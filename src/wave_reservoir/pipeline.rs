@@ -14,7 +14,7 @@ use std::sync::{Mutex, MutexGuard};
 use crate::wave_reservoir::hash::{key, mix, P_THRESHOLD};
 use crate::wave_reservoir::index::Dims;
 use crate::wave_reservoir::config::{IntConfig, IntLevel, RefractoryMode};
-use crate::wave_reservoir::wiring::{scatter_layered, LayeredSynapse};
+use crate::wave_reservoir::wiring::for_each_layered;
 
 /// One layer's mutable state — the only thing the `Mutex` guards.
 struct Layer {
@@ -207,7 +207,6 @@ impl LayerNet {
         guards: &mut [MutexGuard<'_, Layer>],
         leaked_upto: &mut usize,
         drive: &[i16],
-        buf: &mut Vec<LayeredSynapse>,
         firers: &mut Vec<u32>,
     ) {
         // 1. leak+decay the leading edge before any delivery reaches those layers
@@ -237,7 +236,8 @@ impl LayerNet {
             listener(wave_id, firers);
         }
 
-        // 3. apply: config is lock-free (self.cfgs) and potential goes through fast slices
+        // 3. apply: config is lock-free (self.cfgs) and potential goes through fast slices;
+        // deliveries happen straight from the wiring closure (no synapse buffer).
         {
             let mut pots: Vec<&mut [i16]> =
                 guards.iter_mut().map(|g| g.potential.as_mut_slice()).collect();
@@ -245,11 +245,10 @@ impl LayerNet {
             let p_inh = self.cfgs[s].p_inh_q16;
             for &local in firers.iter() {
                 let src = (s * self.ls + local as usize) as u32;
-                scatter_layered(src, self.seed, topo, p_inh, &self.dims, buf);
-                for syn in buf.iter() {
-                    let d = if syn.inhibitory { -1 } else { 1 };
-                    pots[syn.target_layer as usize - lo][syn.local as usize] += d;
-                }
+                for_each_layered(src, self.seed, topo, p_inh, &self.dims, |tl, tloc, inh| {
+                    let d = if inh { -1 } else { 1 };
+                    pots[tl as usize - lo][tloc as usize] += d;
+                });
             }
         }
 
@@ -265,12 +264,11 @@ impl LayerNet {
         assert_eq!(drive.len(), self.n_total(), "drive length {} != n_total() {}", drive.len(), self.n_total());
         let l = self.l as usize;
         let mut leaked_upto = 0usize;
-        let mut buf = Vec::new();
         let mut firers = Vec::new();
         for s in 0..l {
             let (lo, hi) = self.band[s];
             let mut guards: Vec<_> = (lo..=hi).map(|i| self.layers[i].lock().unwrap()).collect();
-            self.process_source(s, 0, lo, &mut guards, &mut leaked_upto, drive, &mut buf, &mut firers);
+            self.process_source(s, 0, lo, &mut guards, &mut leaked_upto, drive, &mut firers);
         }
     }
 
@@ -308,7 +306,6 @@ impl LayerNet {
                 let entry = &entry;
                 let drive_fn = &drive_fn;
                 scope.spawn(move || {
-                    let mut buf = Vec::new();
                     let mut firers = Vec::new();
                     let mut drive_buf = vec![0i16; n];
                     loop {
@@ -345,7 +342,7 @@ impl LayerNet {
                                 held_lo += 1;
                             }
                             self.process_source(
-                                s, w, lo, &mut guards, &mut leaked_upto, &drive_buf, &mut buf, &mut firers,
+                                s, w, lo, &mut guards, &mut leaked_upto, &drive_buf, &mut firers,
                             );
                         }
                         // guards drop here → the whole band is released before the next wave

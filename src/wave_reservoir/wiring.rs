@@ -63,8 +63,24 @@ pub fn scatter_into(source: u32, cfg: &IntConfig, dims: &Dims, out: &mut Vec<Int
     });
 }
 
-/// Same wiring as `scatter_into`, but targets are emitted in per-layer coordinates
-/// `(target_layer, local)` for the pipeline engine. `local = dims.idx(tx, ty, 0) = ty*W + tx`.
+/// Same wiring as `scatter_into`, but each synapse is handed to `emit` in per-layer
+/// coordinates `(target_layer, local, inhibitory)` where `local = ty*W + tx`. The pipeline's
+/// apply path delivers straight from this closure — no intermediate synapse buffer.
+#[inline]
+pub fn for_each_layered(
+    source: u32,
+    seed: u64,
+    topology: &[IntLevel],
+    p_inh_q16: u32,
+    dims: &Dims,
+    mut emit: impl FnMut(u32, u32, bool),
+) {
+    for_each_target(source, seed, topology, p_inh_q16, dims, |tz, tx, ty, inh| {
+        emit(tz, dims.idx(tx, ty, 0), inh);
+    });
+}
+
+/// `for_each_layered` materialized into a `Vec` — the introspection/test form.
 pub fn scatter_layered(
     source: u32,
     seed: u64,
@@ -74,8 +90,8 @@ pub fn scatter_layered(
     out: &mut Vec<LayeredSynapse>,
 ) {
     out.clear();
-    for_each_target(source, seed, topology, p_inh_q16, dims, |tz, tx, ty, inh| {
-        out.push(LayeredSynapse { target_layer: tz, local: dims.idx(tx, ty, 0), inhibitory: inh });
+    for_each_layered(source, seed, topology, p_inh_q16, dims, |target_layer, local, inhibitory| {
+        out.push(LayeredSynapse { target_layer, local, inhibitory });
     });
 }
 
@@ -103,6 +119,25 @@ mod tests {
             }
         }
         assert!(exc && inh, "both excitatory and inhibitory synapses should appear");
+    }
+
+    #[test]
+    fn for_each_layered_matches_scatter_layered() {
+        let cfg = IntConfig::demo();
+        let dims = Dims::new(cfg.w, cfg.h, cfg.l);
+        let src = dims.idx(3, 12, 2);
+        let lc = &cfg.layers[2];
+        let mut list = Vec::new();
+        scatter_layered(src, cfg.seed, &lc.topology, lc.p_inh_q16, &dims, &mut list);
+        let mut fused = Vec::new();
+        for_each_layered(src, cfg.seed, &lc.topology, lc.p_inh_q16, &dims, |tl, local, inh| {
+            fused.push((tl, local, inh));
+        });
+        assert!(!list.is_empty());
+        assert_eq!(fused.len(), list.len());
+        for (a, b) in list.iter().zip(&fused) {
+            assert_eq!((a.target_layer, a.local, a.inhibitory), *b);
+        }
     }
 
     #[test]
