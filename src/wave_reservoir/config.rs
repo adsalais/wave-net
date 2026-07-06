@@ -29,7 +29,6 @@ pub struct IntConfig {
     pub h: u32,
     pub l: u32,
     pub saturation: i16,
-    pub waves: usize,
     pub refractory_mode: RefractoryMode,
     pub layers: Vec<IntLayer>,
 }
@@ -37,7 +36,7 @@ pub struct IntConfig {
 /// Heterogeneity `spread_log2` for a threshold base: spread ≈ base/8 (±12.5%),
 /// as a power of two so the threshold jitter uses a mask, not a divide.
 pub fn spread_log2_for(threshold_base: i32) -> u8 {
-    (31 - (threshold_base.max(1) as u32).leading_zeros()).saturating_sub(3) as u8
+    (threshold_base.max(1) as u32).ilog2().saturating_sub(3) as u8
 }
 
 /// Neuron state (`potential`, `threshold`, `delivery`) is stored as `i16` to halve the
@@ -72,12 +71,11 @@ impl IntConfig {
             refractory: 2,
         };
         IntConfig {
-            seed: 0x1234_5678_9ABC_DEF0, // identical to wave_reservoir::demo for shared wiring
+            seed: 0x1234_5678_9ABC_DEF0, // arbitrary, fixed for reproducibility
             w: 16,
             h: 16,
             l,
             saturation: (tb << 6) as i16,
-            waves: 4,
             refractory_mode: RefractoryMode::CarryOver,
             layers: vec![layer; l as usize],
         }
@@ -95,9 +93,6 @@ impl IntConfig {
         }
         if self.layers.len() != self.l as usize {
             return Err(format!("layers.len()={} must equal l={}", self.layers.len(), self.l));
-        }
-        if self.waves == 0 {
-            return Err("waves must be >= 1".into());
         }
         if self.saturation < 1 || self.saturation > MAX_SATURATION {
             return Err(format!(

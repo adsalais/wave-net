@@ -37,7 +37,7 @@ const SEEDS: [u64; NSEEDS] = [
     0x3333_3333_3333_3333,
 ];
 
-// --- integer XOR harness (duplicated from quantisation_study.rs, int-side only) ---
+// --- integer XOR harness (ridge readout + accuracy) ---
 fn cholesky_solve(mut a: Vec<Vec<f64>>, b: &[Vec<f64>]) -> Vec<Vec<f64>> {
     let n = a.len();
     for i in 0..n {
@@ -91,9 +91,8 @@ fn fair_bit(seed: u64, t: u64) -> u8 {
     (mix(seed ^ t.wrapping_mul(0xD1B5_4A32)) & 1) as u8
 }
 
-/// Fill `buf` (already sized N, reused across waves) with this bit's bipolar bottom-layer drive.
+/// Write this bit's bipolar bottom-layer drive into `buf` (arrives zeroed from `run_stream`).
 fn bit_drive_into(buf: &mut [i16], sites: &[u32], b: u8, level: i16) {
-    buf.iter_mut().for_each(|d| *d = 0);
     let v = if b == 1 { level } else { -level };
     for &s in sites {
         buf[s as usize] += v;
@@ -264,7 +263,6 @@ fn calibrate_on_stream(cfg: &mut IntConfig, target_permille: u64) {
 fn build_at(target: u64, seed: u64, mutate: &impl Fn(&mut IntConfig)) -> IntConfig {
     let mut cfg = IntConfig::demo();
     cfg.seed = seed;
-    cfg.waves = 6;
     mutate(&mut cfg);
     calibrate_on_stream(&mut cfg, target);
     cfg

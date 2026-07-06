@@ -52,9 +52,8 @@ fn for_each_target(
     }
 }
 
-/// Integer scatter-K wiring, global `idx` targets. Same seed/geometry as the float engine, so
-/// the two wire identically; each synapse carries an `inhibitory` flag (probability `p_inh`) —
-/// delivering `-1` when inhibitory, `+1` otherwise.
+/// Integer scatter-K wiring, global `idx` targets. Each synapse carries an `inhibitory` flag
+/// (probability `p_inh_q16 / 2^16`) — delivering `-1` when inhibitory, `+1` otherwise.
 pub fn scatter_into(source: u32, cfg: &IntConfig, dims: &Dims, out: &mut Vec<IntSynapse>) {
     out.clear();
     let lc = &cfg.layers[dims.layer_of(source)];

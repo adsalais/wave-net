@@ -177,12 +177,7 @@ impl LayerNet {
     /// clamp to `±saturation` and apply `Drop` zeroing (finalize a trailing layer).
     fn finalize(&self, layer: &mut Layer) {
         for local in 0..self.ls {
-            let mut p = layer.potential[local];
-            if p > self.sat {
-                p = self.sat;
-            } else if p < -self.sat {
-                p = -self.sat;
-            }
+            let mut p = layer.potential[local].clamp(-self.sat, self.sat);
             if self.drop && layer.cooldown[local] > 0 {
                 p = 0;
             }
@@ -212,12 +207,11 @@ impl LayerNet {
         }
 
         // 2. decide layer s on its (leaked + already-delivered) snapshot; collect firers locally
-        let a = s - lo;
         firers.clear();
         {
-            let layer = &mut *guards[a];
-            let th = &self.cfgs[a + lo].threshold;
-            let refractory = self.cfgs[a + lo].refractory;
+            let layer = &mut *guards[s - lo];
+            let th = &self.cfgs[s].threshold;
+            let refractory = self.cfgs[s].refractory;
             for local in 0..self.ls {
                 if layer.cooldown[local] == 0 && layer.potential[local] >= th[local] {
                     layer.potential[local] = 0;
@@ -254,8 +248,10 @@ impl LayerNet {
         }
     }
 
-    /// Sequential wavefront: one wave, layers bottom-to-top.
+    /// Sequential wavefront: one wave, layers bottom-to-top. Listeners receive `wave_id = 0`
+    /// on every call — use `run_stream` when the wave index matters.
     pub fn wave(&self, drive: &[i16]) {
+        assert_eq!(drive.len(), self.n_total(), "drive length {} != n_total() {}", drive.len(), self.n_total());
         let l = self.l as usize;
         let mut leaked_upto = 0usize;
         let mut buf = Vec::new();
@@ -271,14 +267,17 @@ impl LayerNet {
     /// one wave up the stack, holding a contiguous band of guards (hand-over-hand, acquired in
     /// increasing layer order → deadlock-free); the locks self-regulate the stagger so waves
     /// never overlap. Bit-identical to `waves` sequential `wave` calls.
-    /// Streaming variant: `drive_fn(wave_id, &mut buf)` supplies each wave's drive on demand
-    /// (each worker owns `buf`, reused across its waves). `run` is the constant-drive wrapper.
+    /// Streaming variant: `drive_fn(wave_id, &mut buf)` supplies each wave's drive on demand.
+    /// `buf` arrives zeroed with length `n_total()` — write only the entries you need, and keep
+    /// the length unchanged (worker buffers are reused across waves; the engine re-zeroes them
+    /// so no wave's drive can leak into another). `run` is the constant-drive wrapper.
     pub fn run_stream(
         &self,
         waves: usize,
         threads: usize,
         drive_fn: impl Fn(usize, &mut Vec<i16>) + Sync,
     ) {
+        assert!(threads >= 1, "threads must be >= 1");
         let l = self.l as usize;
         let n = self.n_total();
         let next_wave = AtomicUsize::new(0);
@@ -301,7 +300,9 @@ impl LayerNet {
                         if w >= waves {
                             break;
                         }
+                        drive_buf.fill(0);
                         drive_fn(w, &mut drive_buf);
+                        assert_eq!(drive_buf.len(), n, "drive_fn must keep the buffer at n_total() = {n} elements");
                         // take the whole bottom band before wave w+1 is allowed to enter
                         while entry.load(Ordering::Acquire) != w {
                             std::hint::spin_loop();
@@ -339,10 +340,8 @@ impl LayerNet {
     }
 
     pub fn run(&self, drive: &[i16], waves: usize, threads: usize) {
-        self.run_stream(waves, threads, |_, buf| {
-            buf.clear();
-            buf.extend_from_slice(drive);
-        });
+        assert_eq!(drive.len(), self.n_total(), "drive length {} != n_total() {}", drive.len(), self.n_total());
+        self.run_stream(waves, threads, |_, buf| buf.copy_from_slice(drive));
     }
 
     /// Read a neuron's potential by global index (`idx = layer*ls + local`).
@@ -472,6 +471,55 @@ mod tests {
     }
 
     #[test]
+    fn drive_buffer_arrives_zeroed_each_wave() {
+        // Contract: `drive_fn` receives a zeroed, n_total()-length buffer every wave, so a
+        // sparse writer needs no manual clear — and worker buffer reuse can never leak one
+        // wave's drive into another (which would differ across thread counts).
+        let cfg = IntConfig::demo();
+        let n = cfg.n_total();
+        let ls = (cfg.w * cfg.h) as usize;
+        let seq = LayerNet::new(cfg.clone());
+        for w in 0..12 {
+            let mut d = vec![0i16; n];
+            d[w % ls] = 50; // one wave-dependent site, all else zero
+            seq.wave(&d);
+        }
+        let golden: Vec<i16> = (0..n).map(|i| seq.potential_global(i)).collect();
+        for t in [1usize, 4] {
+            let net = LayerNet::new(cfg.clone());
+            net.run_stream(12, t, |w, buf| {
+                buf[w % ls] = 50; // sparse write, relies on the zeroed buffer
+            });
+            for i in 0..n {
+                assert_eq!(net.potential_global(i), golden[i], "stale drive at {i}, {t} threads");
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "drive length")]
+    fn wave_rejects_wrong_drive_length() {
+        let net = LayerNet::new(IntConfig::demo());
+        net.wave(&[0i16; 3]);
+    }
+
+    #[test]
+    #[should_panic(expected = "threads must be >= 1")]
+    fn run_stream_rejects_zero_threads() {
+        let cfg = IntConfig::demo();
+        let drive = vec![0i16; cfg.n_total()];
+        let net = LayerNet::new(cfg);
+        net.run(&drive, 1, 0);
+    }
+
+    #[test]
+    #[should_panic]
+    fn run_stream_rejects_drive_fn_resizing_buffer() {
+        let net = LayerNet::new(IntConfig::demo());
+        net.run_stream(2, 1, |_, buf| buf.push(1)); // len n+1 violates the contract
+    }
+
+    #[test]
     fn listener_stream_deterministic_across_threads() {
         // The per-layer event stream is serialized + wave-ordered by the layer lock, so a
         // layer-0 subscriber sees the identical (wave, count) sequence at any thread count.
@@ -582,12 +630,12 @@ mod tests {
 
     #[test]
     fn top_layer_trajectory_golden() {
-        // Exact demo trajectory anchor (was the flat engine's golden, now carried by LayerNet):
-        // the top layer's per-wave spike counts and index checksum must reproduce bit-for-bit.
+        // Exact demo trajectory anchor: the top layer's per-wave spike counts and index
+        // checksum must reproduce bit-for-bit — any change to wiring or dynamics trips this.
         let cfg = IntConfig::demo();
         let n = cfg.n_total();
         let top = cfg.l as usize - 1;
-        let waves = cfg.waves;
+        let waves = 4; // the golden anchors exactly 4 waves
         let mut drive = vec![0i16; n];
         for j in 0..(cfg.w * cfg.h) as usize {
             drive[j] = 50;

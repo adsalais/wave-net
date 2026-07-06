@@ -6,12 +6,6 @@ pub struct InputMap {
     pub channels: Vec<Vec<u32>>,
 }
 
-#[derive(Clone, Debug)]
-pub struct CurrentInjector {
-    pub map: InputMap,
-    pub input_scale: f32,
-}
-
 impl InputMap {
     /// Deterministically scatter `num_channels` channels across the bottom layer,
     /// `per_channel` neurons each (indices in `0 .. w*h`, i.e. layer 0).
@@ -27,24 +21,6 @@ impl InputMap {
             channels.push(neurons);
         }
         InputMap { channels }
-    }
-}
-
-impl CurrentInjector {
-    pub fn new(map: InputMap, input_scale: f32) -> CurrentInjector {
-        CurrentInjector { map, input_scale }
-    }
-
-    /// Build a per-neuron drive vector from per-channel `values`.
-    pub fn drive(&self, values: &[f32], n_total: usize) -> Vec<f32> {
-        let mut d = vec![0.0f32; n_total];
-        for (ch, neurons) in self.map.channels.iter().enumerate() {
-            let v = values[ch] * self.input_scale;
-            for &nrn in neurons {
-                d[nrn as usize] += v;
-            }
-        }
-        d
     }
 }
 
@@ -65,12 +41,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn drive_scales_and_places_current() {
-        let n = (16 * 16 * 4) as usize;
-        let map = InputMap { channels: vec![vec![0, 1], vec![2]] };
-        let inj = CurrentInjector::new(map, 2.0);
-        let d = inj.drive(&[1.0, 3.0], n);
-        assert_eq!((d[0], d[1], d[2], d[3]), (2.0, 2.0, 6.0, 0.0));
-    }
 }
