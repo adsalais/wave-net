@@ -6,5 +6,6 @@
 //! depth-utilization diagnostic. Bigger networks added later are calibrated and checked with
 //! the same tools. Learning rules (per-neuron training) build on top of this.
 
+pub mod calibrate;
 pub mod linalg;
 pub mod stream;
