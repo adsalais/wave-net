@@ -6,18 +6,14 @@ override default behavior — follow them exactly.
 ## What this project is
 
 `wave-net` builds a **trained RSNN** — a recurrent spiking neural network that *learns* — using a
-**wave reservoir** as its substrate. The reservoir (a spiking-neuron network whose activity flows
-in waves up a stack of 2D layers) is the fixed, procedurally-generated dynamical base; the project's
-goal is to add a **learning layer** on top of / within it so the network can be trained on tasks.
+**wave reservoir** as its base implementation. The reservoir (a spiking-neuron network whose activity flows
+in waves up a stack of 2D layers) is currently fixed, procedurally-generated dynamical base; the project's
+goal is to change it to become a real RSNN with trained weights
 
-Rust, edition 2024, **standard library only** (no external runtime dependencies).
+Rust, edition 2024, **standard library only unless the user accept it** (no external runtime dependencies).
 
-- **`wave_reservoir` (the substrate, done):** the integer (i16) `LayerNet` engine — wavefront-
-  pipelined, deterministic, multi-threaded — plus its procedural wiring and shared primitives.
-  Copied and validated; this is the base, not the deliverable.
-- **The learning layer (the deliverable, not yet designed):** how the RSNN is trained. This is the
-  next design step — brainstorm it before implementing (see *Workflow* below). Storage is expected
-  to stay per-neuron only (the reservoir keeps generating synapses from a hash; see below).
+- **`wave_reservoir` (the base, done):** the integer (i16) `LayerNet` engine — wavefront-
+  pipelined, deterministic, multi-threaded — plus its procedural wiring and shared primitives. this is the base, not the deliverable.
 
 ## The one idea that explains the engine
 
@@ -71,8 +67,8 @@ for how to feed input and read output from the reservoir.
 - **No `unsafe`.**
 - **Warning-free build** — keep `cargo build` clean.
 - **Determinism is a hard requirement** — `LayerNet` must stay bit-identical across thread counts.
-  Any change to the pipeline must keep the determinism tests (1 vs N threads) and the trajectory
-  golden passing.
+  Any change to the pipeline must keep the determinism tests (1 vs N threads).
+
 - **Tests are inline** `#[cfg(test)]` per module, test-first (TDD) where practical.
 - **One commit per task**, conventional-commit messages (`feat:`, `fix:`, `refactor:`, `docs:`,
   `chore:` …).
