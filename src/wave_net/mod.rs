@@ -9,4 +9,5 @@
 pub mod calibrate;
 pub mod depth;
 pub mod linalg;
+pub mod readout;
 pub mod stream;
