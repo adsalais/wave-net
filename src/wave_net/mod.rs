@@ -7,3 +7,4 @@
 //! the same tools. Learning rules (per-neuron training) build on top of this.
 
 pub mod linalg;
+pub mod stream;
