@@ -5,11 +5,11 @@
 
 use wave_net::wave_reservoir::hash::mix;
 use wave_net::wave_reservoir::index::Dims;
-use wave_net::wave_reservoir::input::InputMap;
-use wave_net::wave_reservoir::config::{
-    spread_log2_for, IntConfig, IntLevel, RefractoryMode, MAX_SATURATION,
-};
+use wave_net::wave_reservoir::config::{IntConfig, IntLevel, RefractoryMode};
 use wave_net::wave_reservoir::pipeline::LayerNet;
+use wave_net::wave_net::calibrate::{calibrate, CalibrateParams};
+use wave_net::wave_net::linalg::ridge_fit;
+use wave_net::wave_net::stream::{fair_bit, BipolarInput};
 use std::sync::{Arc, Mutex};
 
 const READOUT_DIM: usize = 128;
@@ -37,44 +37,7 @@ const SEEDS: [u64; NSEEDS] = [
     0x3333_3333_3333_3333,
 ];
 
-// --- integer XOR harness (ridge readout + accuracy) ---
-fn cholesky_solve(mut a: Vec<Vec<f64>>, b: &[Vec<f64>]) -> Vec<Vec<f64>> {
-    let n = a.len();
-    for i in 0..n {
-        for j in 0..=i {
-            let mut s = a[i][j];
-            for k in 0..j {
-                s -= a[i][k] * a[j][k];
-            }
-            if i == j {
-                a[i][i] = s.max(1e-12).sqrt();
-            } else {
-                a[i][j] = s / a[j][j];
-            }
-        }
-    }
-    let m = b[0].len();
-    let mut x = vec![vec![0.0f64; m]; n];
-    for col in 0..m {
-        let mut z = vec![0.0f64; n];
-        for i in 0..n {
-            let mut s = b[i][col];
-            for k in 0..i {
-                s -= a[i][k] * z[k];
-            }
-            z[i] = s / a[i][i];
-        }
-        for i in (0..n).rev() {
-            let mut s = z[i];
-            for k in (i + 1)..n {
-                s -= a[k][i] * x[k][col];
-            }
-            x[i][col] = s / a[i][i];
-        }
-    }
-    x
-}
-
+// --- integer XOR harness (ridge readout + accuracy); linalg lifted to wave_net::linalg ---
 fn sample_neurons(n: usize, dim: usize, seed: u64) -> Vec<usize> {
     use std::collections::BTreeSet;
     let mut set = BTreeSet::new();
@@ -87,18 +50,6 @@ fn sample_neurons(n: usize, dim: usize, seed: u64) -> Vec<usize> {
     set.into_iter().collect()
 }
 
-fn fair_bit(seed: u64, t: u64) -> u8 {
-    (mix(seed ^ t.wrapping_mul(0xD1B5_4A32)) & 1) as u8
-}
-
-/// Write this bit's bipolar bottom-layer drive into `buf` (arrives zeroed from `run_stream`).
-fn bit_drive_into(buf: &mut [i16], sites: &[u32], b: u8, level: i16) {
-    let v = if b == 1 { level } else { -level };
-    for &s in sites {
-        buf[s as usize] += v;
-    }
-}
-
 fn stream_xor(
     cfg: &IntConfig,
     waves_per_bit: usize,
@@ -107,9 +58,8 @@ fn stream_xor(
     let n = cfg.n_total();
     let ls = (cfg.w * cfg.h) as usize;
     let dims = Dims::new(cfg.w, cfg.h, cfg.l);
-    let sites = InputMap::scatter_bottom(&dims, INPUT_SEED, 1, PER_CHANNEL).channels[0].clone();
+    let input = BipolarInput::scatter_bottom(&dims, INPUT_SEED, PER_CHANNEL, INPUT_LEVEL);
     let sample = sample_neurons(n, READOUT_DIM, seed ^ 0x5A11);
-    let level = INPUT_LEVEL;
     let total = WASHOUT + TRAIN + TEST;
     let total_waves = total * waves_per_bit;
     let bhist: Vec<u8> = (0..total).map(|t| fair_bit(seed, t as u64)).collect();
@@ -147,7 +97,7 @@ fn stream_xor(
 
     // Stream the bits: wave w carries bit w / waves_per_bit.
     net.run_stream(total_waves, THREADS, |w, buf| {
-        bit_drive_into(buf, &sites, bhist[w / waves_per_bit], level);
+        input.drive_into(buf, bhist[w / waves_per_bit]);
     });
 
     let features = std::mem::take(&mut *features.lock().unwrap());
@@ -162,24 +112,6 @@ fn stream_xor(
         }
     }
     (feats, tgts, ctrl)
-}
-
-fn ridge_fit(x: &[Vec<f64>], y: &[f64], lambda: f64) -> Vec<f64> {
-    let d = x[0].len();
-    let mut a = vec![vec![0.0f64; d]; d];
-    let mut b = vec![vec![0.0f64; 1]; d];
-    for (xi, &yi) in x.iter().zip(y) {
-        for i in 0..d {
-            b[i][0] += xi[i] * yi;
-            for j in 0..d {
-                a[i][j] += xi[i] * xi[j];
-            }
-        }
-    }
-    for i in 0..d {
-        a[i][i] += lambda;
-    }
-    cholesky_solve(a, &b).into_iter().map(|r| r[0]).collect()
 }
 
 fn accuracy(w: &[f64], x: &[Vec<f64>], y: &[f64]) -> f32 {
@@ -205,66 +137,19 @@ fn xor_eval(cfg: &IntConfig, waves_per_bit: usize, seed: u64) -> (f32, f32) {
     (res, ctl)
 }
 
-// --- stream-based calibration (matches the actual task's firing rate) ---
-/// Per-layer (spikes, total) over a continuous bipolar bit stream — the real task
-/// dynamics (reset once, never between bits), unlike the class-drive ensemble.
-fn stream_layer_rates(cfg: &IntConfig) -> Vec<(u64, u64)> {
-    let ls = (cfg.w * cfg.h) as u64;
-    let dims = Dims::new(cfg.w, cfg.h, cfg.l);
-    let sites = InputMap::scatter_bottom(&dims, INPUT_SEED, 1, PER_CHANNEL).channels[0].clone();
-    let level = INPUT_LEVEL;
-    let total_waves = CAL_BITS * FIXED_WPB;
-
-    let spikes = Arc::new(Mutex::new(vec![0u64; cfg.l as usize]));
-    let mut net = LayerNet::new(cfg.clone());
-    net.reset_state();
-    for z in 0..cfg.l as usize {
-        let sp = spikes.clone();
-        net.on_layer(
-            z,
-            Box::new(move |_wave, fired| {
-                sp.lock().unwrap()[z] += fired.len() as u64;
-            }),
-        );
-    }
-    net.run_stream(total_waves, THREADS, |w, buf| {
-        let b = fair_bit(TASK_SEED ^ 0xCA1B, (w / FIXED_WPB) as u64);
-        bit_drive_into(buf, &sites, b, level);
-    });
-
-    let spikes = std::mem::take(&mut *spikes.lock().unwrap());
-    let waves = total_waves as u64;
-    (0..cfg.l as usize).map(|z| (spikes[z], ls * waves)).collect()
-}
-
-/// Tune each cascade layer's `threshold_base` (integer, shift step) so it fires at
-/// `target_permille` on the actual bit-stream task — the density-matching fix.
-fn calibrate_on_stream(cfg: &mut IntConfig, target_permille: u64) {
-    for _ in 0..CAL_PASSES {
-        let rates = stream_layer_rates(cfg);
-        for z in 1..cfg.l as usize {
-            let (spikes, total) = rates[z];
-            let tb = cfg.layers[z].threshold_base;
-            let step = (tb >> 2).max(1);
-            if spikes * 1000 > total * target_permille {
-                cfg.layers[z].threshold_base = tb + step;
-            } else if spikes * 1000 < total * target_permille {
-                cfg.layers[z].threshold_base = (tb - step).max(1);
-            }
-            let new_tb = cfg.layers[z].threshold_base;
-            cfg.layers[z].spread_log2 = spread_log2_for(new_tb);
-        }
-        let max_t = cfg.layers.iter().map(|l| l.threshold_base).max().unwrap_or(1);
-        cfg.saturation = max_t.saturating_mul(32).min(MAX_SATURATION as i32) as i16;
-    }
-}
-
 // --- config-variant builders ---
 fn build_at(target: u64, seed: u64, mutate: &impl Fn(&mut IntConfig)) -> IntConfig {
     let mut cfg = IntConfig::demo();
     cfg.seed = seed;
     mutate(&mut cfg);
-    calibrate_on_stream(&mut cfg, target);
+    // Calibrate on the same bipolar bit stream the task uses (its own seed, distinct from the
+    // eval bits) — identical to the routine this used to carry inline, now in wave_net::calibrate.
+    let dims = Dims::new(cfg.w, cfg.h, cfg.l);
+    let input = BipolarInput::scatter_bottom(&dims, INPUT_SEED, PER_CHANNEL, INPUT_LEVEL);
+    let params = CalibrateParams { target_permille: target, passes: CAL_PASSES, bits: CAL_BITS, wpb: FIXED_WPB };
+    calibrate(&mut cfg, &params, &move |w: usize, buf: &mut Vec<i16>| {
+        input.drive_into(buf, fair_bit(TASK_SEED ^ 0xCA1B, (w / FIXED_WPB) as u64))
+    });
     cfg
 }
 
