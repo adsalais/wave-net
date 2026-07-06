@@ -1,4 +1,4 @@
-use crate::wave_reservoir::hash::{key, map_range, mix, P_ATTR, P_TARGET};
+use crate::wave_reservoir::hash::{key, map_range24, mix, P_TARGET};
 use crate::wave_reservoir::index::Dims;
 use crate::wave_reservoir::config::{IntConfig, IntLevel};
 
@@ -40,13 +40,14 @@ fn for_each_target(
         }
         let span = 2 * entry.radius + 1;
         for k in 0..entry.count {
+            // One hash per synapse (the per-spike hot path): dx from bits 63..40,
+            // dy from bits 39..16, inhibitory from bits 15..0.
             let h = mix(key(seed, source, entry.level, k, P_TARGET));
-            let dx = map_range((h >> 32) as u32, span) as i32 - entry.radius as i32;
-            let dy = map_range(h as u32, span) as i32 - entry.radius as i32;
+            let dx = map_range24((h >> 40) as u32, span) as i32 - entry.radius as i32;
+            let dy = map_range24(((h >> 16) as u32) & 0x00FF_FFFF, span) as i32 - entry.radius as i32;
             let tx = dims.wrap_x(sx, dx);
             let ty = dims.wrap_y(sy, dy);
-            let ha = mix(key(seed, source, entry.level, k, P_ATTR));
-            let inhibitory = ((ha & 0xFFFF) as u32) < p_inh_q16;
+            let inhibitory = ((h & 0xFFFF) as u32) < p_inh_q16;
             emit(tz as u32, tx, ty, inhibitory);
         }
     }

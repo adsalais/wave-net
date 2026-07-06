@@ -704,7 +704,7 @@ mod tests {
         let traj = std::mem::take(&mut *traj.lock().unwrap());
         let counts: Vec<usize> = traj.iter().map(|w| w.len()).collect();
         let checksum: u64 = traj.iter().flatten().map(|&x| x as u64).sum();
-        assert_eq!(counts, vec![132, 75, 162, 80], "top-layer spike counts per wave");
-        assert_eq!(checksum, 57437, "trajectory checksum");
+        assert_eq!(counts, vec![138, 77, 158, 85], "top-layer spike counts per wave");
+        assert_eq!(checksum, 60071, "trajectory checksum");
     }
 }
