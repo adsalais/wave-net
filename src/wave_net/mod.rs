@@ -11,3 +11,4 @@ pub mod depth;
 pub mod linalg;
 pub mod readout;
 pub mod stream;
+pub mod train;
