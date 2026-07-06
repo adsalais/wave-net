@@ -62,8 +62,8 @@ for how to feed input and read output from the reservoir.
 
 ## Conventions (required)
 
-- **Standard library only** in `src/` — no external runtime dependencies. Dev-dependencies (e.g. a
-  benchmark harness) are fine but keep `cargo build` / `cargo test` dependency-free.
+- **Standard library only, unless no other choice** in `src/` — no external runtime dependencies. Dev-dependencies (e.g. a
+  benchmark harness) are fine but keep `cargo build` / `cargo test` dependency-free unless if the implementation would be too complex (asynchronous runtime for example).
 - **No `unsafe`.**
 - **Warning-free build** — keep `cargo build` clean.
 - **Determinism is a hard requirement** — `LayerNet` must stay bit-identical across thread counts.
