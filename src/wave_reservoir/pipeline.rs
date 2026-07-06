@@ -43,6 +43,9 @@ pub struct LayerNet {
     drop: bool,
     /// global forward reach (max `max_level` over layers, ≥ 0) — the leak-front lead.
     fwd: usize,
+    /// max waves that can hold non-overlapping bands at once (`ceil(l / band_width)`);
+    /// workers beyond this can only spin, so `run_stream` clamps to it.
+    capacity: usize,
     /// per source layer: the contiguous guard band `[lo, hi]` = `[s-back, s+fwd]` clamped.
     band: Vec<(usize, usize)>,
     /// layers to finalize (clamp) after processing each source layer.
@@ -73,6 +76,7 @@ impl LayerNet {
         let back = (0..l).map(|s| (-level_range(&cfg.layers[s].topology).0).max(0)).max().unwrap_or(0);
         let fwd = fwd as usize;
         let back = back as usize;
+        let capacity = l.div_ceil(fwd + back + 1).max(1);
         let band: Vec<(usize, usize)> = (0..l)
             .map(|s| {
                 let lo = (s as i32 - back as i32).clamp(0, last) as usize;
@@ -130,6 +134,7 @@ impl LayerNet {
             sat: cfg.saturation as i16,
             drop: cfg.refractory_mode == RefractoryMode::Drop,
             fwd,
+            capacity,
             band,
             clamp_after,
             listeners: (0..l).map(|_| None).collect(),
@@ -138,6 +143,12 @@ impl LayerNet {
 
     pub fn n_total(&self) -> usize {
         self.l as usize * self.ls
+    }
+
+    /// Max workers that can make progress simultaneously: consecutive waves may not overlap
+    /// their lock bands, so at most `ceil(l / band_width)` waves fit in the stack at once.
+    pub fn pipeline_capacity(&self) -> usize {
+        self.capacity
     }
 
     /// Subscribe to a layer's spikes: `listener(wave_id, &fired_locals)` is called (in wave
@@ -278,6 +289,11 @@ impl LayerNet {
         drive_fn: impl Fn(usize, &mut Vec<i16>) + Sync,
     ) {
         assert!(threads >= 1, "threads must be >= 1");
+        // Surplus workers can never take a band (waves enter in order and bands may not
+        // overlap); they would only spin on `entry` and steal cycles — clamp them away.
+        // Note: `drive_fn` runs inside the worker, so this assumes it is cheap; revisit the
+        // clamp if drives ever become expensive to produce.
+        let threads = threads.min(self.capacity);
         let l = self.l as usize;
         let n = self.n_total();
         let next_wave = AtomicUsize::new(0);
@@ -467,6 +483,41 @@ mod tests {
             for i in 0..n {
                 assert_eq!(net.potential_global(i), golden[i], "mismatch at {i}, {t} threads");
             }
+        }
+    }
+
+    #[test]
+    fn pipeline_capacity_counts_nonoverlapping_bands() {
+        // demo: fwd=2, back=1 -> band width 4; l=6 -> ceil(6/4) = 2 waves in flight
+        let net = LayerNet::new(IntConfig::demo());
+        assert_eq!(net.pipeline_capacity(), 2);
+        // deep stack: l=32 -> ceil(32/4) = 8
+        let mut cfg = IntConfig::demo();
+        cfg.w = 8;
+        cfg.h = 8;
+        cfg.l = 32;
+        cfg.layers = vec![cfg.layers[0].clone(); 32];
+        assert_eq!(LayerNet::new(cfg).pipeline_capacity(), 8);
+    }
+
+    #[test]
+    fn oversubscribed_threads_clamped_and_correct() {
+        // Way more threads than the pipeline can use: run_stream clamps to capacity, and the
+        // result stays bit-identical to sequential.
+        let cfg = IntConfig::demo();
+        let n = cfg.n_total();
+        let mut drive = vec![0i16; n];
+        for j in 0..(cfg.w * cfg.h) as usize {
+            drive[j] = 50;
+        }
+        let seq = LayerNet::new(cfg.clone());
+        for _ in 0..20 {
+            seq.wave(&drive);
+        }
+        let net = LayerNet::new(cfg);
+        net.run(&drive, 20, 64);
+        for i in 0..n {
+            assert_eq!(net.potential_global(i), seq.potential_global(i), "mismatch at {i}");
         }
     }
 
