@@ -21,11 +21,63 @@ Two engine facts drive the design:
   synapses, so a freshly-tuned layer `z` feeds `z−1` and nudges its rate after it was frozen. →
   add **global-refine** passes after bottom-up (the "hybrid").
 
-Thresholds are already "calibration-owned mutable state" (engine design), so calibration **mutates
-the live `Network` in place** rather than rebuilding from a config. Saturation no longer exists, so
-it plays no part.
+## Ownership: calibration lives at the layer level
 
-## Public API — `src/wave_net/calibrate.rs`
+Each `Layer` already carries everything that describes it — `topology`, `leak`, `cooldown_base`,
+`inhibitor_ratio`, and its tuned `threshold` vector — so a `Layer` is a **self-contained,
+persistable unit** and a `Network` is just `seed + size + layers`. Therefore:
+
+- **The `Layer` owns tuning its own thresholds** (the calibratable state is layer-local).
+- **The `Network` only orchestrates** what genuinely needs the whole stack — running waves and
+  measuring per-layer firing rates — then hands each layer its measured rate and lets the layer tune
+  itself.
+
+**Persistence is structured-for now, built later.** Because each `Layer` owns its full descriptive
+state and exposes threshold get/set, saving a calibrated net later is "snapshot each layer's params
++ thresholds" — a clean separate task. No serialization code (and no `serde`; std-only) in this
+spec.
+
+## `Layer` — new methods (`src/wave_net/neurons.rs`)
+
+```rust
+/// Subtract `delta` from every threshold (delta>0 lowers), clamped to [1, i16::MAX].
+/// Uniform shift, so per-neuron jitter is preserved.
+pub fn shift_threshold(&mut self, delta: i32);
+
+/// One measure-informed tuning step toward `target` (both as fractions in 0..1). Returns whether
+/// it adjusted. The layer owns the step policy: geometric `max_threshold >> step_shift`, lower when
+/// too cold, raise when too hot, no-op inside the tolerance band.
+pub fn calibrate_step(&mut self, rate: f64, target: f64, tol: f64, step_shift: u32) -> bool;
+
+pub fn thresholds(&self) -> &[i16];          // introspection / persistence
+pub fn set_thresholds(&mut self, t: Vec<i16>); // restore (persistence / tests)
+// max_threshold(&self) -> i16 already exists.
+```
+
+## `Network` — new methods (`src/wave_net/network.rs`)
+
+```rust
+/// Locked mutable access to one layer (crate-internal; how calibration reaches Layer methods).
+pub(crate) fn with_layer_mut<R>(&self, z: usize, f: impl FnOnce(&mut Layer) -> R) -> R;
+
+/// Reset, run `warmup` waves (discarded), then `waves` waves counting spikes per layer; return
+/// per-layer firing rate = spikes / (layer_size * waves). Single-threaded, deterministic.
+/// SAVES the caller's registered listeners, installs temporary counting listeners, and RESTORES
+/// the saved listeners before returning — calibration never clobbers user listeners.
+pub(crate) fn measure_layer_rates(&mut self, warmup: usize, waves: usize,
+                                  input: &impl Fn(usize) -> Vec<u32>) -> Vec<f64>;
+
+/// A copy of a layer's per-neuron thresholds (public introspection / determinism tests).
+pub fn layer_thresholds(&self, z: usize) -> Vec<i16>;
+```
+
+Listener save/restore mechanism (boxed `Fn` closures aren't `Clone`, so we **move**, not copy):
+`std::mem::replace(&mut self.listeners, fresh_none_slots)` yields the user's listeners; install
+counters into the fresh slots; run; then `self.listeners = saved` drops the counters and restores
+the user's. Because it saves/restores every call, `measure_layer_rates` is self-contained and safe
+to call repeatedly.
+
+## Public entry (`src/wave_net/calibrate.rs`)
 
 ```rust
 pub struct CalibrateParams {
@@ -35,131 +87,92 @@ pub struct CalibrateParams {
     pub waves: usize,         // waves counted per measurement
     pub max_steps: usize,     // max adjust steps per layer in the bottom-up phase
     pub refine_passes: usize, // global all-layers passes after bottom-up
-    pub step_shift: u32,      // geometric step = max_layer_threshold >> step_shift
+    pub step_shift: u32,      // geometric step = max_threshold >> step_shift
 }
 // Default: target 100, tol 20, warmup 32, waves 128, max_steps 24, refine_passes 4, step_shift 2
 
-/// Lower per-layer thresholds (layers 1..L; L0 is the input surface, left as-is) so each fires
-/// near `target` on `input`. Mutates `net` in place. Uses (and clears) the layer listeners.
-pub fn calibrate(net: &mut Network, params: &CalibrateParams, input: &impl Fn(usize) -> Vec<u32>);
+impl Network {
+    /// Lower per-layer thresholds (layers 1..L; L0 is the input surface, left as-is) so each fires
+    /// near target on `input`. Mutates in place; preserves the caller's listeners.
+    pub fn calibrate(&mut self, params: &CalibrateParams, input: &impl Fn(usize) -> Vec<u32>);
+}
 
 /// A deterministic per-wave input: injects each L0 local with probability `fraction_q16 / 2^16`.
 pub fn random_l0_input(seed: u64, size: u32, fraction_q16: u32) -> impl Fn(usize) -> Vec<u32>;
 ```
 
-## `Network` additions — `src/wave_net/network.rs`
-
-```rust
-/// Subtract `delta` from every threshold in `layer` (delta>0 lowers), clamped to [1, i16::MAX].
-/// Uniform shift, so per-neuron jitter is preserved.
-pub fn shift_layer_threshold(&self, layer: usize, delta: i32);
-
-/// The layer's current maximum threshold (sizes the geometric step).
-pub fn max_layer_threshold(&self, layer: usize) -> i16;
-
-/// A copy of the layer's per-neuron thresholds (introspection / determinism tests).
-pub fn layer_thresholds(&self, layer: usize) -> Vec<i16>;
-```
-
-All three are `&self` (interior mutability via the per-layer `Mutex`).
-
-## `synapse.rs` addition
-
-```rust
-pub const P_INPUT: u64 = 5; // hash purpose tag for the calibration input generator
-```
+`calibrate` is a second `impl Network` block living in `calibrate.rs`; it uses the `pub(crate)`
+`measure_layer_rates` + `with_layer_mut` and delegates every adjustment to `Layer::calibrate_step`.
 
 ## Algorithm (hybrid: bottom-up then global refine)
-
-Two shared free helpers in `calibrate.rs`:
-
-```rust
-// Reset, run `warmup` waves (discarded), then `waves` waves counting spikes per layer.
-// Returns per-layer firing rate = spikes / (layer_size * waves). Single-threaded, deterministic.
-fn measure(net: &mut Network, warmup, waves, input) -> Vec<f64> {
-    attach a counting listener on every layer (Arc<Mutex<Vec<u64>>>);
-    net.reset_state();
-    for w in 0..warmup            { net.wave(&input(w)); }
-    zero the counters;                        // discard warmup
-    for w in 0..waves             { net.wave(&input(warmup + w)); }
-    net.clear_listeners();
-    counts[z] / (layer_size * waves) for each z
-}
-
-// One measure-informed nudge of layer z toward target. Returns whether it adjusted.
-fn step_layer(net: &Network, z, rate: f64, target: f64, tol: f64, step_shift) -> bool {
-    if (rate - target).abs() <= tol { return false; }
-    let step = ((net.max_layer_threshold(z) as i32) >> step_shift).max(1);
-    let delta = if rate < target { step } else { -step };  // too cold -> lower (delta>0)
-    net.shift_layer_threshold(z, delta);
-    true
-}
-```
-
-`calibrate`:
 
 ```
 target = target_permille/1000; tol = tol_permille/1000
 // Phase 1 — bottom-up: fix each layer before moving up (its feeder is now firing)
 for z in 1..L:
     for _ in 0..max_steps:
-        rates = measure(net, warmup, waves, input)       // re-measure after each adjust
-        if !step_layer(net, z, rates[z], target, tol, step_shift): break
+        rates = self.measure_layer_rates(warmup, waves, input)   // re-measure after each adjust
+        adjusted = self.with_layer_mut(z, |l| l.calibrate_step(rates[z], target, tol, step_shift))
+        if !adjusted: break
 // Phase 2 — global refine: absorb the downward (level 0/-1) coupling
 for _ in 0..refine_passes:
-    rates = measure(net, warmup, waves, input)           // one snapshot per pass
+    rates = self.measure_layer_rates(warmup, waves, input)       // one snapshot per pass
     moved = false
-    for z in 1..L: moved |= step_layer(net, z, rates[z], target, tol, step_shift)
+    for z in 1..L:
+        moved |= self.with_layer_mut(z, |l| l.calibrate_step(rates[z], target, tol, step_shift))
     if !moved: break
 ```
 
-Geometric `step = max_threshold >> 2` self-damps: from `i16::MAX` it descends ~×0.75/step
-(~15 steps to reach the low hundreds), and shrinks as the threshold shrinks, so it converges into
-the tolerance band from any starting scale. L0 is never tuned — its rate is just the input
-injection fraction.
+`Layer::calibrate_step`'s geometric `step = max_threshold >> 2` self-damps: from `i16::MAX` it
+descends ~×0.75/step and shrinks as the threshold shrinks, converging into the tolerance band from
+any starting scale. L0 is never tuned — its rate is just the input injection fraction.
 
 ## Determinism
 
 `reset_state` before each measurement + a deterministic seed-based `input` closure ⇒ the resulting
-thresholds are a pure function of `(net's seed/config, params, input)`. `measure` is single-threaded
-(`net.wave` loop). No `Date`/`rand`/hash-map iteration.
+thresholds are a pure function of `(net's seed/config, params, input)`. `measure_layer_rates` is
+single-threaded. No `Date`/`rand`/hash-map iteration.
 
 ## Known limitation
 
 Pure bottom-up ignores the downward feedback; the `refine_passes` phase corrects most of it but is
-itself capped, so with very strong recurrence a residual per-layer rate error can remain. Reported
-acceptable for v1 (the ablation-grade tuning is the separate criticality program). No σ / temporal
-structure is targeted — only firing rate.
+capped, so with very strong recurrence a residual per-layer rate error can remain. Acceptable for
+v1. No σ / temporal structure is targeted — only firing rate.
 
 ## Testing (inline `#[cfg(test)]`, test-first)
 
 Test config: `size = 8`, `L = 4`, forward+lateral topology (`level +1` r2 c6, `level 0` r1 c2),
 `inhibitor_ratio = 0` (all excitatory, predictable), small `threshold_jitter`.
 
-1. **`measure` sanity** — with `random_l0_input(seed, size, frac)`, `rates[0] ≈ frac/65536`
-   (L0 fires exactly when injected; its high threshold blocks any recurrent firing). Loose band.
+1. **`measure_layer_rates` sanity** — with `random_l0_input(seed, size, frac)`,
+   `rates[0] ≈ frac/65536` (L0 fires exactly when injected; its high threshold blocks recurrent
+   firing). Loose band.
 2. **calibration warms a silent net** — before: top-layer rate ≈ 0; after `calibrate`: top-layer
-   rate is in a band around target (e.g. `(target/2, target*2)` and `> 0`), and
-   `max_layer_threshold(top) < i16::MAX` (it dropped).
-3. **thresholds lowered per layer** — every calibrated layer `1..L` has `max_layer_threshold < i16::MAX`.
+   rate in a band around target (e.g. `(target/2, target*2)`, `> 0`), and `layer_thresholds(top)`'s
+   max `< i16::MAX` (it dropped).
+3. **thresholds lowered per layer** — every calibrated layer `1..L` has a max threshold `< i16::MAX`.
 4. **determinism** — two fresh nets, identical config/params/input → identical `layer_thresholds(z)`
    for all `z`.
-5. **`shift_layer_threshold` / clamp** — subtracting past 1 floors at 1; adding past `i16::MAX`
-   caps; jitter spread preserved by a uniform shift (unit test on a small layer).
+5. **listeners preserved** — register a layer‑0 listener, run `calibrate`, then one wave: the
+   listener still fires (save/restore worked).
+6. **`Layer::shift_threshold` clamp** (unit test in `neurons.rs`) — subtracting past 1 floors at 1;
+   adding past `i16::MAX` caps; a uniform shift preserves the jitter spread.
 
 `cargo build` warning-free; no `unsafe`; standard library only.
 
 ## Files touched
 
-- **`src/wave_net/calibrate.rs`** — replace stub: `CalibrateParams`, `calibrate`, `random_l0_input`,
-  `measure`/`step_layer` helpers, tests.
-- **`src/wave_net/network.rs`** — add `shift_layer_threshold`, `max_layer_threshold`,
-  `layer_thresholds`.
-- **`src/wave_net/synapse.rs`** — add `P_INPUT`.
-- `mod.rs` unchanged (`calibrate` already declared).
+- **`src/wave_net/neurons.rs`** — `Layer::shift_threshold`, `calibrate_step`, `thresholds`,
+  `set_thresholds` (+ a `shift_threshold` unit test). Layer stays the self-contained persistable unit.
+- **`src/wave_net/network.rs`** — `with_layer_mut`, `measure_layer_rates` (with listener
+  save/restore), `layer_thresholds`.
+- **`src/wave_net/calibrate.rs`** — replace stub: `CalibrateParams`, `random_l0_input`, and
+  `impl Network { pub fn calibrate }`, plus integration tests.
+- **`src/wave_net/synapse.rs`** — add `pub const P_INPUT: u64 = 5;`.
+- `mod.rs` unchanged.
 
 ## Non-goals
 
 No σ / criticality targeting, no per-neuron homeostatic field, no memory-capacity / XOR evaluation,
-no threading, no persistence of the calibrated thresholds (they live in the mutated `Network`;
-rebuilding from `Config` resets them — a later export/import can add persistence if needed).
+no threading, and **no serialization code yet** — persistence is structured-for (each `Layer` is a
+self-contained unit with threshold get/set) and built as a separate task when needed.
