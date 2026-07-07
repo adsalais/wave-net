@@ -1,6 +1,7 @@
-//! `wave` — one layer's per-wave step: integrate (drain inbox) → inject → clamp →
-//! decide → generate outgoing synapses → leak. Touches only this layer; the Network
-//! routes the generated synapses into other layers' inboxes for the next wave.
+//! `wave` — one layer's per-wave step: integrate (drain inbox) → inject → decide →
+//! generate outgoing synapses → leak. Touches only this layer; the Network routes the
+//! generated synapses into other layers' inboxes for the next wave. The only clamp is the
+//! `i16` narrowing in drain — pure overflow protection; firing and leak bound the potential.
 
 use crate::wave_net::neurons::Layer;
 use crate::wave_net::synapse::{generate_into, SynapseGroup};
@@ -22,7 +23,7 @@ pub fn process_layer(
         *c = c.saturating_sub(1);
     }
 
-    // 2. drain inbox: sum deliveries in i32, fold into potential (narrow to i16), clear inbox
+    // 2. drain inbox: sum deliveries in i32, fold into potential, narrow to i16 (overflow guard)
     for a in acc[..ls].iter_mut() {
         *a = 0;
     }
@@ -35,19 +36,14 @@ pub fn process_layer(
         layer.potential[i] = v.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
     }
 
-    // 3. inject forced-fire input (L0 only; other layers get &[])
+    // 3. inject forced-fire input (L0 only; other layers get &[]). i16::MAX is >= every
+    // possible threshold, so injected neurons always fire this wave.
     for &a in input {
-        layer.potential[a as usize] = layer.saturation;
+        layer.potential[a as usize] = i16::MAX;
         layer.cooldown[a as usize] = 0;
     }
 
-    // 4. one saturation clamp
-    let sat = layer.saturation;
-    for p in layer.potential.iter_mut() {
-        *p = (*p).clamp(-sat, sat);
-    }
-
-    // 5. decide
+    // 4. decide
     fired.clear();
     for i in 0..ls {
         if layer.cooldown[i] == 0 && layer.potential[i] >= layer.threshold[i] {
@@ -57,7 +53,7 @@ pub fn process_layer(
         }
     }
 
-    // 6. generate outgoing synapses, aggregated by relative level into `out`
+    // 5. generate outgoing synapses, aggregated by relative level into `out`
     let base = layer_index as usize * ls;
     for &local in fired.iter() {
         generate_into(
@@ -71,7 +67,7 @@ pub fn process_layer(
         );
     }
 
-    // 7. leak survivors into the next wave
+    // 6. leak survivors into the next wave
     let (la, lb) = layer.leak;
     for p in layer.potential.iter_mut() {
         let v = *p;
@@ -94,7 +90,6 @@ mod tests {
             cooldown_base,
             inhibitor_ratio: 0,
             threshold_jitter: 0,
-            saturation: i16::MAX,
         };
         let mut l = Layer::new(&cfg, 0, 0, size);
         for t in l.threshold.iter_mut() {
@@ -130,7 +125,7 @@ mod tests {
         let mut acc = vec![0i32; 1];
         let mut out: Vec<SynapseGroup> = Vec::new();
         let mut fired = Vec::new();
-        // wave A: force fire via injection (potential=saturation, cooldown=0)
+        // wave A: force fire via injection (potential=i16::MAX, cooldown=0)
         process_layer(&mut l, 0, 0, 1, &[0], &mut acc, &mut out, &mut fired);
         assert_eq!(fired, vec![0]);
         // wave B: strong drive but still refractory (cooldown 2 -> 1)
@@ -154,22 +149,27 @@ mod tests {
     }
 
     #[test]
-    fn inhibition_and_single_clamp() {
-        let mut l = low_layer(1, 30_000, 2, vec![]);
-        l.saturation = 50;
-        l.potential[0] = 40;
-        // +100 excitatory, -10 inhibitory -> raw 130, clamps once to 50
-        for _ in 0..100 {
-            l.inbox.push(Synapse { target: 0, inhibitory: false });
-        }
-        for _ in 0..10 {
-            l.inbox.push(Synapse { target: 0, inhibitory: true });
-        }
-        let mut acc = vec![0i32; 1];
-        let mut out: Vec<SynapseGroup> = Vec::new();
-        let mut fired = Vec::new();
-        process_layer(&mut l, 0, 0, 1, &[], &mut acc, &mut out, &mut fired);
-        // clamped to 50 pre-decide (no fire), then leak (3,5): 50 - 6 - 1 = 43
-        assert_eq!(l.potential[0], 43);
+    fn inhibition_nets_once_order_independent() {
+        // +100 excitatory, -10 inhibitory summed in one i32 pass -> net +90; order can't matter,
+        // and with saturation gone there is no membrane clamp below the i16 bound.
+        let run = |exc_first: bool| {
+            let mut l = low_layer(1, 30_000, 2, vec![]);
+            l.potential[0] = 40;
+            if exc_first {
+                for _ in 0..100 { l.inbox.push(Synapse { target: 0, inhibitory: false }); }
+                for _ in 0..10 { l.inbox.push(Synapse { target: 0, inhibitory: true }); }
+            } else {
+                for _ in 0..10 { l.inbox.push(Synapse { target: 0, inhibitory: true }); }
+                for _ in 0..100 { l.inbox.push(Synapse { target: 0, inhibitory: false }); }
+            }
+            let mut acc = vec![0i32; 1];
+            let mut out: Vec<SynapseGroup> = Vec::new();
+            let mut fired = Vec::new();
+            process_layer(&mut l, 0, 0, 1, &[], &mut acc, &mut out, &mut fired);
+            l.potential[0]
+        };
+        // 40 + 90 = 130 (no clamp), then leak (3,5): 130 - 16 - 4 = 110
+        assert_eq!(run(true), 110);
+        assert_eq!(run(false), 110); // identical regardless of delivery order
     }
 }

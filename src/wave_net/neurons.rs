@@ -13,7 +13,6 @@ pub struct Layer {
 
     // tunable params (calibration/training will rewrite these between phases)
     pub threshold: Vec<i16>,
-    pub saturation: i16,
 
     // fixed structure
     pub leak: (u8, u8),
@@ -39,7 +38,6 @@ impl Layer {
             inbox: Vec::new(),
             outbox: Vec::new(),
             threshold,
-            saturation: cfg.saturation,
             leak: cfg.leak,
             cooldown_base: cfg.cooldown_base,
             topology: cfg.topology.clone(),
@@ -65,7 +63,6 @@ mod tests {
             cooldown_base: 2,
             inhibitor_ratio: 0,
             threshold_jitter: jitter,
-            saturation: i16::MAX,
         }
     }
 

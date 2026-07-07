@@ -26,12 +26,6 @@ impl Network {
         let mut layers = Vec::with_capacity(l);
         for (z, lc) in config.layers.iter().enumerate() {
             let layer = Layer::new(lc, config.seed, z as u32, size);
-            assert!(
-                layer.saturation >= layer.max_threshold(),
-                "layer {z}: saturation {} must be >= max threshold {}",
-                layer.saturation,
-                layer.max_threshold()
-            );
             layers.push(Mutex::new(layer));
         }
         Network {
@@ -136,24 +130,14 @@ mod tests {
             cooldown_base: 2,
             inhibitor_ratio: 0,
             threshold_jitter: 0,
-            saturation: i16::MAX,
         };
         let l1 = LayerConfig { topology: vec![], ..l0.clone() };
         Config { seed: 99, size: 4, layers: vec![l0, l1] }
     }
 
     #[test]
-    fn new_asserts_invariants() {
+    fn new_builds_expected_size() {
         assert_eq!(Network::new(two_layer()).n_total(), 32);
-    }
-
-    #[test]
-    #[should_panic(expected = "saturation")]
-    fn new_rejects_saturation_below_threshold() {
-        let mut c = two_layer();
-        c.layers[0].threshold_jitter = 0; // threshold == i16::MAX
-        c.layers[0].saturation = 100; // < max threshold -> panic
-        Network::new(c);
     }
 
     #[test]

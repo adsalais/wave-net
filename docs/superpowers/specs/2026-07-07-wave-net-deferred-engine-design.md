@@ -2,6 +2,13 @@
 
 **Date:** 2026-07-07
 **Status:** approved (brainstorming complete)
+
+> **Amendment (2026-07-07):** `saturation` was **removed** from the engine after implementation.
+> Firing (reset-on-fire) plus `i16` storage and leak already bound the potential, so a separate
+> per-layer membrane clamp was redundant. Overflow protection is the single `i16` narrowing in the
+> drain step; forced-fire injection sets `potential = i16::MAX` (unconditionally ≥ any `i16`
+> threshold), which also retired the `saturation ≥ max threshold` invariant and its construction
+> assert. Read the `saturation`, clamp-step, and per-layer-saturation passages below as historical.
 **Scope of this spec:** v1 = a *technically functioning*, deterministic, single-threaded
 engine. **No threads, no training, no calibration logic, no demo/example.** Not
 byte-identical to `wave_reservoir` — it is a deliberately different model.
