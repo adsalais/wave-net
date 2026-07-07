@@ -25,6 +25,7 @@ pub struct SynapseGroup {
 /// Hash purpose tags (keep stable — they seed distinct hash streams).
 pub const P_TARGET: u64 = 1;
 pub const P_THRESHOLD: u64 = 3;
+pub const P_INPUT: u64 = 5;
 
 #[inline]
 pub fn mix(mut z: u64) -> u64 {
