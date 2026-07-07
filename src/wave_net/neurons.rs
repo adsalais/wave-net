@@ -48,6 +48,36 @@ impl Layer {
     pub fn max_threshold(&self) -> i16 {
         self.threshold.iter().copied().max().unwrap_or(0)
     }
+
+    /// Subtract `delta` from every threshold (delta>0 lowers), clamped to [1, i16::MAX].
+    /// Uniform shift, so per-neuron jitter is preserved.
+    pub fn shift_threshold(&mut self, delta: i32) {
+        for t in self.threshold.iter_mut() {
+            *t = ((*t as i32) - delta).clamp(1, i16::MAX as i32) as i16;
+        }
+    }
+
+    /// One measure-informed tuning step toward `target` (fractions in 0..1). Returns whether it
+    /// adjusted. Geometric step `max_threshold >> step_shift`; lower when too cold, raise when hot,
+    /// no-op inside the tolerance band.
+    pub fn calibrate_step(&mut self, rate: f64, target: f64, tol: f64, step_shift: u32) -> bool {
+        if (rate - target).abs() <= tol {
+            return false;
+        }
+        let step = ((self.max_threshold() as i32) >> step_shift).max(1);
+        let delta = if rate < target { step } else { -step };
+        self.shift_threshold(delta);
+        true
+    }
+
+    pub fn thresholds(&self) -> &[i16] {
+        &self.threshold
+    }
+
+    pub fn set_thresholds(&mut self, t: Vec<i16>) {
+        assert_eq!(t.len(), self.threshold.len(), "threshold length mismatch");
+        self.threshold = t;
+    }
 }
 
 #[cfg(test)]
@@ -90,5 +120,41 @@ mod tests {
         let a = Layer::new(&lc(128), 7, 2, 8);
         let b = Layer::new(&lc(128), 7, 2, 8);
         assert_eq!(a.threshold, b.threshold);
+    }
+
+    #[test]
+    fn shift_threshold_clamps_and_preserves_jitter() {
+        let mut l = Layer::new(&lc(128), 1, 0, 8);
+        let before = l.thresholds().to_vec();
+        l.shift_threshold(1000);
+        for (a, b) in before.iter().zip(l.thresholds()) {
+            assert_eq!(*b as i32, (*a as i32 - 1000).max(1));
+        }
+        l.shift_threshold(i16::MAX as i32); // drive well past the floor
+        assert!(l.thresholds().iter().all(|&t| t == 1));
+        l.shift_threshold(-(i16::MAX as i32)); // raise past the cap
+        assert!(l.thresholds().iter().all(|&t| t == i16::MAX));
+    }
+
+    #[test]
+    fn calibrate_step_lowers_cold_raises_hot_holds_in_band() {
+        let mut l = Layer::new(&lc(0), 1, 0, 8); // jitter 0 -> all i16::MAX
+        let m0 = l.max_threshold();
+        assert!(l.calibrate_step(0.0, 0.1, 0.02, 2)); // cold -> lower
+        assert!(l.max_threshold() < m0);
+        let m1 = l.max_threshold();
+        assert!(!l.calibrate_step(0.1, 0.1, 0.02, 2)); // in band -> no change
+        assert_eq!(l.max_threshold(), m1);
+        assert!(l.calibrate_step(0.5, 0.1, 0.02, 2)); // hot -> raise
+        assert!(l.max_threshold() > m1);
+    }
+
+    #[test]
+    fn thresholds_round_trip() {
+        let mut l = Layer::new(&lc(128), 1, 0, 8);
+        let snap = l.thresholds().to_vec();
+        l.shift_threshold(500);
+        l.set_thresholds(snap.clone());
+        assert_eq!(l.thresholds(), snap.as_slice());
     }
 }
