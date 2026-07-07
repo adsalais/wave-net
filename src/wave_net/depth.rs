@@ -6,10 +6,10 @@
 
 use crate::wave_net::linalg::ridge_fit;
 use crate::wave_net::stream::{fair_bit, BipolarInput};
-use crate::wave_reservoir::config::IntConfig;
-use crate::wave_reservoir::hash::mix;
-use crate::wave_reservoir::index::Dims;
-use crate::wave_reservoir::pipeline::LayerNet;
+use crate::wave_net::config::IntConfig;
+use crate::wave_net::hash::mix;
+use crate::wave_net::index::Dims;
+use crate::wave_net::pipeline::LayerNet;
 use std::sync::{Arc, Mutex};
 
 /// Per-layer diagnostic result.

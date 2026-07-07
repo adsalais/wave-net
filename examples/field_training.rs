@@ -15,9 +15,9 @@ use wave_net::wave_net::calibrate::{calibrate, CalibrateParams};
 use wave_net::wave_net::readout::OnlineReadout;
 use wave_net::wave_net::stream::{fair_bit, BipolarInput};
 use wave_net::wave_net::train::{add_field, hill_climb, PerturbParams};
-use wave_net::wave_reservoir::config::IntConfig;
-use wave_net::wave_reservoir::index::Dims;
-use wave_net::wave_reservoir::pipeline::LayerNet;
+use wave_net::wave_net::config::IntConfig;
+use wave_net::wave_net::index::Dims;
+use wave_net::wave_net::pipeline::LayerNet;
 
 const WPB: usize = 8;
 const WASHOUT: usize = 30;

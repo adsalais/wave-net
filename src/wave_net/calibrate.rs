@@ -3,8 +3,8 @@
 //! bigger networks added later are calibrated with the same call. Generalizes the
 //! `calibrate_on_stream` routine that used to live only in the `params_study` example.
 
-use crate::wave_reservoir::config::{spread_log2_for, IntConfig, MAX_SATURATION};
-use crate::wave_reservoir::pipeline::LayerNet;
+use crate::wave_net::config::{spread_log2_for, IntConfig, MAX_SATURATION};
+use crate::wave_net::pipeline::LayerNet;
 use std::sync::{Arc, Mutex};
 
 /// Knobs for [`calibrate`].
@@ -78,7 +78,7 @@ pub fn calibrate(
 mod tests {
     use super::*;
     use crate::wave_net::stream::{fair_bit, BipolarInput};
-    use crate::wave_reservoir::index::Dims;
+    use crate::wave_net::index::Dims;
 
     fn bit_drive(cfg: &IntConfig, wpb: usize) -> impl Fn(usize, &mut Vec<i16>) + Sync + use<> {
         let dims = Dims::new(cfg.w, cfg.h, cfg.l);

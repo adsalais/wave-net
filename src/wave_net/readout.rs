@@ -63,7 +63,7 @@ impl OnlineReadout {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wave_reservoir::hash::mix;
+    use crate::wave_net::hash::mix;
 
     #[test]
     fn rls_recovers_a_linear_map() {
@@ -88,9 +88,9 @@ mod tests {
         // reservoir training is meant to lift).
         use crate::wave_net::calibrate::{calibrate, CalibrateParams};
         use crate::wave_net::stream::{fair_bit, BipolarInput};
-        use crate::wave_reservoir::config::IntConfig;
-        use crate::wave_reservoir::index::Dims;
-        use crate::wave_reservoir::pipeline::LayerNet;
+        use crate::wave_net::config::IntConfig;
+        use crate::wave_net::index::Dims;
+        use crate::wave_net::pipeline::LayerNet;
         use std::sync::{Arc, Mutex};
 
         const WPB: usize = 8;

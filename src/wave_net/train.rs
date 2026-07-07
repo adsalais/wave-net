@@ -3,7 +3,7 @@
 //! practice the online top-layer readout accuracy (see `examples/field_training.rs`), a mock in
 //! tests. Works directly on the non-differentiable integer engine: no gradients needed.
 
-use crate::wave_reservoir::hash::mix;
+use crate::wave_net::hash::mix;
 
 /// Add a per-neuron field into a (zeroed) drive buffer, saturating: `buf[i] += field[i]`.
 /// This is how the field "rides on the drive" without touching the engine.
