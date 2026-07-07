@@ -1,13 +1,175 @@
-//process a wave tick:
-// access layer
-// 1- update neurons potential from Layer::update_buffer
-// 2- parse neurons
-//      - if neuron is ready to fire
-//          proceduraly generate its synapse
-//             for each layer from the topology add the synapse to the update_buffer
-//          update the refractory to its cooldown_base
-//          feed a spike_buffer
-//      - if not, decrease the refractory period if not zero
-//      - leak the potential
-// 3- notify the spikes to the listeners using the spike_buffer
-//pub fn process_wave(layer: &mut Layer, the otehr layers for topology) {}
+//! `wave` — one layer's per-wave step: integrate (drain inbox) → inject → clamp →
+//! decide → generate outgoing synapses → leak. Touches only this layer; the Network
+//! routes the generated synapses into other layers' inboxes for the next wave.
+
+use crate::wave_net::neurons::Layer;
+use crate::wave_net::synapse::{generate_into, SynapseGroup};
+
+pub fn process_layer(
+    layer: &mut Layer,
+    layer_index: u32,
+    seed: u64,
+    size: u32,
+    input: &[u32],
+    acc: &mut [i32],
+    out: &mut [SynapseGroup],
+    fired: &mut Vec<u32>,
+) {
+    let ls = (size as usize) * (size as usize);
+
+    // 1. cooldown decay
+    for c in layer.cooldown.iter_mut() {
+        *c = c.saturating_sub(1);
+    }
+
+    // 2. drain inbox: sum deliveries in i32, fold into potential (narrow to i16), clear inbox
+    for a in acc[..ls].iter_mut() {
+        *a = 0;
+    }
+    for s in layer.inbox.iter() {
+        acc[s.target as usize] += if s.inhibitory { -1 } else { 1 };
+    }
+    layer.inbox.clear();
+    for i in 0..ls {
+        let v = layer.potential[i] as i32 + acc[i];
+        layer.potential[i] = v.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+    }
+
+    // 3. inject forced-fire input (L0 only; other layers get &[])
+    for &a in input {
+        layer.potential[a as usize] = layer.saturation;
+        layer.cooldown[a as usize] = 0;
+    }
+
+    // 4. one saturation clamp
+    let sat = layer.saturation;
+    for p in layer.potential.iter_mut() {
+        *p = (*p).clamp(-sat, sat);
+    }
+
+    // 5. decide
+    fired.clear();
+    for i in 0..ls {
+        if layer.cooldown[i] == 0 && layer.potential[i] >= layer.threshold[i] {
+            layer.potential[i] = 0;
+            layer.cooldown[i] = layer.cooldown_base;
+            fired.push(i as u32);
+        }
+    }
+
+    // 6. generate outgoing synapses, aggregated by relative level into `out`
+    let base = layer_index as usize * ls;
+    for &local in fired.iter() {
+        generate_into(
+            seed,
+            (base + local as usize) as u32,
+            local,
+            size,
+            &layer.topology,
+            layer.inhibitor_ratio,
+            out,
+        );
+    }
+
+    // 7. leak survivors into the next wave
+    let (la, lb) = layer.leak;
+    for p in layer.potential.iter_mut() {
+        let v = *p;
+        *p = v - (v >> la) - (v >> lb);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wave_net::config::LayerConfig;
+    use crate::wave_net::neurons::Layer;
+    use crate::wave_net::synapse::{Synapse, SynapseGroup, TopologyLevel};
+
+    // A layer with hand-set LOW thresholds so integration can actually cause firing.
+    fn low_layer(size: u32, threshold: i16, cooldown_base: u8, topo: Vec<TopologyLevel>) -> Layer {
+        let cfg = LayerConfig {
+            topology: topo,
+            leak: (3, 5),
+            cooldown_base,
+            inhibitor_ratio: 0,
+            threshold_jitter: 0,
+            saturation: i16::MAX,
+        };
+        let mut l = Layer::new(&cfg, 0, 0, size);
+        for t in l.threshold.iter_mut() {
+            *t = threshold;
+        }
+        l
+    }
+
+    fn groups_for(l: &Layer) -> Vec<SynapseGroup> {
+        l.topology.iter().map(|e| SynapseGroup { level: e.level, synapses: Vec::new() }).collect()
+    }
+
+    #[test]
+    fn integration_fires_and_resets() {
+        let mut l = low_layer(4, 3, 2, vec![TopologyLevel { level: 1, radius: 0, count: 1 }]);
+        for _ in 0..3 {
+            l.inbox.push(Synapse { target: 0, inhibitory: false });
+        }
+        let mut acc = vec![0i32; 16];
+        let mut out = groups_for(&l);
+        let mut fired = Vec::new();
+        process_layer(&mut l, 0, 0, 4, &[], &mut acc, &mut out, &mut fired);
+        assert_eq!(fired, vec![0]);
+        assert_eq!(l.potential[0], 0);
+        assert_eq!(l.cooldown[0], 2);
+        assert_eq!(out[0].synapses.len(), 1);
+        assert!(l.inbox.is_empty());
+    }
+
+    #[test]
+    fn refractory_blocks_refire() {
+        let mut l = low_layer(1, 3, 2, vec![]);
+        let mut acc = vec![0i32; 1];
+        let mut out: Vec<SynapseGroup> = Vec::new();
+        let mut fired = Vec::new();
+        // wave A: force fire via injection (potential=saturation, cooldown=0)
+        process_layer(&mut l, 0, 0, 1, &[0], &mut acc, &mut out, &mut fired);
+        assert_eq!(fired, vec![0]);
+        // wave B: strong drive but still refractory (cooldown 2 -> 1)
+        for _ in 0..100 {
+            l.inbox.push(Synapse { target: 0, inhibitory: false });
+        }
+        process_layer(&mut l, 0, 0, 1, &[], &mut acc, &mut out, &mut fired);
+        assert!(fired.is_empty(), "must not fire while refractory");
+    }
+
+    #[test]
+    fn leak_decays_subthreshold_potential() {
+        let mut l = low_layer(1, 20_000, 2, vec![]);
+        l.potential[0] = 1000;
+        let mut acc = vec![0i32; 1];
+        let mut out: Vec<SynapseGroup> = Vec::new();
+        let mut fired = Vec::new();
+        process_layer(&mut l, 0, 0, 1, &[], &mut acc, &mut out, &mut fired);
+        // leak (3,5): 1000 - 125 - 31 = 844
+        assert_eq!(l.potential[0], 844);
+    }
+
+    #[test]
+    fn inhibition_and_single_clamp() {
+        let mut l = low_layer(1, 30_000, 2, vec![]);
+        l.saturation = 50;
+        l.potential[0] = 40;
+        // +100 excitatory, -10 inhibitory -> raw 130, clamps once to 50
+        for _ in 0..100 {
+            l.inbox.push(Synapse { target: 0, inhibitory: false });
+        }
+        for _ in 0..10 {
+            l.inbox.push(Synapse { target: 0, inhibitory: true });
+        }
+        let mut acc = vec![0i32; 1];
+        let mut out: Vec<SynapseGroup> = Vec::new();
+        let mut fired = Vec::new();
+        process_layer(&mut l, 0, 0, 1, &[], &mut acc, &mut out, &mut fired);
+        // clamped to 50 pre-decide (no fire), then leak (3,5): 50 - 6 - 1 = 43
+        assert_eq!(l.potential[0], 43);
+    }
+}
