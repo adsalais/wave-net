@@ -82,6 +82,12 @@ Substantial features are **spec-driven**: brainstorm the design first, write it 
 TDD plan, then implement test-first with one commit per task. Design the **learning layer** this way
 before writing training code — it is the core research question, not a mechanical change.
 
+**Plan execution is inline and autonomous.** Always execute plans inline (via executing-plans) —
+never offer or use the subagent-driven option. Once plan-writing has started, do not pause for user
+input: no execution-approach question, no per-task approval gate. Write the plan, then implement it
+task-by-task to completion in the same session, stopping only for a genuinely destructive action or
+a real change of scope.
+
 ## Architecture map
 
 ```
