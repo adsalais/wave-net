@@ -2,7 +2,7 @@
 //! generated synapses into the target layers' inboxes for the next wave.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::wave_net::config::Config;
 use crate::wave_net::neurons::Layer;
@@ -113,6 +113,50 @@ impl Network {
     pub fn n_total(&self) -> usize {
         self.layers.len() * (self.size as usize) * (self.size as usize)
     }
+
+    /// Locked mutable access to one layer (how calibration reaches Layer methods).
+    pub(crate) fn with_layer_mut<R>(&self, z: usize, f: impl FnOnce(&mut Layer) -> R) -> R {
+        let mut g = self.layers[z].lock().unwrap();
+        f(&mut g)
+    }
+
+    /// A copy of a layer's per-neuron thresholds (introspection / determinism tests).
+    pub fn layer_thresholds(&self, z: usize) -> Vec<i16> {
+        self.with_layer_mut(z, |l| l.thresholds().to_vec())
+    }
+
+    /// Reset, run `warmup` waves (discarded), then `waves` counted; per-layer firing rate =
+    /// spikes / (layer_size * waves). Saves and restores the caller's listeners around the run.
+    pub(crate) fn measure_layer_rates(
+        &mut self,
+        warmup: usize,
+        waves: usize,
+        input: &impl Fn(usize) -> Vec<u32>,
+    ) -> Vec<f64> {
+        let l = self.layers.len();
+        // Move the caller's listeners aside (boxed Fn is not Clone), install counters.
+        let saved = std::mem::replace(&mut self.listeners, (0..l).map(|_| None).collect());
+        let counts = Arc::new(Mutex::new(vec![0u64; l]));
+        for z in 0..l {
+            let c = counts.clone();
+            self.listeners[z] = Some(Box::new(move |_w: usize, fired: &[u32]| {
+                c.lock().unwrap()[z] += fired.len() as u64;
+            }));
+        }
+        self.reset_state();
+        for w in 0..warmup {
+            self.wave(&input(w));
+        }
+        counts.lock().unwrap().iter_mut().for_each(|c| *c = 0); // discard warmup
+        for w in 0..waves {
+            self.wave(&input(warmup + w));
+        }
+        self.listeners = saved; // restore caller's listeners; counters dropped
+        let counts = std::mem::take(&mut *counts.lock().unwrap());
+        let ls = (self.size as u64) * (self.size as u64);
+        let denom = (ls * waves as u64) as f64;
+        counts.iter().map(|&s| s as f64 / denom).collect()
+    }
 }
 
 #[cfg(test)]
@@ -189,5 +233,38 @@ mod tests {
                 assert_eq!(net.potential(z, i), 0);
             }
         }
+    }
+
+    #[test]
+    fn layer_thresholds_reads_layer() {
+        let net = Network::new(two_layer()); // jitter 0 -> all i16::MAX
+        let t = net.layer_thresholds(1);
+        assert_eq!(t.len(), 16); // size 4 -> 16
+        assert!(t.iter().all(|&x| x == i16::MAX));
+    }
+
+    #[test]
+    fn measure_rates_reflects_l0_injection() {
+        // inject 4 of the 16 L0 locals (size 4) every wave -> rates[0] = 0.25; L1 silent (near-max)
+        let mut net = Network::new(two_layer());
+        let input = |_w: usize| (0..4u32).collect::<Vec<u32>>();
+        let rates = net.measure_layer_rates(4, 32, &input);
+        assert!((rates[0] - 0.25).abs() < 0.02, "L0 rate {} != ~0.25", rates[0]);
+        assert!(rates[1] < 0.01, "L1 should be silent, got {}", rates[1]);
+    }
+
+    #[test]
+    fn measure_preserves_listeners() {
+        let mut net = Network::new(two_layer());
+        let hits = Arc::new(Mutex::new(0usize));
+        {
+            let h = hits.clone();
+            net.on_layer(0, Box::new(move |_w, _f| *h.lock().unwrap() += 1));
+        }
+        let input = |_w: usize| vec![0u32];
+        net.measure_layer_rates(2, 8, &input);
+        *hits.lock().unwrap() = 0; // reset, then one wave must still hit the user listener
+        net.wave(&[0]);
+        assert_eq!(*hits.lock().unwrap(), 1, "user listener must survive measurement");
     }
 }
