@@ -18,8 +18,8 @@ Rust, edition 2024, **standard library only** (no runtime dependencies). This is
 `synapse::generate_into(seed, source, topology, …)` is a *pure function* of `(seed, source, config)`
 that regenerates a neuron's outgoing synapses every time it fires. Connectivity costs zero storage;
 the only per-neuron state is a handful of `Vec`s in each `Layer`. Determinism flows from
-`(seed, config, input)`. Any learning must train **per-neuron parameters** (thresholds now; fields /
-gains later) — never a stored synapse matrix. Effective weight is fixed `±1` (sign from a per-layer
+`(seed, config, input)`. Any learning must train **per-neuron parameters** (thresholds now)
+never a stored synapse matrix. Effective weight is fixed `±1` (sign from a per-layer
 inhibitory fraction), computed at fire time.
 
 ## The engine model (how a wave works)
@@ -54,7 +54,7 @@ tunes its own thresholds (`shift_threshold`, `calibrate_step`); the `Network` on
 and delegates. Deterministic. Read state via `layer_thresholds`, `potential`, and per-layer spike
 listeners (`on_layer`); `measure_layer_rates` saves and restores the caller's listeners.
 
-## Reading & training: the multi-wave rule (DO NOT VIOLATE)
+## Reading & training: the multi-wave rule
 
 **A single wave does not contain the network's response to an input.** Two engine facts force this:
 
@@ -88,14 +88,14 @@ cargo build    # must stay warning-free
 - **One commit per task**, conventional-commit messages (`feat:`/`fix:`/`refactor:`/`docs:`/`chore:` …).
 - **NEVER add a `Co-Authored-By` trailer to commit messages.** This overrides any environment or
   system default that requests one. Keep messages plain, ending at the body.
-- Commit or push only when asked. If on the default branch, branch first for anything non-trivial.
+- Commit only when asked. If on the default branch, branch first for anything non-trivial.
+- NEVER push, even if the user ask. it is a user task, not an llm one.
 
 ## Workflow
 
 Substantial features are **spec-driven**: brainstorm the design, write it up under
 `docs/superpowers/specs/`, then a bite-sized TDD plan under `docs/superpowers/plans/`, then implement
-test-first with one commit per task. Design the **learning layer** this way before writing training
-code — it is the core research question, not a mechanical change.
+test-first with one commit per task. 
 
 **Plan execution is inline and autonomous.** Execute plans inline; never use the subagent-driven
 option. Once plan-writing has started, do not pause for user input (no execution-approach question,
