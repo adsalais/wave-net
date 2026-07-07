@@ -1,11 +1,11 @@
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct TopologyLevel {
     pub level: i32,
     pub radius: u32,
     pub count: u32,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct Synapse {
     // neuron that will receive the input
     pub target: u32,
@@ -14,7 +14,17 @@ pub struct Synapse {
     pub inhibitory: bool,
 }
 
-//contains all the logic to generate the synapses based on a provided &Vec<TopologyLevel>, seed and adress of the neuron(layer number and adress)
+/// A firing neuron's outgoing synapses for one topology entry, tagged with the entry's
+/// **relative** layer offset. The `Network` resolves the absolute target layer.
+#[derive(Debug)]
+pub struct SynapseGroup {
+    pub level: i32,
+    pub synapses: Vec<Synapse>,
+}
+
+/// Hash purpose tags (keep stable — they seed distinct hash streams).
+pub const P_TARGET: u64 = 1;
+pub const P_THRESHOLD: u64 = 3;
 
 #[inline]
 pub fn mix(mut z: u64) -> u64 {
@@ -47,4 +57,45 @@ pub fn map_range(bits: u32, span: u32) -> u32 {
 #[inline]
 pub fn map_range24(bits: u32, span: u32) -> u32 {
     (((bits as u64) * (span as u64)) >> 24) as u32
+}
+
+/// (x, y) -> local index in a `size`-wide square layer (`size` is a power of two).
+#[inline]
+pub fn local_of(x: u32, y: u32, size: u32) -> u32 {
+    (y << size.trailing_zeros()) | x
+}
+
+/// local index -> (x, y).
+#[inline]
+pub fn xy_of(local: u32, size: u32) -> (u32, u32) {
+    (local & (size - 1), local >> size.trailing_zeros())
+}
+
+/// Toroidal shift of one coordinate by `off`, wrapped into `0..size`.
+#[inline]
+pub fn wrap(base: u32, off: i32, size: u32) -> u32 {
+    ((base as i32 + off) as u32) & (size - 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn index_roundtrip() {
+        let size = 8;
+        for y in 0..size {
+            for x in 0..size {
+                let l = local_of(x, y, size);
+                assert_eq!(xy_of(l, size), (x, y));
+            }
+        }
+    }
+
+    #[test]
+    fn wrap_is_toroidal() {
+        assert_eq!(wrap(0, -1, 8), 7);
+        assert_eq!(wrap(7, 1, 8), 0);
+        assert_eq!(wrap(0, -3, 8), 5);
+    }
 }
