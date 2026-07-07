@@ -82,6 +82,50 @@ training, the menu is:
 
 Any of these must operate on a **multi-wave window**, per the engine's deferred + recurrent dynamics.
 
+## Online, constant-memory training over long windows (FPTT / HYPR family)
+
+The methods below all solve the same problem the multi-wave rule creates: learning over a long
+temporal window in a recurrent spiking net **without storing the window**. Two facts about wave_net
+filter what's borrowable:
+
+- **Weights are fixed ±1 procedural** → per-*synapse* rules don't apply; the only trainable state is
+  **per-neuron** (threshold, maybe leak/adaptation). Point these methods' machinery at per-neuron
+  parameters, not synapses.
+- **Integer hard threshold → no gradients.** Gradient-based methods (FPTT, HYPR, StochEP) need a
+  **differentiable shadow twin**; the gradient-free three-factor form (eligibility × reward) needs
+  no shadow and fits the FPGA-clean integer substrate — that's the natural path.
+
+Ranked by value to this engine:
+
+1. **Adaptive threshold (ALIF) as the trainable slow state** — highest leverage. Make the per-neuron
+   threshold a slow dynamic variable (rises on fire, decays at rest) instead of a static calibrated
+   value. Gives long-range memory, is per-neuron (fits the constraint), and is exactly the variable
+   e-prop/FPTT know how to train (e-prop's ALIF eligibility has a threshold-adaptation component).
+   Cheap: one extra per-neuron slow variable + decay. Bridges static-threshold *calibration* to
+   dynamic-threshold *learning*.
+2. **Constant-memory online learning** — don't store the multi-wave window; carry a constant-size
+   **eligibility trace** forward and update online. Borrow (a) e-prop's threshold eligibility trace
+   as the credit-assignment mechanism (gradient-free when the top-down signal is a reward =
+   three-factor), and (b) FPTT's **dynamic regularizer** (couple each online update to a slowly
+   moving reference parameter) as the stabilizer — transplantable even into a reward-modulated rule.
+3. **Locality ladder for on-substrate learning** — **ETLP** (event-based three-factor local
+   plasticity) is e-prop made hardware-local; the target shape for a rule that runs inside the
+   substrate rather than an offline trainer.
+4. **Liquid / heterogeneous time constants** — FPTT matched BPTT paired with a liquid (adaptive)
+   time-constant neuron. Making `leak` per-neuron / heterogeneous / adaptive is another cheap
+   per-neuron parameter buying multi-timescale memory (adaptive-LIF / resonate-and-fire family).
+5. **HYPR parallelization** — file for later: forward-mode learning parallelizes, and the deferred
+   one-hop model is already layer-parallelizable (read last wave's inbox, write next wave's outbox),
+   so this lands naturally at scale-up.
+6. **StochEP / Equilibrium Propagation** — a stretch: EP needs the net to relax to an equilibrium
+   (convergent RNN, free/nudged phases); a driven wave engine only fits if a settling regime is
+   carved out. Lower priority.
+
+**Suggested path:** per-neuron threshold as an adaptive (ALIF) state, trained by an e-prop-style
+eligibility trace under a reward/three-factor signal (gradient-free, no shadow), regularized
+FPTT-style toward a running reference — with a surrogate-gradient shadow as a ceiling/benchmark and
+ETLP as the on-chip-local target.
+
 ## Sources
 
 - [GeNN procedural connectivity (Nature Comp. Sci. 2021)](https://www.nature.com/articles/s43588-020-00022-7)
@@ -92,3 +136,11 @@ Any of these must operate on a **multi-wave window**, per the engine's deferred 
 - [Implementing SNNs on Neuromorphic Architectures: A Review (TrueNorth/Loihi)](https://arxiv.org/pdf/2202.08897)
 - [Integer-State Dynamics of Quantized SNNs](https://arxiv.org/pdf/2604.01042)
 - [A solution to the learning dilemma for recurrent SNNs (e-prop, Bellec et al.)](https://pmc.ncbi.nlm.nih.gov/articles/PMC7367848/)
+
+Online / constant-memory training and adaptive neurons:
+- FPTT for SNNs — Yin, Corradi & Bohté, *Accurate online training of dynamical SNNs through Forward Propagation Through Time*, Nature Machine Intelligence 2023: [nature](https://www.nature.com/articles/s42256-023-00650-4) · [arXiv](https://arxiv.org/abs/2112.11231). FPTT origin (RNNs): Kag & Saligrama, ICML 2021.
+- HYPR — Baronig et al., *A scalable hybrid training approach for recurrent SNNs*, Neuromorphic Computing and Engineering 2026: [DOI](https://doi.org/10.1088/2634-4386/ae46d4) · [arXiv](https://arxiv.org/abs/2506.14464). Constant memory + ~108× throughput vs e-prop on GPU; works with reset-based LIF/ALIF.
+- e-prop (Nature Communications version) — Bellec et al. 2020: [nature](https://www.nature.com/articles/s41467-020-17236-y).
+- ETLP — *event-based three-factor local plasticity for online learning with neuromorphic hardware*, Neuromorphic Computing and Engineering 4(3):034006, 2024.
+- StochEP — *Stochastic Equilibrium Propagation for Spiking Convergent RNNs*, [arXiv:2511.11320](https://arxiv.org/abs/2511.11320), 2025.
+- LSNN / adaptive-LIF (ALIF) — Bellec et al., *Long short-term memory and learning-to-learn in networks of spiking neurons*, NeurIPS 2018: [arXiv](https://arxiv.org/abs/1803.09574).
