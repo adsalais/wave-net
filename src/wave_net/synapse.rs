@@ -77,9 +77,89 @@ pub fn wrap(base: u32, off: i32, size: u32) -> u32 {
     ((base as i32 + off) as u32) & (size - 1)
 }
 
+/// Append one firing neuron's synapses into `groups` (one per topology entry, same order).
+/// Emits **relative** levels only; the caller (Network) resolves absolute target layers.
+/// Contract: `groups.len() == topology.len()` and `groups[i].level == topology[i].level`.
+/// Appends (does not clear), so a whole layer's firers aggregate into one `groups` set.
+pub fn generate_into(
+    seed: u64,
+    source_global: u32,
+    src_local: u32,
+    size: u32,
+    topology: &[TopologyLevel],
+    inhibitor_ratio: u32,
+    groups: &mut [SynapseGroup],
+) {
+    let (sx, sy) = xy_of(src_local, size);
+    for (entry, group) in topology.iter().zip(groups.iter_mut()) {
+        let span = 2 * entry.radius + 1;
+        for k in 0..entry.count {
+            let h = mix(key(seed, source_global, entry.level, k, P_TARGET));
+            let dx = map_range24((h >> 40) as u32, span) as i32 - entry.radius as i32;
+            let dy = map_range24(((h >> 16) as u32) & 0x00FF_FFFF, span) as i32 - entry.radius as i32;
+            let tx = wrap(sx, dx, size);
+            let ty = wrap(sy, dy, size);
+            let inhibitory = ((h & 0xFFFF) as u32) < inhibitor_ratio;
+            group.synapses.push(Synapse { target: local_of(tx, ty, size), inhibitory });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn topo() -> Vec<TopologyLevel> {
+        vec![
+            TopologyLevel { level: 1, radius: 2, count: 6 },
+            TopologyLevel { level: -1, radius: 0, count: 1 },
+        ]
+    }
+
+    fn empty_groups(t: &[TopologyLevel]) -> Vec<SynapseGroup> {
+        t.iter().map(|e| SynapseGroup { level: e.level, synapses: Vec::new() }).collect()
+    }
+
+    #[test]
+    fn generate_counts_per_level() {
+        let t = topo();
+        let mut g = empty_groups(&t);
+        generate_into(42, 0, 0, 8, &t, 0, &mut g);
+        assert_eq!(g[0].synapses.len(), 6);
+        assert_eq!(g[1].synapses.len(), 1);
+        // radius 0 targets the source cell itself
+        assert_eq!(g[1].synapses[0].target, local_of(0, 0, 8));
+    }
+
+    #[test]
+    fn generate_targets_within_radius() {
+        let t = topo();
+        let mut g = empty_groups(&t);
+        let (sx, sy) = (3u32, 5u32);
+        generate_into(7, 100, local_of(sx, sy, 8), 8, &t, 0, &mut g);
+        for s in &g[0].synapses {
+            let (tx, ty) = xy_of(s.target, 8);
+            let dx = ((tx + 8 - sx) & 7).min((sx + 8 - tx) & 7);
+            let dy = ((ty + 8 - sy) & 7).min((sy + 8 - ty) & 7);
+            assert!(dx <= 2 && dy <= 2, "target ({tx},{ty}) out of radius from ({sx},{sy})");
+        }
+    }
+
+    #[test]
+    fn generate_is_deterministic_and_appends() {
+        let t = topo();
+        let mut a = empty_groups(&t);
+        let mut b = empty_groups(&t);
+        generate_into(1, 9, 9, 8, &t, 30000, &mut a);
+        generate_into(1, 9, 9, 8, &t, 30000, &mut b);
+        assert_eq!(a[0].synapses.len(), b[0].synapses.len());
+        for (x, y) in a[0].synapses.iter().zip(&b[0].synapses) {
+            assert_eq!((x.target, x.inhibitory), (y.target, y.inhibitory));
+        }
+        // second call appends (aggregation across firers)
+        generate_into(1, 9, 9, 8, &t, 30000, &mut a);
+        assert_eq!(a[0].synapses.len(), 12);
+    }
 
     #[test]
     fn index_roundtrip() {
