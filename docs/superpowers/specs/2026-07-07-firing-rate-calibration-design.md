@@ -89,7 +89,9 @@ pub struct CalibrateParams {
     pub refine_passes: usize, // global all-layers passes after bottom-up
     pub step_shift: u32,      // geometric step = max_threshold >> step_shift
 }
-// Default: target 100, tol 20, warmup 32, waves 128, max_steps 24, refine_passes 4, step_shift 2
+// Default: target 100, tol 20, warmup 32, waves 128, max_steps 48, refine_passes 4, step_shift 2
+// (max_steps gives descent headroom from i16::MAX to the low thresholds sparse ±1 layers need;
+//  the geometric step auto-shrinks near target, so 48 does not hurt precision. All are tunable.)
 
 impl Network {
     /// Lower per-layer thresholds (layers 1..L; L0 is the input surface, left as-is) so each fires
