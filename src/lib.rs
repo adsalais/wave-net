@@ -6,4 +6,5 @@
 //! is rebuilt from scratch. `wave_net` will be re-wired here once it has content.
 
 pub mod legacy_net;
+pub mod wave_net;
 pub mod wave_reservoir;
