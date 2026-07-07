@@ -128,19 +128,18 @@ ETLP as the on-chip-local target.
 
 ## Sources
 
-- [GeNN procedural connectivity (Nature Comp. Sci. 2021)](https://www.nature.com/articles/s43588-020-00022-7)
-- [Reservoir Computing: Foundations, Advances, Toward Neuromorphic Intelligence (review)](https://www.mdpi.com/2673-2688/7/2/70)
-- [Reinforcement Learning with Low-Complexity Liquid State Machines](https://pmc.ncbi.nlm.nih.gov/articles/PMC6718696/)
-- [Biologically Inspired Dynamic Thresholds for SNNs](https://arxiv.org/pdf/2206.04426)
-- [Information-Theoretic Intrinsic Plasticity for Online Unsupervised Learning in SNNs](https://www.frontiersin.org/journals/neuroscience/articles/10.3389/fnins.2019.00031/full)
-- [Implementing SNNs on Neuromorphic Architectures: A Review (TrueNorth/Loihi)](https://arxiv.org/pdf/2202.08897)
-- [Integer-State Dynamics of Quantized SNNs](https://arxiv.org/pdf/2604.01042)
-- [A solution to the learning dilemma for recurrent SNNs (e-prop, Bellec et al.)](https://pmc.ncbi.nlm.nih.gov/articles/PMC7367848/)
+Format: *Title* (tag) — Venue Year — link(s).
 
-Online / constant-memory training and adaptive neurons:
-- FPTT for SNNs — Yin, Corradi & Bohté, *Accurate online training of dynamical SNNs through Forward Propagation Through Time*, Nature Machine Intelligence 2023: [nature](https://www.nature.com/articles/s42256-023-00650-4) · [arXiv](https://arxiv.org/abs/2112.11231). FPTT origin (RNNs): Kag & Saligrama, ICML 2021.
-- HYPR — Baronig et al., *A scalable hybrid training approach for recurrent SNNs*, Neuromorphic Computing and Engineering 2026: [DOI](https://doi.org/10.1088/2634-4386/ae46d4) · [arXiv](https://arxiv.org/abs/2506.14464). Constant memory + ~108× throughput vs e-prop on GPU; works with reset-based LIF/ALIF.
-- e-prop (Nature Communications version) — Bellec et al. 2020: [nature](https://www.nature.com/articles/s41467-020-17236-y).
-- ETLP — *event-based three-factor local plasticity for online learning with neuromorphic hardware*, Neuromorphic Computing and Engineering 4(3):034006, 2024.
-- StochEP — *Stochastic Equilibrium Propagation for Spiking Convergent RNNs*, [arXiv:2511.11320](https://arxiv.org/abs/2511.11320), 2025.
-- LSNN / adaptive-LIF (ALIF) — Bellec et al., *Long short-term memory and learning-to-learn in networks of spiking neurons*, NeurIPS 2018: [arXiv](https://arxiv.org/abs/1803.09574).
+- Knight & Nowotny, *Larger GPU-accelerated brain simulations with procedural connectivity* — Nature Computational Science 2021 — [nature](https://www.nature.com/articles/s43588-020-00022-7)
+- *Reservoir Computing: Foundations, Advances, and Challenges Toward Neuromorphic Intelligence* (review) — MDPI AI 2026 — [mdpi](https://www.mdpi.com/2673-2688/7/2/70)
+- *Reinforcement Learning with Low-Complexity Liquid State Machines* — Frontiers in Neuroscience 2019 — [pmc](https://pmc.ncbi.nlm.nih.gov/articles/PMC6718696/)
+- *Biologically Inspired Dynamic Thresholds for Spiking Neural Networks* — arXiv 2022 — [arxiv](https://arxiv.org/pdf/2206.04426)
+- *Information-Theoretic Intrinsic Plasticity for Online Unsupervised Learning in SNNs* — Frontiers in Neuroscience 2019 — [frontiers](https://www.frontiersin.org/journals/neuroscience/articles/10.3389/fnins.2019.00031/full)
+- *Implementing Spiking Neural Networks on Neuromorphic Architectures: A Review* (TrueNorth/Loihi) — arXiv 2022 — [arxiv](https://arxiv.org/pdf/2202.08897)
+- *Integer-State Dynamics of Quantized Spiking Neural Networks* — arXiv 2026 — [arxiv](https://arxiv.org/pdf/2604.01042)
+- Bellec et al., *A solution to the learning dilemma for recurrent networks of spiking neurons* (e-prop) — Nature Communications 2020 — [nature](https://www.nature.com/articles/s41467-020-17236-y) · [pmc](https://pmc.ncbi.nlm.nih.gov/articles/PMC7367848/)
+- Yin, Corradi & Bohté, *Accurate online training of dynamical SNNs through Forward Propagation Through Time* (FPTT) — Nature Machine Intelligence 2023 — [nature](https://www.nature.com/articles/s42256-023-00650-4) · [arxiv](https://arxiv.org/abs/2112.11231) — origin: Kag & Saligrama, ICML 2021
+- Baronig et al., *A scalable hybrid training approach for recurrent SNNs* (HYPR) — Neuromorphic Computing and Engineering 2026 — [doi](https://doi.org/10.1088/2634-4386/ae46d4) · [arxiv](https://arxiv.org/abs/2506.14464)
+- *ETLP: event-based three-factor local plasticity for online learning with neuromorphic hardware* — Neuromorphic Computing and Engineering 2024
+- *Stochastic Equilibrium Propagation for Spiking Convergent Recurrent Neural Networks* (StochEP) — arXiv 2025 — [arxiv](https://arxiv.org/abs/2511.11320)
+- Bellec et al., *Long short-term memory and learning-to-learn in networks of spiking neurons* (LSNN / adaptive-LIF) — NeurIPS 2018 — [arxiv](https://arxiv.org/abs/1803.09574)
