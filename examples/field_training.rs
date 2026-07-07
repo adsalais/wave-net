@@ -11,13 +11,13 @@
 //! Run: `cargo run --release --example field_training [iters]` (default 120).
 
 use std::sync::{Arc, Mutex};
-use wave_net::wave_net::calibrate::{calibrate, CalibrateParams};
-use wave_net::wave_net::readout::OnlineReadout;
-use wave_net::wave_net::stream::{fair_bit, BipolarInput};
-use wave_net::wave_net::train::{add_field, hill_climb, PerturbParams};
-use wave_net::wave_net::config::IntConfig;
-use wave_net::wave_net::index::Dims;
-use wave_net::wave_net::pipeline::LayerNet;
+use wave_net::legacy_net::calibrate::{calibrate, CalibrateParams};
+use wave_net::legacy_net::readout::OnlineReadout;
+use wave_net::legacy_net::stream::{fair_bit, BipolarInput};
+use wave_net::legacy_net::train::{add_field, hill_climb, PerturbParams};
+use wave_net::legacy_net::config::IntConfig;
+use wave_net::legacy_net::index::Dims;
+use wave_net::legacy_net::pipeline::LayerNet;
 
 const WPB: usize = 8;
 const WASHOUT: usize = 30;

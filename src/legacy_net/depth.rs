@@ -4,12 +4,12 @@
 //! saturated top layer shows up as decode accuracy near chance (0.5). This is the promoted,
 //! reusable form of the one-off probe used to decide the conditioning scope.
 
-use crate::wave_net::linalg::ridge_fit;
-use crate::wave_net::stream::{fair_bit, BipolarInput};
-use crate::wave_net::config::IntConfig;
-use crate::wave_net::hash::mix;
-use crate::wave_net::index::Dims;
-use crate::wave_net::pipeline::LayerNet;
+use crate::legacy_net::linalg::ridge_fit;
+use crate::legacy_net::stream::{fair_bit, BipolarInput};
+use crate::legacy_net::config::IntConfig;
+use crate::legacy_net::hash::mix;
+use crate::legacy_net::index::Dims;
+use crate::legacy_net::pipeline::LayerNet;
 use std::sync::{Arc, Mutex};
 
 /// Per-layer diagnostic result.
@@ -164,7 +164,7 @@ pub fn depth_report(cfg: &IntConfig, params: &DepthParams) -> Vec<LayerReport> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wave_net::calibrate::{calibrate, CalibrateParams};
+    use crate::legacy_net::calibrate::{calibrate, CalibrateParams};
 
     #[test]
     fn calibrated_demo_transmits_input_to_the_top_layer() {

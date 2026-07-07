@@ -1,5 +1,5 @@
-use crate::wave_net::hash::{key, map_range, mix, P_TARGET};
-use crate::wave_net::index::Dims;
+use crate::legacy_net::hash::{key, map_range, mix, P_TARGET};
+use crate::legacy_net::index::Dims;
 
 #[derive(Clone, Debug)]
 pub struct InputMap {

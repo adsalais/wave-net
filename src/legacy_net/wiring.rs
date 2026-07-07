@@ -1,6 +1,6 @@
-use crate::wave_net::hash::{key, map_range24, mix, P_TARGET};
-use crate::wave_net::index::Dims;
-use crate::wave_net::config::{IntConfig, IntLevel};
+use crate::legacy_net::hash::{key, map_range24, mix, P_TARGET};
+use crate::legacy_net::index::Dims;
+use crate::legacy_net::config::{IntConfig, IntLevel};
 
 #[derive(Clone, Copy, Debug)]
 pub struct IntSynapse {
@@ -98,8 +98,8 @@ pub fn scatter_layered(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wave_net::index::Dims;
-    use crate::wave_net::config::IntConfig;
+    use crate::legacy_net::index::Dims;
+    use crate::legacy_net::config::IntConfig;
 
     #[test]
     fn flags_carry_both_excitatory_and_inhibitory() {

@@ -2,9 +2,9 @@
 //! encoder. Shared by the calibrator, the depth diagnostic, and task examples so they drive the
 //! reservoir identically. Lifted from the `params_study` example.
 
-use crate::wave_net::hash::mix;
-use crate::wave_net::index::Dims;
-use crate::wave_net::input::InputMap;
+use crate::legacy_net::hash::mix;
+use crate::legacy_net::index::Dims;
+use crate::legacy_net::input::InputMap;
 
 /// Deterministic fair coin: `fair_bit(seed, t)` is a reproducible pseudo-random bit for step `t`.
 pub fn fair_bit(seed: u64, t: u64) -> u8 {

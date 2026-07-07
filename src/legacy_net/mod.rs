@@ -1,4 +1,5 @@
-//! `wave_net` — self-contained engine fork + conditioning & diagnostics toolkit.
+//! `legacy_net` — the previous self-contained engine fork + conditioning & diagnostics toolkit.
+//! Kept as a frozen reference while the new `wave_net` is rebuilt from scratch.
 //!
 //! `wave_net` carries its own copy of the integer wave-reservoir engine (`config`, `hash`,
 //! `index`, `input`, `pipeline`, `wiring`) so training experiments can freely modify it;

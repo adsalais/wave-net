@@ -11,10 +11,10 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
-use crate::wave_net::hash::{key, mix, P_THRESHOLD};
-use crate::wave_net::index::Dims;
-use crate::wave_net::config::{IntConfig, IntLevel, RefractoryMode};
-use crate::wave_net::wiring::for_each_layered;
+use crate::legacy_net::hash::{key, mix, P_THRESHOLD};
+use crate::legacy_net::index::Dims;
+use crate::legacy_net::config::{IntConfig, IntLevel, RefractoryMode};
+use crate::legacy_net::wiring::for_each_layered;
 
 /// One layer's mutable state — the only thing the `Mutex` guards.
 struct Layer {
@@ -367,7 +367,7 @@ impl LayerNet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wave_net::config::MAX_SATURATION;
+    use crate::legacy_net::config::MAX_SATURATION;
     use std::sync::{Arc, Mutex};
 
     #[test]

@@ -63,7 +63,7 @@ impl OnlineReadout {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wave_net::hash::mix;
+    use crate::legacy_net::hash::mix;
 
     #[test]
     fn rls_recovers_a_linear_map() {
@@ -86,11 +86,11 @@ mod tests {
         // the train split, evaluate on the held-out split. Must beat the ~0.5 control, i.e. the
         // top layer already supports temporal-XOR to some degree (the untrained baseline that
         // reservoir training is meant to lift).
-        use crate::wave_net::calibrate::{calibrate, CalibrateParams};
-        use crate::wave_net::stream::{fair_bit, BipolarInput};
-        use crate::wave_net::config::IntConfig;
-        use crate::wave_net::index::Dims;
-        use crate::wave_net::pipeline::LayerNet;
+        use crate::legacy_net::calibrate::{calibrate, CalibrateParams};
+        use crate::legacy_net::stream::{fair_bit, BipolarInput};
+        use crate::legacy_net::config::IntConfig;
+        use crate::legacy_net::index::Dims;
+        use crate::legacy_net::pipeline::LayerNet;
         use std::sync::{Arc, Mutex};
 
         const WPB: usize = 8;

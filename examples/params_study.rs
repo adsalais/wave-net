@@ -3,13 +3,13 @@
 //! and recalibrates on the actual bit stream, so effects aren't confounded with
 //! firing-rate shifts.
 
-use wave_net::wave_net::hash::mix;
-use wave_net::wave_net::index::Dims;
-use wave_net::wave_net::config::{IntConfig, IntLevel, RefractoryMode};
-use wave_net::wave_net::pipeline::LayerNet;
-use wave_net::wave_net::calibrate::{calibrate, CalibrateParams};
-use wave_net::wave_net::linalg::ridge_fit;
-use wave_net::wave_net::stream::{fair_bit, BipolarInput};
+use wave_net::legacy_net::hash::mix;
+use wave_net::legacy_net::index::Dims;
+use wave_net::legacy_net::config::{IntConfig, IntLevel, RefractoryMode};
+use wave_net::legacy_net::pipeline::LayerNet;
+use wave_net::legacy_net::calibrate::{calibrate, CalibrateParams};
+use wave_net::legacy_net::linalg::ridge_fit;
+use wave_net::legacy_net::stream::{fair_bit, BipolarInput};
 use std::sync::{Arc, Mutex};
 
 const READOUT_DIM: usize = 128;
