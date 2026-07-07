@@ -27,24 +27,35 @@ This spec's experiment therefore runs at 32×32.
 
 ## Goal
 
-Make per-neuron thresholds trainable (they are currently frozen hash jitter), and train them at
-**full depth** with a **reward-modulated rule** whose per-neuron credit is a **global scalar
-reward gated by a near-threshold eligibility trace**. Raise held-out temporal-XOR above baseline.
-Ship v1 as the global-scalar rule, with interfaces shaped so a spatially-**propagated** reward
-wave can drop in later without an engine change.
+Make per-neuron thresholds trainable (they are currently frozen hash jitter), and train them with a
+**reward-modulated rule** whose per-neuron credit is a **centered global scalar reward gated by a
+near-threshold eligibility trace**. Raise held-out temporal-XOR above baseline — and, crucially,
+show the gain survives the controls (*Controls and interpretation*), not just the baseline. Ship v1
+as the global-scalar rule, with interfaces shaped so a spatially-**propagated** reward wave can drop
+in later without an engine change. Layer scope (full-depth vs top-first) is an experimental axis,
+not a fixed assumption (see reopened #4).
 
 ## Decisions locked in brainstorming
 
 - **Reward signal:** start with a **global scalar** (readout correct/wrong per bit), broadcast to
   eligible neurons; design the interfaces so a **propagated reward wave** is a later swap.
-- **Scope:** **full depth** (all ~N neurons). Safe here because the rule is local — global reward
-  × per-neuron eligibility applies uniformly, so there is no search-space blow-up (unlike node
-  perturbation).
+- **Reward baseline (centering):** the per-neuron gradient uses the **centered** reward
+  `r(t) − r̄`, not the raw reward. Without this, the constant `r̄·ē_i` term makes the rule a global
+  excitability knob rather than a credit-assignment rule (see Component 3). Added in review.
+- **Controls are mandatory:** the experiment is only interpretable against a **random-proposal**
+  control and a **shuffled-reward** control (see *Controls and interpretation*). Added in review.
 - **Threshold hook:** fold the trainable delta into the **stored** threshold between trials (zero
   hot-path cost), *not* an extra add in the decide loop.
-- **Trainer loop:** batch **propose-then-keep-if-better** (an informed, eligibility-gated proposal
-  replacing random perturbation), *not* a fully-online per-bit update.
 - **Layer size:** 32×32×6.
+
+**Reopened in review (not yet locked):**
+
+- **Trainer loop (#3):** batch propose-then-keep-if-better vs fully-online updates vs
+  eligibility-masked perturbation. Now framed as *proposal strategies under one keep-if-better
+  harness* — see Component 3 and *Controls and interpretation*.
+- **Layer scope (#4):** full-depth vs top-layer-first. Now proposed as an **experimental axis**
+  rather than a fixed choice — the "deep credit is noise" vs "deep layers have unique leverage"
+  tension is an empirical question the controls can answer directly.
 
 ## Out of scope (this spec)
 
@@ -129,7 +140,8 @@ pub struct RewardParams {
 }
 
 /// evaluate(theta) runs the reservoir with that threshold delta and returns
-/// (reward, per_neuron_gradient) where gradient[i] = Σ_t reward(t) · eligible_i(t).
+/// (selection_reward, per_neuron_gradient) where the gradient uses the CENTERED reward:
+///   gradient[i] = Σ_t (reward(t) − r̄) · eligible_i(t),   r̄ = mean reward over the scored bits.
 pub fn reward_modulated(
     init: Vec<i16>,
     cfg: &RewardParams,
@@ -138,14 +150,26 @@ pub fn reward_modulated(
 ```
 
 Per iteration:
-1. `(r0, g) = evaluate(&theta)` — reward + per-neuron eligibility-weighted reward gradient at the
+1. `(r0, g) = evaluate(&theta)` — selection reward + per-neuron centered-reward gradient at the
    current point.
 2. Candidate: `theta' = clamp(theta − lr · sign(g[i]), −clamp, clamp)` per neuron.
-   **Sign:** correct (r>0) → *lower* eligible contributors' thresholds so they fire more readily
-   (reinforce the useful pattern); wrong (r<0) → *raise* them. Hence `−sign(g)`.
+   **Sign:** a neuron whose eligibility correlates with *above-average* reward (g[i] > 0) gets its
+   threshold *lowered* so it fires more readily (reinforce the useful pattern); anti-correlated
+   (g[i] < 0) gets raised. Hence `−sign(g)`. `g[i] = 0` (uncorrelated) → no move.
 3. `(r1, _) = evaluate(&theta')` — "replay and measure the effect".
 4. **Keep-if-better:** accept `theta'` iff `r1 > best`. Record best-so-far in `Outcome.history`
    (non-decreasing, like `hill_climb`).
+
+### Why the reward must be centered (review #1)
+
+Decompose the raw-reward gradient: `Σ_t r(t)·eligible_i(t) ≈ N·r̄·ē_i + N·Cov(r, eligible_i)`.
+At a ~62% baseline `r̄ > 0`, so the first term is **positive for every eligible neuron** — it
+lowers all their thresholds roughly uniformly, which is a global excitability increase, not
+learning. The real credit signal is entirely in `Cov(r, eligible_i)`: does neuron i's
+near-threshold-ness *differ* between correct and incorrect bits? Centering (`r(t) − r̄`) cancels
+the constant term so only the covariance drives updates. This is the REINFORCE baseline /
+variance-reduction trick; v1 uses the **batch mean** `r̄` over the scored bits (a per-neuron or
+moving baseline is a possible later refinement).
 
 The `evaluate → (reward, Vec<f64>)` signature carries a **per-neuron** vector, so replacing the
 global-scalar-derived gradient with a propagated-credit-derived gradient later is a change to the
@@ -164,15 +188,40 @@ Full-depth reward-modulated threshold training, mirroring `field_training.rs`'s 
 - **Eligibility:** an `on_layer_eligibility(z, margin, …)` on **every** layer, accumulating a
   per-neuron, per-bit eligibility count into a full-depth buffer (length N per bit).
 - **`evaluate(theta)`:** `set_threshold_delta(theta)`, `reset_state`, run the stream; the readout
-  trains on TRAIN; reward per bit `r = +1` if `predict>=0.5` matches target else `−1`; gradient
-  `g[i] = Σ_{t∈TRAIN} r(t) · eligibility_i(t)`; the returned scalar reward is VAL accuracy (the
-  keep-if-better selector). TEST is never read inside `evaluate`.
+  trains on TRAIN; reward per bit `r = +1` if `predict>=0.5` matches target else `−1`; centered
+  gradient `g[i] = Σ_{t∈TRAIN} (r(t) − r̄) · eligibility_i(t)` with `r̄` the mean reward over TRAIN
+  bits; the returned selection reward is VAL accuracy (the keep-if-better selector). TEST is never
+  read inside `evaluate`.
 - **Report:** baseline (θ=0) vs trained TEST on the never-selected split; how many neurons ended
   up biased; θ range; VAL best-so-far trace.
 
 **Honesty:** readout trains on TRAIN; the eligibility gradient is computed on TRAIN; keep-if-better
 selection uses VAL; the headline number is TEST, never selected on — identical discipline to the
 field experiment, so the reported gain is real generalization.
+
+## Controls and interpretation (mandatory) — review #2
+
+A single trained-vs-baseline number is **uninterpretable**: a gain could come from the
+reward-modulated credit, from the global excitability change centering is meant to remove, or from
+the keep-if-better search improving a weak baseline *regardless of proposal quality*. The
+experiment therefore runs the real rule alongside two controls under the **same keep-if-better
+harness**, differing only in how the candidate θ' is proposed / scored:
+
+- **Random-proposal control** = node perturbation on thresholds: kick random neurons (ignore
+  eligibility and reward), same accept/reject. Isolates whether the eligibility-gated gradient
+  beats blind search at all.
+- **Shuffled-reward control** = compute `g` with the per-bit reward `r(t)` **randomly permuted
+  across bits**, destroying the true credit while preserving the eligibility mask and the reward
+  distribution. Isolates whether the *reward correlation* (not the mask alone) is doing the work.
+
+**Interpretation gate:** the mechanism is only credited if **real > random** and **real >
+shuffled** on TEST, by more than the seed-to-seed spread (report ≥3 seeds). `real ≈ shuffled` means
+the credit signal is noise; `real ≈ random` means eligibility adds nothing over blind search. Both
+are publishable *negative* results and would redirect the program — which is the point of running
+them.
+
+Each arm is one line in a small results table (arm × layer-scope × seed), so the controls also
+carry the **layer-scope axis (#4)** at no extra harness cost — see below.
 
 ## Verification
 
@@ -183,16 +232,21 @@ field experiment, so the reported gain is real generalization.
    the expected direction) on a fixed drive.
 3. Eligibility hook on a hand-constructed tiny net emits exactly the locals within
    `|potential − threshold| ≤ margin` at decide, and nothing when unsubscribed.
-4. All existing pipeline tests still pass (`threaded_matches_sequential_all_thread_counts`,
+4. The eligibility stream is **deterministic across thread counts** (emitted under the layer lock,
+   in wave order, like the spike listener) — a differential check at threads `[1,2,4]`.
+5. All existing pipeline tests still pass (`threaded_matches_sequential_all_thread_counts`,
    `top_layer_trajectory_golden`, etc.) — the hot path is unchanged.
 
 **Trainer (`train.rs` tests):**
-5. On a toy reward whose gradient points at a known target θ*, `reward_modulated` drives θ toward
-   θ* and `history` is non-decreasing (mirrors `hill_climb_improves_on_a_quadratic`).
+6. Centering: on a fixed eligibility matrix with a reward that is constant across bits, the
+   gradient is **all-zero** (the baseline cancels the constant) — the direct guard for review #1.
+7. On a toy reward whose *centered* gradient points at a known target θ*, `reward_modulated` drives
+   θ toward θ* and `history` is non-decreasing (mirrors `hill_climb_improves_on_a_quadratic`).
 
 **Experiment:**
-6. Trained TEST > baseline TEST on the honest 32×32 split (the headline result; reported, not
-   asserted as a unit test).
+8. Real rule beats **both** the random-proposal and shuffled-reward controls on TEST by more than
+   the ≥3-seed spread (the interpretation gate; reported, not asserted as a unit test). A bare
+   trained-vs-baseline gain is explicitly *not* sufficient.
 
 ## Files touched
 
