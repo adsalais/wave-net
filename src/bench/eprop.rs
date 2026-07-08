@@ -188,6 +188,21 @@ fn trial_eligibility(net: &mut Network, cfg: &EpropConfig, class: usize, trial: 
 #[derive(Clone, Debug, PartialEq)]
 pub struct LearnCurve {
     pub accuracy_permille: Vec<u64>,
+    /// Accuracy on held-out trials (disjoint indices → unseen cue realizations, same K classes) with the
+    /// thresholds frozen after training. This is generalization, not the prequential training curve.
+    pub test_accuracy: u64,
+}
+
+/// Class scores for one trial's eligibility: K population sums (top-layer spikes for V1, readout
+/// potentials for the readout path). Shared by the training loop and the held-out evaluation.
+fn score_outs(net: &Network, cfg: &EpropConfig, elig: &[Vec<u32>]) -> Vec<i64> {
+    if cfg.readout {
+        readout_scores(net, net.layer_count() - 1, cfg.k)
+    } else {
+        let top = &elig[elig.len() - 1];
+        let group = (top.len() / cfg.k).max(1);
+        (0..cfg.k).map(|c| top[c * group..(c + 1) * group].iter().map(|&x| x as i64).sum()).collect()
+    }
 }
 
 /// Deterministic class for trial `t`.
@@ -252,16 +267,7 @@ pub fn train(cfg: &EpropConfig, lr: f64) -> LearnCurve {
     for t in 0..cfg.trials {
         let class = pick_class(cfg.seed, t, cfg.k);
         let elig = trial_eligibility(&mut net, cfg, class, t);
-        // Population output coding: split the output surface into K contiguous groups; class score c is
-        // the group total. V1 sums top-layer spike counts; V2a sums the readout layer's potentials.
-        // (Single output neurons are too often silent to carry a signal.)
-        let outs: Vec<i64> = if cfg.readout {
-            readout_scores(&net, net.layer_count() - 1, cfg.k)
-        } else {
-            let top = &elig[elig.len() - 1];
-            let group = (top.len() / cfg.k).max(1);
-            (0..cfg.k).map(|c| top[c * group..(c + 1) * group].iter().map(|&x| x as i64).sum()).collect()
-        };
+        let outs = score_outs(&net, cfg, &elig);
         let pred = (0..cfg.k).max_by_key(|&i| outs[i]).unwrap();
         outcomes.push(pred == class);
 
@@ -298,12 +304,26 @@ pub fn train(cfg: &EpropConfig, lr: f64) -> LearnCurve {
         }
     }
 
+    // Held-out generalization: frozen thresholds, disjoint trial indices (unseen cue realizations).
+    let holdout = 400usize;
+    let mut test_correct = 0usize;
+    for t in cfg.trials..cfg.trials + holdout {
+        let class = pick_class(cfg.seed, t, cfg.k);
+        let elig = trial_eligibility(&mut net, cfg, class, t);
+        let outs = score_outs(&net, cfg, &elig);
+        let pred = (0..cfg.k).max_by_key(|&i| outs[i]).unwrap();
+        if pred == class {
+            test_correct += 1;
+        }
+    }
+    let test_accuracy = (test_correct as u64 * 1000) / holdout as u64;
+
     let block = cfg.block.max(1);
     let accuracy_permille = outcomes
         .chunks(block)
         .map(|c| (c.iter().filter(|&&b| b).count() as u64 * 1000) / c.len() as u64)
         .collect();
-    LearnCurve { accuracy_permille }
+    LearnCurve { accuracy_permille, test_accuracy }
 }
 
 #[cfg(test)]
@@ -456,6 +476,27 @@ mod tests {
         let a = train(&cfg, 0.3);
         let b = train(&cfg, 0.3);
         assert_eq!(a.accuracy_permille, b.accuracy_permille);
+        assert_eq!(a.test_accuracy, b.test_accuracy);
+    }
+
+    #[test]
+    fn eprop_v1_generalizes_but_v2b_does_not() {
+        // FINDING (held-out reveals it): V1 (spiking, *trainable* output) learns a stable classifier that
+        // generalizes to UNSEEN cue realizations. V2b (broadcast readout) does NOT — its high prequential
+        // training accuracy (~687) was fast-adaptation tracking, and the frozen thresholds sit at chance.
+        // The held-out test, not the training curve, is the honest metric.
+        let v1 = train(&EpropConfig::demo(), 0.3);
+        let mut bcfg = EpropConfig::demo();
+        bcfg.readout = true;
+        bcfg.broadcast = true;
+        bcfg.softmax_temp = 10.0;
+        bcfg.trials = 3600;
+        bcfg.block = 300;
+        let bc = train(&bcfg, 0.5);
+        eprintln!("V1  train-late {} test {}", late_mean(&v1.accuracy_permille), v1.test_accuracy);
+        eprintln!("V2b train-late {} test {}", late_mean(&bc.accuracy_permille), bc.test_accuracy);
+        assert!(v1.test_accuracy > 580, "V1 generalizes to held-out: {}", v1.test_accuracy);
+        assert!(bc.test_accuracy < 580, "V2b does NOT generalize (687 was prequential): {}", bc.test_accuracy);
     }
 
     #[test]
