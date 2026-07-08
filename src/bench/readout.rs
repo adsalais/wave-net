@@ -1,6 +1,37 @@
 //! `readout` — per-neuron spike-count features over a multi-wave window, and an integer
 //! nearest-centroid classifier. No floats: centroids are integer means, distances are i64.
 
+use std::sync::{Arc, Mutex};
+
+use crate::wave_net::network::Network;
+
+/// Run `waves` waves feeding `input(w)` each wave, returning per-neuron spike counts over the
+/// computational layers `1..L` concatenated (layer 0, the transducer, excluded). Installs counting
+/// listeners, runs, then clears listeners. Does not reset state — the caller sets up the run.
+pub fn record_response(net: &mut Network, waves: usize, input: impl Fn(usize) -> Vec<u32>) -> Vec<u32> {
+    let l = net.layer_count();
+    let ls = (net.size() * net.size()) as usize;
+    let counts = Arc::new(Mutex::new(vec![0u32; l.saturating_sub(1) * ls]));
+    for z in 1..l {
+        let c = counts.clone();
+        net.on_layer(
+            z,
+            Box::new(move |_w: usize, fired: &[u32]| {
+                let mut g = c.lock().unwrap();
+                let base = (z - 1) * ls;
+                for &local in fired {
+                    g[base + local as usize] += 1;
+                }
+            }),
+        );
+    }
+    for w in 0..waves {
+        net.wave(&input(w));
+    }
+    net.clear_listeners();
+    std::mem::take(&mut *counts.lock().unwrap())
+}
+
 /// Integer nearest-centroid classifier over fixed-length `u32` feature vectors.
 pub struct NearestCentroid {
     centroids: Vec<Vec<i64>>, // one centroid (integer mean) per class
@@ -51,6 +82,42 @@ impl NearestCentroid {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wave_net::config::{Config, LayerConfig};
+    use crate::wave_net::network::Network;
+    use crate::wave_net::synapse::TopologyLevel;
+
+    fn two_layer_low() -> Config {
+        // L0 -> L1 straight up; L1 baseline low so L0 injection makes it fire.
+        let l0 = LayerConfig {
+            topology: vec![TopologyLevel { level: 1, radius: 1, count: 4 }],
+            leak: (3, 5),
+            cooldown_base: 1,
+            inhibitor_ratio: 0,
+            threshold_jitter: 0,
+            baseline_init: 2,
+            adapt_bump: 0,
+            adapt_decay: 5,
+        };
+        let l1 = LayerConfig { topology: vec![], ..l0.clone() };
+        Config { seed: 1, size: 4, layers: vec![l0, l1] }
+    }
+
+    #[test]
+    fn record_response_counts_spikes() {
+        let mut net = Network::new(two_layer_low());
+        let ls = 16;
+        // silent run -> all zero, correct length ((L-1)*ls = 1*16)
+        net.reset_state();
+        let silent = record_response(&mut net, 4, |_w| Vec::new());
+        assert_eq!(silent.len(), ls);
+        assert!(silent.iter().all(|&c| c == 0), "silent run must record no spikes");
+        // drive all L0 every wave -> L1 should fire, so some counts are non-zero
+        net.reset_state();
+        let all_l0: Vec<u32> = (0..ls as u32).collect();
+        let driven = record_response(&mut net, 6, move |_w| all_l0.clone());
+        assert_eq!(driven.len(), ls);
+        assert!(driven.iter().any(|&c| c > 0), "driven run must record L1 spikes");
+    }
 
     #[test]
     fn nearest_centroid_separates_clusters() {
