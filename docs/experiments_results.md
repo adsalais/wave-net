@@ -414,6 +414,30 @@ high one (~750) means it learns — but the broad middle is uninformative.
 future claim must be multi-seed and held-out from the start** — and the deeper question is whether a fixed
 random-`±1` feed-forward integer reservoir is a trainable substrate at all, given even V1 fails on some seeds.
 
+### Does width fix the seed-fragility? No.
+
+The one hypothesis that could redeem the substrate: seed-fragility is a *small-N* problem (64 neurons/layer is
+a tiny random-feature sample; at large N the law of large numbers should make *some* neurons reliably
+discriminative). Test — V1 **held-out** test accuracy over width × 4 seeds (layers 3, lr 0.3):
+
+| size (N/layer) | s0 | s1 | s2 | s3 | mean | worst |
+|---|---|---|---|---|---|---|
+| 8 (64) | 845 | 587 | 472 | 512 | 604 | 472 |
+| 16 (256) | 510 | 457 | 472 | 532 | 492 | 457 |
+| 32 (1024) | 490 | 455 | 527 | 952 | 606 | 455 |
+| 64 (4096) | 505 | 460 | 527 | 710 | 550 | 460 |
+
+**Refuted.** The worst seed sits at chance (~460) at *every* width; the mean shows no trend; and even at 4096
+neurons/layer learning is still a coin flip (~1–2 of 4 seeds learn, the rest chance). Width does **not** tame
+the fragility — so the problem is **not** the reservoir's random-feature *coverage* (which width would fix).
+
+**Where that leaves it.** The `seed` controls *both* the reservoir *and* the seeded cue/probe patterns, so the
+per-instance coin flip could live in either: a "bad seed" may mean a bad random projection **or** a
+degenerate task encoding (the two class patterns not separably re-triggered by the probe). Width refuting the
+reservoir-coverage story shifts suspicion toward the **task encoding** — but they're currently entangled under
+one seed. Disentangling them (separate network vs task seeds) is the next decisive test; "just scale up" is
+dead either way.
+
 ## Engine finding along the way — the floored leak
 
 Store-recall *found a real substrate bug*. The potential leak `p -= (p>>a)+(p>>b)` is `0` for `0 < p <
