@@ -471,6 +471,32 @@ can only gate a fixed random projection; they cannot *shape* it to the task — 
 decisive next direction is **architectural: make the weights/input projection trainable** (so the network can
 align the reservoir to the task) rather than searching for a cleverer calibration of a fixed random one.
 
+### "One last chance" — richer procedural weights (still static) don't fix it
+
+Test: replace the ±1 synapse sign with a procedural **random magnitude** (`sign × 1..=16`, hash-drawn — a
+richer but still *static* projection, as GeNN samples procedural weights from a distribution), run under
+BLAKE3 to avoid the hash confound, and re-measure the V1 held-out seed-split:
+
+| | net/task=s0 | s1 | s2 | s3 |
+|---|---|---|---|---|
+| ±1, vary net | 417 | 442 | **877** | 442 |
+| **rand-wt, vary net** | 570 | 442 | 312 | 410 |
+| ±1, vary task | 417 | 505 | **885** | 507 |
+| **rand-wt, vary task** | 570 | 687 | 472 | — |
+
+**No improvement — arguably worse.** Peaks are *lower* (687 vs 885), there are *more* below-chance cells, and
+it's still a 1-in-4 lottery. Enriching the fixed random projection does not make threshold-only training
+reliable. This is exactly what Knight & Nowotny predict: procedural connectivity is a **static**-connectivity
+technique — *"plastic synapses which change their weights must be simulated in the traditional way"* (i.e.
+**stored**). A richer static projection is still static.
+
+**Final verdict.** Three independent attempts to rescue the substrate — **scale (width)**, **hash quality
+(BLAKE3)**, and **projection richness (random weights)** — all failed to make learning reliable. The ceiling
+is structural: **you cannot reliably train a network whose only plastic degrees of freedom are per-neuron
+thresholds over frozen random weights.** The GeNN-sanctioned path is a **hybrid — keep the procedural static
+reservoir, add a small *stored, trained* readout/projection** (cheap at our scale). See
+`related-work.md` §1 for the paper grounding.
+
 ## Engine finding along the way — the floored leak
 
 Store-recall *found a real substrate bug*. The potential leak `p -= (p>>a)+(p>>b)` is `0` for `0 < p <

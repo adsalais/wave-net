@@ -428,18 +428,18 @@ mod tests {
             train(&c, 0.3).test_accuracy
         };
         let fixed = SEEDS[0];
-        eprintln!("V1 held-out test — which axis carries the fragility? (feature strong_hash = {})",
-            cfg!(feature = "strong_hash"));
-        eprint!("FIX task=s0, vary NETWORK:");
+        println!("V1 held-out — axis? (strong_hash={} random_weights={})",
+            cfg!(feature = "strong_hash"), cfg!(feature = "random_weights"));
+        print!("FIX task=s0, vary NETWORK:");
         for &n in &SEEDS {
-            eprint!("  {}", v1(n, fixed));
+            print!("  {}", v1(n, fixed));
         }
-        eprintln!();
-        eprint!("FIX network=s0, vary TASK: ");
+        println!();
+        print!("FIX network=s0, vary TASK: ");
         for &t in &SEEDS {
-            eprint!("  {}", v1(fixed, t));
+            print!("  {}", v1(fixed, t));
         }
-        eprintln!();
+        println!();
     }
 
     #[test]

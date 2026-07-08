@@ -24,6 +24,25 @@ hash) whenever a spike must be transmitted, storing zero connectivity. It enable
   justification that our storage-free, FPGA-clean approach scales. Also worth checking how they
   keep per-neuron RNG streams independent and reproducible.
 
+**Read in full (2026-07-08) — three points that reframe wave_net's learning experiments:**
+
+1. **RNG quality is load-bearing; they use Philox4×32-10** (a *counter-based* cryptographic PRNG,
+   Salmon et al. 2011) precisely to get independent, correlation-free streams per neuron. Our
+   home-rolled `key`/`mix` is **not** that: the verification pass found it *correlates* the streams
+   that share a seed (network vs task aligned spuriously → the "same-seed learns" artifact), and
+   swapping in BLAKE3 removed it. **Adopt a counter-based / crypto-quality mixer** (Philox-style
+   integer, or keep BLAKE3-quality) — this is a real defect the paper's design explicitly avoids.
+2. **Procedural = *static* connectivity only.** Verbatim: *"applicable whenever synapses are static –
+   plastic synapses which change their weights during a simulation will have to be simulated in the
+   traditional way."* GeNN **never learns procedural weights**; plastic weights are **stored**. So our
+   attempt to learn on a purely-procedural net fights the paradigm. The sanctioned architecture is
+   **hybrid: procedural static reservoir + a small *stored* plastic readout/projection.** (Enriching
+   the static projection with distributional magnitudes — our `random_weights` test — did **not** make
+   learning reliable, consistent with this: a richer *static* projection is still static.)
+3. **The benefit is memory at *scale* (24×10⁹ synapses).** We run at ~10³–10⁵ synapses, where storage
+   is trivially cheap — so we inherited procedural's *constraint* (can't learn weights) with **none**
+   of its payoff. At our scale, storing the plastic part costs nothing.
+
 ## 2. Fixed substrate + train per-neuron params → Liquid State Machine / spiking reservoir computing
 
 Our "fixed procedurally-wired dynamical substrate, then learn on top" *is* an LSM (Maass): a random
