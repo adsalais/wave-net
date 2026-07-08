@@ -34,6 +34,7 @@ pub struct RsnnConfig {
     pub rec_tau: f32,     // presynaptic-trace decay time constant (waves) for the temporal eligibility
     pub adapt_bump: i16,  // ALIF adaptation strength (0 = LIF; adaptation is a per-neuron memory)
     pub adapt_decay: u8,  // ALIF adaptation decay shift
+    pub rec_init: i8,     // initial recurrent weight (0 = keep procedural ±1; >0 bootstraps self-excitation)
     pub calib: CalibrateParams,
     pub calib_fraction_q16: u32,
 }
@@ -64,6 +65,7 @@ impl RsnnConfig {
             rec_tau: 4.0,
             adapt_bump: 20,
             adapt_decay: 6,
+            rec_init: 0,
             calib: CalibrateParams { warmup: 16, waves: 48, max_steps: 24, refine_passes: 3, ..CalibrateParams::default() },
             calib_fraction_q16: 20000,
         }
@@ -300,14 +302,63 @@ fn xor_trial(net: &mut Network, cfg: &RsnnConfig, a: usize, b: usize, trial: usi
     (act, waves)
 }
 
-/// No-op until Task 2 (temporal e-prop on the level-0 recurrent weights).
-fn recurrent_update(_net: &mut Network, _cfg: &RsnnConfig, _w: &[Vec<f32>], _err: &[f32], _waves: &[Vec<u32>]) {}
+/// Temporal e-prop on the L1 level-0 recurrent weights. Builds a decaying presynaptic trace per neuron
+/// over the recorded waves, correlates it with postsynaptic spikes (`e_ij = Σ_t pre_trace_i(t)·fired_j(t)`),
+/// and updates the stored weights via the symmetric-feedback learning signal.
+fn recurrent_update(net: &mut Network, cfg: &RsnnConfig, w: &[Vec<f32>], err: &[f32], waves: &[Vec<u32>]) {
+    let ls = (cfg.size * cfg.size) as usize;
+    let up = cfg.rec_count as usize;
+    let ttot = waves.len();
+    let mut fired = vec![vec![0f32; ls]; ttot];
+    for (t, wv) in waves.iter().enumerate() {
+        for &loc in wv {
+            fired[t][loc as usize] = 1.0;
+        }
+    }
+    let decay = 1.0 - 1.0 / cfg.rec_tau.max(1.0);
+    let mut tr = vec![vec![0f32; ls]; ttot];
+    for i in 0..ls {
+        let mut trace = 0f32;
+        for t in 0..ttot {
+            trace = trace * decay + fired[t][i];
+            tr[t][i] = trace;
+        }
+    }
+    let l_sig: Vec<f32> = (0..ls).map(|j| (0..2).map(|c| w[c][j] * err[c]).sum()).collect();
+    net.with_layer_mut(1, |l1| {
+        for i in 0..ls {
+            let sg = (ls + i) as u32; // L1 global id = layer 1 * ls + i
+            for kk in 0..up {
+                let j = target_of(cfg.seed, sg, i as u32, 0, kk as u32, cfg.rec_radius, cfg.size) as usize;
+                let mut e = 0f32;
+                for t in 0..ttot {
+                    e += tr[t][i] * fired[t][j];
+                }
+                l1.out_shadow[i * up + kk] += -cfg.hidden_lr * l_sig[j] * e;
+            }
+        }
+        for (wq, s) in l1.out_weights.iter_mut().zip(&l1.out_shadow) {
+            *wq = s.round().clamp(-127.0, 127.0) as i8;
+        }
+    });
+}
 
 /// Train a readout on L1's read-window activity for temporal XOR; with `rec_count > 0` also trains the L1
 /// level-0 recurrent weights. Returns held-out test accuracy permille.
 pub fn train_xor(cfg: &RsnnConfig) -> u64 {
     let mut net = Network::new(cfg.engine_config_xor());
     net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
+    if cfg.rec_count > 0 && cfg.rec_init != 0 {
+        // bootstrap self-excitation so recurrent activity persists through the gap (else no eligibility)
+        net.with_layer_mut(1, |l1| {
+            for wq in l1.out_weights.iter_mut() {
+                *wq = cfg.rec_init;
+            }
+            for (s, wq) in l1.out_shadow.iter_mut().zip(&l1.out_weights) {
+                *s = *wq as f32;
+            }
+        });
+    }
     let ls = (cfg.size * cfg.size) as usize;
     let mut w = vec![vec![0f32; ls]; 2];
     let score = |w: &[Vec<f32>], a: &[f32]| -> Vec<f32> {
@@ -357,6 +408,30 @@ mod tests {
         cfg.delay = 20;
         cfg.trials = 1500;
         cfg
+    }
+
+    #[test]
+    fn recurrence_does_not_yet_beat_ff_on_temporal_xor() {
+        // HONEST NULL (after tuning delay, rec_count/radius, rec_tau, lr, rec_init): level-0 recurrence with
+        // a spike-timing eligibility does NOT beat the feed-forward baseline on temporal XOR. Where FF fails
+        // (delay 20, ~chance) recurrence can't sustain A across the 20-wave silent gap either (~chance);
+        // where recurrence *can* hold memory (delay ~12) the LIF membrane leak already gives FF that memory,
+        // so FF wins there too. The trained recurrent memory horizon ≈ the membrane-leak horizon (~12 waves)
+        // — the floored leak that fixed infinite-memory now caps recurrent memory. Extending it needs a
+        // better pseudo-derivative, level −1 recurrence, or surrogate-gradient BPTT (all deferred).
+        let seeds = [0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF];
+        let mut best_rec = 0u64;
+        for &s in &seeds {
+            let ff = xor_cfg(s);
+            let mut rc = ff.clone();
+            rc.rec_count = 24;
+            rc.rec_tau = 20.0;
+            let ff_acc = train_xor(&ff);
+            let rc_acc = train_xor(&rc);
+            eprintln!("seed {s:#x}  FF {ff_acc}  +recurrence {rc_acc}");
+            best_rec = best_rec.max(rc_acc);
+        }
+        assert!(best_rec < 640, "recurrence does not (yet) crack the 20-wave temporal XOR (best {best_rec})");
     }
 
     #[test]
