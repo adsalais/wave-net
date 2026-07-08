@@ -1,2 +1,5 @@
 /target
 scratchpad
+
+# downloaded reference papers (large binaries)
+docs/*.pdf
