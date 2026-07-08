@@ -150,6 +150,33 @@ sparse fan-out gives more distinct, less-redundant features → good for LIF non
 heterogeneous network should mix *densities per role*, not just neuron types: dense-ALIF layers to hold
 context, sparse-LIF layers to compute (`adapt_bump` is already per-layer).
 
+## Experiment 4 — e-prop-like threshold learning (Spec 3, v1): *it learns*
+
+A gradient-free three-factor rule: per-neuron **eligibility** (trial spike count) × a **global
+reward-prediction-error** `(R − R̄)` nudges each baseline threshold, `Δθ = −lr·(R−R̄)·e`, accumulated in an
+`f64` shadow written back to the integer engine. Task: the `K=2` held-category store-recall (cue → delay →
+probe); output = the top layer split into `K` **population groups**; reward = the correct group's spike
+margin. No engine change; no trained readout — the thresholds *are* the learned parameters.
+
+**Result: the rule learns.** Late-training accuracy vs a frozen-threshold control (`lr = 0`, same seed):
+
+| | late-half accuracy ‰ (chance 500) |
+|---|---|
+| **learning** (`lr = 0.3`) | ~770 |
+| **frozen control** | ~271 |
+
+The learning curve climbs from ~chance to ~77% and clearly beats the frozen control; it's noisy
+block-to-block (crude credit + threshold random-walk), so the metric is the late-half mean.
+
+**Two findings from getting it working:**
+- **Population coding was required.** Reading two *single* output neurons failed — they're almost always
+  silent, so `R = 0` every trial at any `lr`. Worse, a silent neuron has **zero eligibility**, so the rule
+  can never wake it (chicken-and-egg). The spike-count eligibility can *reshape active* neurons but not
+  *recruit silent* ones — which is exactly why the deferred **non-spiking potential readout** (potential is
+  non-zero even when silent) is the principled next step.
+- **The `f64` shadow is essential.** `lr` an order of magnitude below 0.3 never moved the integer
+  thresholds at all — tiny updates round to 0 without the fractional accumulator.
+
 ## Engine finding along the way — the floored leak
 
 Store-recall *found a real substrate bug*. The potential leak `p -= (p>>a)+(p>>b)` is `0` for `0 < p <
@@ -161,10 +188,11 @@ starves sparse cascades, so configs need denser drive (the fix and its density c
 
 ## Implications
 
-- **For training (Spec 3, e-prop-style threshold learning):** train against a **held-category /
-  working-memory task** (the store-recall / delayed-match family) — the only thing adaptation buys. **Not**
-  MC or XOR (bit-level tasks LIF already does better). e-prop's eligibility trace on the per-neuron
-  threshold is the machinery that credits exactly this slow held-state. Ensure ALIF layers have **dense**
+- **For training (Spec 3, e-prop-style threshold learning) — now demonstrated (Experiment 4):** trained
+  against a **held-category** task (store-recall) — the only thing adaptation buys — the three-factor rule
+  learns (~770‰ vs frozen ~271‰). **Not** MC or XOR (bit-level tasks LIF already does better). e-prop's
+  eligibility trace on the per-neuron threshold is the machinery that credits exactly this slow held-state.
+  Ensure ALIF layers have **dense**
   fan-out.
 - **Heterogeneous networks** (mixed LIF/ALIF layers, mixed densities) are the natural way to span both
   memory axes — worth a bench experiment (a mixed config on store-recall *and* XOR) before or during Spec 3.

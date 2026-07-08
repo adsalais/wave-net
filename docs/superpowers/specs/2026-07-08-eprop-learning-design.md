@@ -136,3 +136,23 @@ unit over tens of trials). Delay/`lr`/cue-overlap are the main tuning levers.
 - Broadcast-error alignment (per-output feedback weights); training adaptation params (`adapt_bump`/decay);
   surrogate-gradient e-prop with a differentiable shadow.
 - `K > 2`, curriculum, multiple tasks — not needed to answer "does the three-factor rule learn at all?"
+
+## Revision (post-implementation) — it learns, and a required change
+
+**Result: the rule learns.** On the `K=2` held-category task, late-training accuracy reaches **~770‰**
+versus a frozen-threshold control at **~271‰** (chance 500). The three-factor rule (per-neuron eligibility ×
+global reward-prediction-error) genuinely trains the integer thresholds — the first working learning in
+this engine. The curve is *noisy* block-to-block (crude credit + threshold random-walk), so the assertion
+uses the **late-half mean**, not a single final block. Good `lr ≈ 0.3` (with the f64 shadow); `lr` an order
+of magnitude smaller never moved the integer thresholds at all.
+
+**Required change from the design — population output coding.** The spec read the "first `K` locals" of the
+top layer as the outputs. That failed hard: two arbitrary single neurons are almost always **silent**, so
+`R = 0` every trial (no signal, at *any* `lr`) — and a silent neuron has **zero eligibility**, so the rule
+can never recruit it (chicken-and-egg). Fix: split the top layer into `K` contiguous **groups** and score
+class `c` by the group's total spikes. Populations are reliably active and informative. **This silent-zero-
+eligibility limit is a real property of the spike-count eligibility** — it can *reshape* active neurons but
+not wake silent ones; the deferred **non-spiking potential readout** (which reads sub-threshold potential,
+non-zero even when silent) is the principled fix, now better motivated. The frozen control landing *below*
+chance (271) is the arbitrary group→class assignment being anti-aligned; learning both realigns it and
+builds selectivity.
