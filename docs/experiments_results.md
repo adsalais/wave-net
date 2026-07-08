@@ -615,3 +615,20 @@ the earlier "depth erodes separation" finding from a wall into something trainab
 (At depth 5 the globally-degenerate `deadbeef` reservoir is beyond even multi-layer — both fail — while the
 other seeds still hit 1000; depth 4 is reliable for all. DFA's random feedback is noisy but here it was
 clean across seeds.)
+
+**Depth sweep — how far does it hold?** Worst-seed held-out over 3 seeds:
+
+| depth | single-layer | multi-layer |
+|---|---|---|
+| 3 | 890 | 1000 |
+| 4 | 485 | 1000 |
+| 5 | 485 | 485 |
+| 6 | 485 | 902 |
+| 7 | 485 | 485 |
+
+Single-layer is at chance for **every** depth ≥ 4 — the advantage of training all layers is robust and only
+grows with depth. But multi-layer's *worst-seed* reliability breaks down past depth ~4: at ≥5 the hardest
+seed can still fail (the non-monotonic 485/902/485 is just which seed is unluckiest varying). So multi-layer
+makes depth **usable** (vs single-layer's total failure) but **not arbitrarily reliable** — depth 4 is the
+clean sweet spot; deeper, the fixed random reservoir's seed lottery + noisy DFA feedback cap it. Pushing
+deeper needs a better reservoir (recurrence/criticality) and/or less-noisy credit (symmetric feedback / BPTT).
