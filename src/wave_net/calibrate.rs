@@ -94,13 +94,14 @@ mod tests {
             topology: vec![
                 TopologyLevel { level: 1, radius: 2, count: 6 },
                 TopologyLevel { level: 0, radius: 1, count: 2 },
+                TopologyLevel { level: -1, radius: 1, count: 2 },
             ],
             leak: (3, 5),
             cooldown_base: 2,
             inhibitor_ratio: 0,
             threshold_jitter: 64,
             baseline_init: 8,
-            adapt_bump: 3,
+            adapt_bump: 5,
             adapt_decay: 5,
         };
         Config { seed: 0x00C0_FFEE, size: 8, layers: vec![layer; 4] }
