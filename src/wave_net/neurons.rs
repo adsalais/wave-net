@@ -1,5 +1,8 @@
 //! `neurons` — a `Layer`'s per-neuron state, its delivery inbox/outbox pair, and its
-//! per-layer parameters. Thresholds start near `i16::MAX` (silent) with a small hash jitter.
+//! per-layer parameters. The `threshold` field is the ALIF **baseline**: it inits low
+//! (`baseline_init + jitter`, clamped to [1, i16::MAX]) and is tuned by calibration. Each
+//! neuron also carries `adapt`, a slow variable bumped on fire and decayed each wave; the
+//! effective firing threshold is `threshold + adapt`.
 
 use crate::wave_net::config::LayerConfig;
 use crate::wave_net::synapse::{key, map_range, mix, Synapse, TopologyLevel, P_THRESHOLD};
@@ -8,17 +11,20 @@ pub struct Layer {
     // wave-mutable hot state
     pub potential: Vec<i16>,
     pub cooldown: Vec<u8>,
+    pub adapt: Vec<i16>,      // ALIF adaptation: rest 0, >= 0; bumped on fire, decayed each wave
     pub inbox: Vec<Synapse>,  // drained THIS wave (filled last wave)
     pub outbox: Vec<Synapse>, // filled for NEXT wave; swapped with inbox at wave end
 
     // tunable params (calibration/training will rewrite these between phases)
-    pub threshold: Vec<i16>,
+    pub threshold: Vec<i16>, // ALIF baseline; effective threshold is threshold + adapt
 
     // fixed structure
     pub leak: (u8, u8),
     pub cooldown_base: u8,
     pub topology: Vec<TopologyLevel>,
     pub inhibitor_ratio: u32,
+    pub adapt_bump: i16,   // added to adapt on each fire (0 = plain LIF)
+    pub adapt_decay: u8,   // right-shift decay of adapt per wave
 }
 
 impl Layer {
@@ -30,11 +36,12 @@ impl Layer {
             let global = (base + local) as u32;
             let h = mix(key(seed, global, 0, 0, P_THRESHOLD));
             let jitter = map_range(h as u32, cfg.threshold_jitter as u32) as i32; // [0, jitter)
-            *th = (i16::MAX as i32 - jitter) as i16;
+            *th = (cfg.baseline_init as i32 + jitter).clamp(1, i16::MAX as i32) as i16;
         }
         Layer {
             potential: vec![0; ls],
             cooldown: vec![0; ls],
+            adapt: vec![0; ls],
             inbox: Vec::new(),
             outbox: Vec::new(),
             threshold,
@@ -42,6 +49,8 @@ impl Layer {
             cooldown_base: cfg.cooldown_base,
             topology: cfg.topology.clone(),
             inhibitor_ratio: cfg.inhibitor_ratio,
+            adapt_bump: cfg.adapt_bump,
+            adapt_decay: cfg.adapt_decay,
         }
     }
 
@@ -97,6 +106,25 @@ mod tests {
             adapt_bump: 0,
             adapt_decay: 5,
         }
+    }
+
+    fn lc_baseline(jitter: u16, baseline: i16) -> LayerConfig {
+        LayerConfig { baseline_init: baseline, ..lc(jitter) }
+    }
+
+    #[test]
+    fn thresholds_near_baseline_within_jitter() {
+        let l = Layer::new(&lc_baseline(128, 12), 1, 0, 8);
+        for &t in &l.threshold {
+            assert!((12..12 + 128).contains(&t), "threshold {t} out of [12, 140) band");
+        }
+    }
+
+    #[test]
+    fn new_zeroes_adaptation() {
+        let l = Layer::new(&lc_baseline(128, 12), 1, 0, 8);
+        assert_eq!(l.adapt.len(), 64);
+        assert!(l.adapt.iter().all(|&a| a == 0));
     }
 
     #[test]
