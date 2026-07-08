@@ -7,14 +7,14 @@ use crate::bench::store_recall::{cue_realization, probe_pattern};
 use crate::wave_net::network::Network;
 use std::sync::{Arc, Mutex};
 
-/// One trial (reset → present cue → delay → probe); returns per-computational-layer spike counts. If
-/// `flip` is set, that L0 site is toggled in every present wave (the perturbation for σ).
+/// One trial (reset → present cue → delay → probe); returns per-computational-layer spike counts. Each
+/// site in `flip` is toggled in every present wave (empty = unperturbed; the perturbation set for σ).
 pub fn reservoir_states(
     net: &mut Network,
     cfg: &EpropConfig,
     class: usize,
     trial: usize,
-    flip: Option<u32>,
+    flip: &[u32],
 ) -> Vec<Vec<u32>> {
     let l = net.layer_count();
     let ls = (net.size() * net.size()) as usize;
@@ -34,7 +34,7 @@ pub fn reservoir_states(
     net.reset_state();
     for w in 0..cfg.present_waves {
         let mut sites = cue_realization(cfg.seed, cfg.size, class, trial, w, cfg.base_q16, cfg.keep_q16, cfg.noise_q16);
-        if let Some(s) = flip {
+        for &s in flip {
             match sites.iter().position(|&x| x == s) {
                 Some(pos) => {
                     sites.remove(pos);
@@ -70,7 +70,7 @@ pub fn collect_states(cfg: &EpropConfig, trials: usize) -> (Vec<Vec<u32>>, Vec<u
     let mut labels = Vec::with_capacity(trials);
     for t in 0..trials {
         let class = pick_class(cfg.seed, t, cfg.k);
-        states.push(top_state(&reservoir_states(&mut net, cfg, class, t, None)));
+        states.push(top_state(&reservoir_states(&mut net, cfg, class, t, &[])));
         labels.push(class);
     }
     (states, labels)
@@ -176,10 +176,100 @@ pub fn kernel_minus_gen_rank(cfg: &EpropConfig) -> f64 {
     let m = 64usize;
     let mut net = calibrated_reservoir(cfg);
     let kernel: Vec<Vec<u32>> = (0..m)
-        .map(|t| top_state(&reservoir_states(&mut net, cfg, pick_class(cfg.seed, t, cfg.k), t, None)))
+        .map(|t| top_state(&reservoir_states(&mut net, cfg, pick_class(cfg.seed, t, cfg.k), t, &[])))
         .collect();
-    let noisy: Vec<Vec<u32>> = (0..m).map(|t| top_state(&reservoir_states(&mut net, cfg, 0, t, None))).collect();
+    let noisy: Vec<Vec<u32>> = (0..m).map(|t| top_state(&reservoir_states(&mut net, cfg, 0, t, &[]))).collect();
     effective_dim(&as_f64(&kernel)) - effective_dim(&as_f64(&noisy))
+}
+
+/// σ / edge-of-chaos: flip a small localized set of L0 sites, measure per-layer Hamming divergence
+/// (neurons whose count differs) between base and perturbed states, and return the geometric growth of
+/// divergence up the stack. (A single-site flip is too weak to register in these small integer nets.)
+pub fn perturbation_spread(cfg: &EpropConfig) -> f64 {
+    use crate::wave_net::synapse::{key, mix};
+    let mut net = calibrated_reservoir(cfg);
+    let ls = cfg.size * cfg.size;
+    let nflip = (ls / 16).max(4);
+    let mut sites: Vec<u32> = (0..nflip).map(|i| (mix(key(cfg.seed, i, 0, 0, 71)) % ls as u64) as u32).collect();
+    sites.sort_unstable();
+    sites.dedup();
+    let base = reservoir_states(&mut net, cfg, 0, 0, &[]);
+    let pert = reservoir_states(&mut net, cfg, 0, 0, &sites);
+    let div: Vec<f64> = base
+        .iter()
+        .zip(&pert)
+        .map(|(b, p)| b.iter().zip(p).filter(|(x, y)| x != y).count() as f64)
+        .collect();
+    let mut log_sum = 0f64;
+    let mut n = 0u32;
+    for z in 1..div.len() {
+        if div[z - 1] > 0.0 && div[z] > 0.0 {
+            log_sum += (div[z] / div[z - 1]).ln();
+            n += 1;
+        }
+    }
+    if n == 0 { 0.0 } else { (log_sum / n as f64).exp() }
+}
+
+/// Mean firing fraction per computational layer over `trials` trials.
+pub fn layer_gain(cfg: &EpropConfig, trials: usize) -> Vec<f64> {
+    let mut net = calibrated_reservoir(cfg);
+    let ls = (cfg.size * cfg.size) as usize;
+    let waves = (cfg.present_waves + cfg.delay + cfg.read_waves).max(1);
+    let mut sum: Vec<f64> = Vec::new();
+    for t in 0..trials {
+        let layered = reservoir_states(&mut net, cfg, pick_class(cfg.seed, t, cfg.k), t, &[]);
+        if sum.is_empty() {
+            sum = vec![0.0; layered.len()];
+        }
+        for (z, layer) in layered.iter().enumerate() {
+            sum[z] += layer.iter().sum::<u32>() as f64 / (ls * waves) as f64;
+        }
+    }
+    sum.iter().map(|s| s / trials as f64).collect()
+}
+
+/// Degeneracy: (dead fraction, saturated fraction, sampled mean |pairwise correlation|). `waves` is the
+/// per-trial spike ceiling used to flag saturation.
+pub fn degeneracy(states: &[Vec<u32>], waves: u32) -> (f64, f64, f64) {
+    let n = states.len();
+    let d = states[0].len();
+    let mut dead = 0usize;
+    let mut sat = 0usize;
+    for j in 0..d {
+        let total: u64 = states.iter().map(|x| x[j] as u64).sum();
+        let mx = states.iter().map(|x| x[j]).max().unwrap_or(0);
+        if total == 0 {
+            dead += 1;
+        }
+        if mx >= waves {
+            sat += 1;
+        }
+    }
+    // synchrony: mean |Pearson| over a deterministic sample of neuron-index pairs (stride 7)
+    let mut sync_sum = 0f64;
+    let mut pairs = 0u32;
+    let mut a = 0usize;
+    while a + 7 < d && pairs < 200 {
+        let b = a + 7;
+        let ma: f64 = states.iter().map(|x| x[a] as f64).sum::<f64>() / n as f64;
+        let mb: f64 = states.iter().map(|x| x[b] as f64).sum::<f64>() / n as f64;
+        let (mut cov, mut va, mut vb) = (0f64, 0f64, 0f64);
+        for x in states {
+            let da = x[a] as f64 - ma;
+            let db = x[b] as f64 - mb;
+            cov += da * db;
+            va += da * da;
+            vb += db * db;
+        }
+        if va > 0.0 && vb > 0.0 {
+            sync_sum += (cov / (va.sqrt() * vb.sqrt())).abs();
+            pairs += 1;
+        }
+        a += 1;
+    }
+    let sync = if pairs == 0 { 0.0 } else { sync_sum / pairs as f64 };
+    (dead as f64 / d as f64, sat as f64 / d as f64, sync)
 }
 
 #[cfg(test)]
@@ -256,5 +346,24 @@ mod tests {
         let b = kernel_minus_gen_rank(&small());
         assert!(a.is_finite());
         assert_eq!(a, b, "deterministic");
+    }
+
+    #[test]
+    fn perturbation_spread_orders_regimes() {
+        // a starved (sparse) reservoir should spread a perturbation no more than the denser baseline
+        let sparse = perturbation_spread(&dead_cfg());
+        let dense = perturbation_spread(&small());
+        eprintln!("sigma sparse {sparse:.3} dense {dense:.3}");
+        assert!(sparse.is_finite() && dense.is_finite());
+        assert!(dense >= sparse, "denser reservoir spreads at least as much: dense {dense} vs sparse {sparse}");
+    }
+
+    #[test]
+    fn degeneracy_flags_dead_and_saturated() {
+        // 4 features: #0 dead (all 0), #3 saturated (== waves every trial); waves = 5
+        let states: Vec<Vec<u32>> = (0..10).map(|i| vec![0, (i % 3) as u32, (i % 2) as u32, 5]).collect();
+        let (dead, sat, _sync) = degeneracy(&states, 5);
+        assert!((dead - 0.25).abs() < 1e-9, "one of four dead: {dead}");
+        assert!((sat - 0.25).abs() < 1e-9, "one of four saturated: {sat}");
     }
 }
