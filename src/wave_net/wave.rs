@@ -1,10 +1,11 @@
 //! `wave` — one layer's per-wave step: integrate (drain inbox) → inject → decide →
 //! generate outgoing synapses → leak, then decay adaptation. Touches only this layer; the
 //! Network routes the generated synapses into other layers' inboxes for the next wave. Firing
-//! uses the ALIF effective threshold `threshold + adapt` (computed in i32); a fire bumps `adapt`
-//! (saturating, >= 0) and every neuron's `adapt` decays geometrically each wave, like the leak.
+//! uses the ALIF effective threshold `threshold + (adapt >> ADAPT_SHIFT)` (i32); a fire bumps
+//! `adapt` (Q8 fixed point, saturating at `ADAPT_MAX`) and every neuron's `adapt` decays
+//! geometrically each wave, like the leak.
 
-use crate::wave_net::neurons::Layer;
+use crate::wave_net::neurons::{Layer, ADAPT_MAX, ADAPT_SHIFT};
 use crate::wave_net::synapse::{generate_into, SynapseGroup};
 
 pub fn process_layer(
@@ -47,11 +48,12 @@ pub fn process_layer(
     // 4. decide (ALIF effective threshold = baseline + adapt, in i32; fire bumps adapt)
     fired.clear();
     for i in 0..ls {
-        let eff = layer.threshold[i] as i32 + layer.adapt[i] as i32;
+        let eff = layer.threshold[i] as i32 + (layer.adapt[i] >> ADAPT_SHIFT);
         if layer.cooldown[i] == 0 && (layer.potential[i] as i32) >= eff {
             layer.potential[i] = 0;
             layer.cooldown[i] = layer.cooldown_base;
-            layer.adapt[i] = (layer.adapt[i] as i32 + layer.adapt_bump as i32).clamp(0, i16::MAX as i32) as i16;
+            let bumped = layer.adapt[i] + ((layer.adapt_bump as i32) << ADAPT_SHIFT);
+            layer.adapt[i] = bumped.clamp(0, ADAPT_MAX);
             fired.push(i as u32);
         }
     }
@@ -118,7 +120,7 @@ mod tests {
     fn fire_bumps_adaptation() {
         let mut l = low_layer(4, 3, 2, vec![TopologyLevel { level: 1, radius: 0, count: 1 }]);
         l.adapt_bump = 8;
-        l.adapt_decay = 7; // decay of 8 is 8>>7 == 0, so the bump is observable this wave
+        l.adapt_decay = 15; // Q8 bump is 8<<8; decay (>>15) is 0 at this magnitude, so it's observable
         for _ in 0..3 {
             l.inbox.push(Synapse { target: 0, inhibitory: false });
         }
@@ -127,7 +129,7 @@ mod tests {
         let mut fired = Vec::new();
         process_layer(&mut l, 0, 0, 4, &[], &mut acc, &mut out, &mut fired);
         assert_eq!(fired, vec![0]);
-        assert_eq!(l.adapt[0], 8, "fire should bump adapt by adapt_bump");
+        assert_eq!(l.adapt[0], 8 << ADAPT_SHIFT, "fire should bump adapt by adapt_bump (Q8)");
     }
 
     #[test]
@@ -147,9 +149,9 @@ mod tests {
     #[test]
     fn high_adaptation_blocks_firing() {
         // potential clears the baseline but not baseline + adapt.
-        let drive = |adapt0: i16| {
+        let drive = |eff_adapt: i32| {
             let mut l = low_layer(1, 5, 2, vec![]);
-            l.adapt[0] = adapt0;
+            l.adapt[0] = eff_adapt << ADAPT_SHIFT; // effective contribution eff_adapt
             for _ in 0..10 {
                 l.inbox.push(Synapse { target: 0, inhibitory: false });
             }

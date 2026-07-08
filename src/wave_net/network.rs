@@ -103,7 +103,8 @@ impl Network {
         self.layers[layer].lock().unwrap().potential[local]
     }
 
-    pub fn adaptation(&self, layer: usize, local: usize) -> i16 {
+    /// Raw Q8 fixed-point adaptation state (effective threshold contribution is `>> ADAPT_SHIFT`).
+    pub fn adaptation(&self, layer: usize, local: usize) -> i32 {
         self.layers[layer].lock().unwrap().adapt[local]
     }
 
@@ -233,7 +234,7 @@ mod tests {
             (0..net.layer_count())
                 .flat_map(|z| (0..(net.size() * net.size()) as usize).map(move |i| (z, i)))
                 .map(|(z, i)| net.adaptation(z, i))
-                .collect::<Vec<i16>>()
+                .collect::<Vec<i32>>()
         };
         assert_eq!(run(), run());
     }

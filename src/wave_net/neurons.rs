@@ -2,21 +2,31 @@
 //! per-layer parameters. The `threshold` field is the ALIF **baseline**: it inits low
 //! (`baseline_init + jitter`, clamped to [1, i16::MAX]) and is tuned by calibration. Each
 //! neuron also carries `adapt`, a slow variable bumped on fire and decayed each wave; the
-//! effective firing threshold is `threshold + adapt`.
+//! effective firing threshold is `threshold + (adapt >> ADAPT_SHIFT)`.
+//!
+//! `adapt` is stored in **Q8 fixed point** (i32, scaled by `2^ADAPT_SHIFT`) so its geometric
+//! decay `adapt -= adapt >> adapt_decay` stays exponential with time constant ≈ `2^adapt_decay`
+//! waves *independent of magnitude* — the fixed-point scale pushes the integer right-shift dead
+//! zone below ~1/256 of a threshold unit, so adaptation always relaxes (no ratchet / lock-out).
 
 use crate::wave_net::config::LayerConfig;
 use crate::wave_net::synapse::{key, map_range, mix, Synapse, TopologyLevel, P_THRESHOLD};
+
+/// Fixed-point scale for `adapt`: it holds the effective threshold contribution × `2^ADAPT_SHIFT`.
+pub const ADAPT_SHIFT: u32 = 8;
+/// Ceiling for `adapt`, so the effective contribution never exceeds `i16::MAX` (overflow guard).
+pub const ADAPT_MAX: i32 = (i16::MAX as i32) << ADAPT_SHIFT;
 
 pub struct Layer {
     // wave-mutable hot state
     pub potential: Vec<i16>,
     pub cooldown: Vec<u8>,
-    pub adapt: Vec<i16>,      // ALIF adaptation: rest 0, >= 0; bumped on fire, decayed each wave
+    pub adapt: Vec<i32>,      // ALIF adaptation (Q8 fixed point): rest 0, >= 0; bumped on fire, decayed each wave
     pub inbox: Vec<Synapse>,  // drained THIS wave (filled last wave)
     pub outbox: Vec<Synapse>, // filled for NEXT wave; swapped with inbox at wave end
 
     // tunable params (calibration/training will rewrite these between phases)
-    pub threshold: Vec<i16>, // ALIF baseline; effective threshold is threshold + adapt
+    pub threshold: Vec<i16>, // ALIF baseline; effective threshold is threshold + (adapt >> ADAPT_SHIFT)
 
     // fixed structure
     pub leak: (u8, u8),
