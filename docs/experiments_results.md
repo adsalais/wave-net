@@ -669,3 +669,25 @@ learning**; either alone fails.
 
 So: **size 16 + multi-layer + trial length matched to depth ⇒ reliable to ~16 layers**; the wall beyond is
 the *credit rule* (DFA), not capacity or the reservoir.
+
+## Backward recurrence (level −1/−2) + width — confirms ψ is the blocker
+
+To separate "topology/capacity too weak" from "credit rule too weak," we tried a *stronger* recurrence —
+cross-layer **backward** loops (`level −1` and `−2`, i.e. `Lz → Lz−1 → Lz`) — with the **width fix**
+(size 16, depth 4) and multi-layer credit, all trained by the temporal eligibility. Temporal XOR, LIF,
+delay 20:
+
+| seed | FF | + backward recurrence |
+|---|---|---|
+| s0 | 482 | 475 |
+| s1 | 497 | 497 |
+| s2 | 507 | 492 |
+
+**Both at chance — backward recurrence added nothing, any seed.** With topology (cross-layer loops) *and*
+capacity (width + multi-layer credit) controlled out, recurrence *still* can't learn the task. So the
+blocker is **not** the recurrent structure or the neuron count — it's the **credit rule**: the spike-time
+pseudo-derivative `ψ = fired_j` gives *no learning signal during the silent gap*, exactly where the
+recurrence would need to learn to sustain `A`. No neuron fires in the gap → no eligibility → the recurrent
+weights can't be shaped to hold memory. **The indicated next lever is a sub-threshold `ψ`** (credit flows
+when a neuron is *near* threshold, not only when it spikes) — for both recurrence and the multi-layer DFA
+depth ceiling. (This was run deliberately as a diagnostic; the null is the intended, informative result.)
