@@ -29,6 +29,11 @@ pub struct RsnnConfig {
     pub trials: usize,
     pub readout_lr: f32,
     pub hidden_lr: f32,
+    pub rec_count: u32,   // level-0 lateral synapses per neuron (0 = feed-forward, no recurrence)
+    pub rec_radius: u32,  // level-0 recurrence radius
+    pub rec_tau: f32,     // presynaptic-trace decay time constant (waves) for the temporal eligibility
+    pub adapt_bump: i16,  // ALIF adaptation strength (0 = LIF; adaptation is a per-neuron memory)
+    pub adapt_decay: u8,  // ALIF adaptation decay shift
     pub calib: CalibrateParams,
     pub calib_fraction_q16: u32,
 }
@@ -54,6 +59,11 @@ impl RsnnConfig {
             trials: 1500,
             readout_lr: 0.02,
             hidden_lr: 0.004,
+            rec_count: 0,
+            rec_radius: 2,
+            rec_tau: 4.0,
+            adapt_bump: 20,
+            adapt_decay: 6,
             calib: CalibrateParams { warmup: 16, waves: 48, max_steps: 24, refine_passes: 3, ..CalibrateParams::default() },
             calib_fraction_q16: 20000,
         }
@@ -71,6 +81,28 @@ impl RsnnConfig {
             adapt_decay: 6,
         };
         Config { seed: self.seed, size: self.size, layers: vec![layer; self.layers] }
+    }
+
+    /// Temporal-XOR net: L0 input transducer → L1 recurrent hidden (level 0), readout reads L1.
+    /// `rec_count == 0` gives L1 an empty topology — the feed-forward baseline.
+    fn engine_config_xor(&self) -> Config {
+        let l0 = LayerConfig {
+            topology: vec![TopologyLevel { level: 1, radius: self.up_radius, count: self.up_count }],
+            leak: (3, 5),
+            cooldown_base: 2,
+            inhibitor_ratio: 0,
+            threshold_jitter: 32,
+            baseline_init: 6,
+            adapt_bump: self.adapt_bump,
+            adapt_decay: self.adapt_decay,
+        };
+        let l1_topo = if self.rec_count > 0 {
+            vec![TopologyLevel { level: 0, radius: self.rec_radius, count: self.rec_count }]
+        } else {
+            vec![]
+        };
+        let l1 = LayerConfig { topology: l1_topo, ..l0.clone() };
+        Config { seed: self.seed, size: self.size, layers: vec![l0, l1] }
     }
 }
 
@@ -152,9 +184,9 @@ pub fn train_readout(cfg: &RsnnConfig) -> u64 {
 
 /// Regenerate the procedural target of source neuron `src_local`'s level-`+1` slot `k` (matches
 /// `generate_into`), so the e-prop update can pair a stored weight with its postsynaptic neuron.
-fn target_of(seed: u64, source_global: u32, src_local: u32, k: u32, radius: u32, size: u32) -> u32 {
+fn target_of(seed: u64, source_global: u32, src_local: u32, level: i32, k: u32, radius: u32, size: u32) -> u32 {
     let (sx, sy) = xy_of(src_local, size);
-    let h = mix(key(seed, source_global, 1, k, P_TARGET));
+    let h = mix(key(seed, source_global, level, k, P_TARGET));
     let span = 2 * radius + 1;
     let dx = map_range24((h >> 40) as u32, span) as i32 - radius as i32;
     let dy = map_range24(((h >> 16) as u32) & 0x00FF_FFFF, span) as i32 - radius as i32;
@@ -200,7 +232,7 @@ pub fn train_eprop(cfg: &RsnnConfig) -> u64 {
                     }
                     let sg = (z_below * ls + i) as u32;
                     for kk in 0..up {
-                        let j = target_of(cfg.seed, sg, i as u32, kk as u32, cfg.up_radius, cfg.size) as usize;
+                        let j = target_of(cfg.seed, sg, i as u32, 1, kk as u32, cfg.up_radius, cfg.size) as usize;
                         l1.out_shadow[i * up + kk] += -cfg.hidden_lr * l_sig[j] * pre_i * psi[j] as f32;
                     }
                 }
@@ -225,9 +257,119 @@ pub fn train_eprop(cfg: &RsnnConfig) -> u64 {
     (correct as u64 * 1000) / holdout as u64
 }
 
+/// Two independent input bits for trial `t` (deterministic).
+fn pick_ab(seed: u64, t: usize) -> (usize, usize) {
+    let a = (mix(key(seed, t as u32, 0, 0, 51)) & 1) as usize;
+    let b = (mix(key(seed, t as u32, 0, 0, 53)) & 1) as usize;
+    (a, b)
+}
+
+/// reset → present cue(a) → delay → present cue(b) → read (silent). Records L1 per-wave fired-sets and
+/// returns (read-window L1 spike counts, per-wave L1 fired-sets over the whole trial).
+fn xor_trial(net: &mut Network, cfg: &RsnnConfig, a: usize, b: usize, trial: usize) -> (Vec<f32>, Vec<Vec<u32>>) {
+    let ls = (cfg.size * cfg.size) as usize;
+    let rec: Arc<Mutex<Vec<Vec<u32>>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let r = rec.clone();
+        net.on_layer(1, Box::new(move |_w, fired: &[u32]| r.lock().unwrap().push(fired.to_vec())));
+    }
+    net.reset_state();
+    let present = |net: &mut Network, class: usize, phase: usize| {
+        for w in 0..cfg.present_waves {
+            let sites = cue_realization(cfg.task_seed, cfg.size, class, trial * 2 + phase, w, cfg.base_q16, cfg.keep_q16, cfg.noise_q16);
+            net.wave(&sites);
+        }
+    };
+    present(net, a, 0);
+    for _ in 0..cfg.delay {
+        net.wave(&[]);
+    }
+    present(net, b, 1);
+    let read_start = rec.lock().unwrap().len();
+    for _ in 0..cfg.read_waves {
+        net.wave(&[]);
+    }
+    net.clear_listeners();
+    let waves = rec.lock().unwrap().clone();
+    let mut act = vec![0f32; ls];
+    for wave in waves.iter().skip(read_start) {
+        for &loc in wave {
+            act[loc as usize] += 1.0;
+        }
+    }
+    (act, waves)
+}
+
+/// No-op until Task 2 (temporal e-prop on the level-0 recurrent weights).
+fn recurrent_update(_net: &mut Network, _cfg: &RsnnConfig, _w: &[Vec<f32>], _err: &[f32], _waves: &[Vec<u32>]) {}
+
+/// Train a readout on L1's read-window activity for temporal XOR; with `rec_count > 0` also trains the L1
+/// level-0 recurrent weights. Returns held-out test accuracy permille.
+pub fn train_xor(cfg: &RsnnConfig) -> u64 {
+    let mut net = Network::new(cfg.engine_config_xor());
+    net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
+    let ls = (cfg.size * cfg.size) as usize;
+    let mut w = vec![vec![0f32; ls]; 2];
+    let score = |w: &[Vec<f32>], a: &[f32]| -> Vec<f32> {
+        (0..2).map(|c| w[c].iter().zip(a).map(|(wi, ai)| wi * ai).sum()).collect()
+    };
+    for t in 0..cfg.trials {
+        let (a, b) = pick_ab(cfg.task_seed, t);
+        let label = a ^ b;
+        let (act, waves) = xor_trial(&mut net, cfg, a, b, t);
+        let p = softmax(&score(&w, &act));
+        let err: Vec<f32> = (0..2).map(|c| p[c] - if c == label { 1.0 } else { 0.0 }).collect();
+        for c in 0..2 {
+            for j in 0..ls {
+                w[c][j] -= cfg.readout_lr * err[c] * act[j];
+            }
+        }
+        if cfg.rec_count > 0 {
+            recurrent_update(&mut net, cfg, &w, &err, &waves);
+        }
+    }
+    let mut correct = 0usize;
+    let holdout = 400usize;
+    for t in cfg.trials..cfg.trials + holdout {
+        let (a, b) = pick_ab(cfg.task_seed, t);
+        let (act, _) = xor_trial(&mut net, cfg, a, b, t);
+        let s = score(&w, &act);
+        let pred = if s[1] > s[0] { 1 } else { 0 };
+        if pred == (a ^ b) {
+            correct += 1;
+        }
+    }
+    (correct as u64 * 1000) / holdout as u64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The recurrence-requiring temporal-XOR config: LIF (no adaptation memory) + a delay that outlasts the
+    /// membrane leak, so only a recurrent loop can hold A across the gap. (ALIF adaptation alone solves XOR
+    /// feed-forward — a real finding — which is why we strip it here.)
+    fn xor_cfg(seed: u64) -> RsnnConfig {
+        let mut cfg = RsnnConfig::demo();
+        cfg.seed = seed;
+        cfg.task_seed = seed;
+        cfg.adapt_bump = 0;
+        cfg.delay = 20;
+        cfg.trials = 1500;
+        cfg
+    }
+
+    #[test]
+    fn temporal_xor_ff_is_near_chance() {
+        let seeds = [0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF];
+        let mut best = 0u64;
+        for &s in &seeds {
+            let acc = train_xor(&xor_cfg(s));
+            eprintln!("FF (LIF, delay 20) temporal-XOR seed {s:#x}  held-out {acc}");
+            best = best.max(acc);
+        }
+        assert!(best < 640, "feed-forward (LIF, long delay) must NOT solve temporal XOR (best {best})");
+    }
 
     #[test]
     fn eprop_hidden_learns_reliably() {
