@@ -45,6 +45,7 @@ pub struct Layer {
     pub out_shadow: Vec<f32>, // higher-precision training accumulator, quantised into out_weights
     pub elig_pre: Vec<i32>,   // e-prop presynaptic trace: this neuron's spike count this trial
     pub elig_post: Vec<i32>,  // e-prop postsynaptic pseudo-derivative accumulated this trial
+    pub decide_potential: Vec<i16>, // potential at the decide step (pre fire-reset/leak); per-wave snapshot
 }
 
 impl Layer {
@@ -94,6 +95,7 @@ impl Layer {
             out_shadow,
             elig_pre: vec![0; ls],
             elig_post: vec![0; ls],
+            decide_potential: vec![0; ls],
         }
     }
 

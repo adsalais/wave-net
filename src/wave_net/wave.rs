@@ -60,6 +60,7 @@ pub fn process_layer(
     // and the pre-trace (spike count) for firers.
     const PSI_BAND: i32 = 8;
     for i in 0..ls {
+        layer.decide_potential[i] = layer.potential[i]; // snapshot pre fire-reset/leak
         let eff = layer.threshold[i] as i32 + (layer.adapt[i] >> ADAPT_SHIFT);
         if ((layer.potential[i] as i32) - eff).abs() <= PSI_BAND {
             layer.elig_post[i] += 1;
@@ -135,6 +136,23 @@ mod tests {
 
     fn groups_for(l: &Layer) -> Vec<SynapseGroup> {
         l.topology.iter().map(|e| SynapseGroup { level: e.level, synapses: Vec::new() }).collect()
+    }
+
+    #[test]
+    fn decide_potential_snapshots_pre_reset() {
+        let mut l = low_layer(4, 5, 2, vec![]); // threshold 5, no outgoing topology
+        for c in l.cooldown.iter_mut() {
+            *c = 0;
+        }
+        l.potential[0] = 8; // fires (>= 5)
+        l.potential[1] = 3; // sub-threshold (< 5)
+        let mut acc = vec![0i32; 16];
+        let mut out: Vec<SynapseGroup> = Vec::new();
+        let mut fired = Vec::new();
+        process_layer(&mut l, 0, 0, 4, &[], &mut acc, &mut out, &mut fired);
+        assert_eq!(l.decide_potential[0], 8, "fired neuron's decide_potential is the pre-reset value");
+        assert_eq!(l.potential[0], 0, "fired neuron's potential reset post-wave");
+        assert_eq!(l.decide_potential[1], 3, "sub-threshold neuron's decide_potential is its charge");
     }
 
     #[test]

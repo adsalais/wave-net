@@ -116,6 +116,7 @@ impl Network {
             g.adapt.iter_mut().for_each(|a| *a = 0);
             g.elig_pre.iter_mut().for_each(|e| *e = 0);
             g.elig_post.iter_mut().for_each(|e| *e = 0);
+            g.decide_potential.iter_mut().for_each(|p| *p = 0);
             g.inbox.clear();
             g.outbox.clear();
         }
@@ -152,6 +153,11 @@ impl Network {
     /// A copy of a layer's per-neuron thresholds (introspection / determinism tests).
     pub fn layer_thresholds(&self, z: usize) -> Vec<i16> {
         self.with_layer_mut(z, |l| l.thresholds().to_vec())
+    }
+
+    /// Per-neuron membrane potential captured at the last decide step (pre fire-reset/leak).
+    pub fn layer_decide_potential(&self, z: usize) -> Vec<i16> {
+        self.layers[z].lock().unwrap().decide_potential.clone()
     }
 
     /// Reset, run `warmup` waves (discarded), then `waves` counted; per-layer firing rate =
