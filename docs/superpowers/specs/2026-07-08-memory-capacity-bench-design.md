@@ -138,3 +138,28 @@ differing; each variant **calibrated separately** to the same target rate.
 - external datasets (SHD/SSC/psMNIST) — Tier 2.
 - Graded/rate input encoding, sweeping `K`/`B` as the deliverable — not needed to answer "how far back,
   and does ALIF extend it."
+
+## Revision (post-implementation) — the premise was wrong, and the result is more interesting
+
+The design assumed ALIF would **extend the MC tail**. Empirically it does the opposite: plain **LIF has
+substantially higher MC than ALIF** (feed-forward `1.57` vs `0.39`; recurrent `1.58` vs `0.38`), with LIF
+reconstructing the recent bit near-perfectly at lag 1 (the one-hop delay) and ALIF worse at every lag.
+
+Why, and why it's not a tuning miss:
+
+- **MC measures delayed *linear echo* — the ability to linearly reconstruct a *specific* past bit
+  `u(t−k)`.** LIF's fading spike echo does this; adaptation is a **slow low-pass integrator** (τ ≈ `2^decay`
+  bins) — a running average of history that *cannot pinpoint* one past bit (it blurs them). With the fixed
+  binary pattern (every "1" drives the same neurons) the adaptation population collapses toward a single
+  scalar low-pass, so it carries almost no per-lag structure. `adapt_bump = 0` (LIF) is the **max-MC
+  point**; more adaptation only lowers it — structural, not tunable.
+- **We tried exposing the adaptation state to the readout** (option B: augment `x(t)` with `net.adaptation`
+  per neuron, standardized). It did **not** help — it slightly *hurt* (extra weakly-informative features →
+  overfitting). Confirmed: the adaptation memory is not the delayed echo MC rewards. Reverted to the
+  standard spike-count readout.
+
+**The real result (and it's the useful one):** MC and store-recall bracket the **two kinds of memory**.
+Store-recall (Spec 1): *held / probed* memory → **ALIF wins**. MC (Spec 2): *delayed linear echo* → **LIF
+wins**. ALIF trades echo for held/nonlinear memory. So the assertions were reframed to the truth
+(`memory_capacity_lif_echo_beats_alif`): LIF echoes at lag 1, LIF MC > ALIF MC in both regimes, recurrent
+reservoir holds > 1 bit. The MC harness + `RidgeReadout` + `linalg` remain the reusable deliverables.
