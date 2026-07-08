@@ -102,3 +102,28 @@ solve weights, predict, threshold at 0.5, accuracy → permille.
 - external datasets — Tier 2.
 - Graded input, sweeping `B`/λ as the deliverable — not needed to answer "does ALIF's nonlinearity buy
   nonlinear temporal computation."
+
+## Revision (post-implementation) — the answer, checked against architecture
+
+**Does ALIF's nonlinearity buy nonlinear temporal computation? No — robustly.** Feed-forward LIF solves
+temporal XOR (~86% at `τ=1`, decaying with `τ`); **ALIF stays near chance** at every `τ`.
+
+The first config made XOR look *barely* solvable, which prompted the right question: does the result change
+with architecture? A throwaway sweep (feed-forward, `τ ∈ {1,2,4}`, LIF vs ALIF) over width, depth,
+refractory, density, and inhibition answered both halves:
+
+- **XOR solvability is strongly architecture-dependent.** Sparser connectivity (LIF `927`) and
+  wider+inhibition (`888`, holding to `644` at `τ=4`) solve it well; inhibition and longer refractory help;
+  recurrence *hurts* (`555`). The **dense all-excitatory topology the floored leak pushed us toward is poor
+  for nonlinear separation** — sparse/competitive dynamics are much better. So the demo config gained
+  inhibition (`inhibitor_ratio ≈ 0.15`, a new knob on the shared `engine_config`; MC keeps 0), giving a
+  clear `LIF ~86%` sanity signal.
+- **ALIF's non-help is robust.** Across all nine architectures, ALIF never exceeded ~`638` and never
+  approached LIF. Adaptation does not buy nonlinear temporal computation.
+
+**Combined result (three experiments):** ALIF wins **held-category memory across a delay** (store-recall);
+LIF wins **linear echo** (MC) *and* **nonlinear temporal** (XOR). So ALIF's adaptation buys *exactly one
+thing* — categorical memory held across a delay and read by a probe — not bit-level temporal computation of
+any kind. That sharply scopes what a Spec 3 training rule should target. Tests assert the robust finding
+(feed-forward LIF solves XOR; LIF ≫ ALIF); the sweep itself was throwaway (findings recorded here and in
+`related-work.md`).
