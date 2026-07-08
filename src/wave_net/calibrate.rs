@@ -101,7 +101,7 @@ mod tests {
             threshold_jitter: 64,
             baseline_init: 8,
             adapt_bump: 3,
-            adapt_decay: 1,
+            adapt_decay: 5,
         };
         Config { seed: 0x00C0_FFEE, size: 8, layers: vec![layer; 4] }
     }
