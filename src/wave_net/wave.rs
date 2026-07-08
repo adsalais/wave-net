@@ -76,7 +76,8 @@ pub fn process_layer(
             local,
             size,
             &layer.topology,
-            layer.inhibitor_ratio,
+            &layer.out_weights,
+            layer.total_slots,
             out,
         );
     }
@@ -195,6 +196,23 @@ mod tests {
             process_layer(&mut l, 0, 0, 4, &[], &mut acc, &mut out, &mut fired);
             assert_eq!(l.adapt[0], 0, "adapt must stay 0 when adapt_bump is 0");
         }
+    }
+
+    #[test]
+    fn stored_weight_sets_delivered_value() {
+        // A source neuron's stored out_weight is what its synapse delivers.
+        let mut l = low_layer(4, 1, 2, vec![TopologyLevel { level: 1, radius: 0, count: 1 }]);
+        l.out_weights[0] = 7; // neuron 0, slot 0 -> radius-0 target is neuron 0 itself
+        for c in l.cooldown.iter_mut() {
+            *c = 0;
+        }
+        l.potential[0] = 1; // fires (threshold 1)
+        let mut acc = vec![0i32; 16];
+        let mut out = groups_for(&l);
+        let mut fired = Vec::new();
+        process_layer(&mut l, 0, 0, 4, &[], &mut acc, &mut out, &mut fired);
+        assert_eq!(fired, vec![0]);
+        assert_eq!(out[0].synapses[0].weight, 7, "delivered weight = stored out_weight");
     }
 
     #[test]

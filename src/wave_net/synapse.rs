@@ -101,10 +101,12 @@ pub fn generate_into(
     src_local: u32,
     size: u32,
     topology: &[TopologyLevel],
-    inhibitor_ratio: u32,
+    weights: &[i8],
+    total_slots: usize,
     groups: &mut [SynapseGroup],
 ) {
     let (sx, sy) = xy_of(src_local, size);
+    let mut slot = 0usize;
     for (entry, group) in topology.iter().zip(groups.iter_mut()) {
         let span = 2 * entry.radius + 1;
         for k in 0..entry.count {
@@ -113,12 +115,9 @@ pub fn generate_into(
             let dy = map_range24(((h >> 16) as u32) & 0x00FF_FFFF, span) as i32 - entry.radius as i32;
             let tx = wrap(sx, dx, size);
             let ty = wrap(sy, dy, size);
-            let sign: i16 = if ((h & 0xFFFF) as u32) < inhibitor_ratio { -1 } else { 1 };
-            #[cfg(not(feature = "random_weights"))]
-            let magnitude: i16 = 1;
-            #[cfg(feature = "random_weights")]
-            let magnitude: i16 = 1 + (mix(key(seed, source_global, entry.level, k, P_WEIGHT)) & 0x0F) as i16;
-            group.synapses.push(Synapse { target: local_of(tx, ty, size), weight: sign * magnitude });
+            let w = weights[src_local as usize * total_slots + slot] as i16;
+            group.synapses.push(Synapse { target: local_of(tx, ty, size), weight: w });
+            slot += 1;
         }
     }
 }
@@ -138,11 +137,18 @@ mod tests {
         t.iter().map(|e| SynapseGroup { level: e.level, synapses: Vec::new() }).collect()
     }
 
+    /// All-+1 stored weights for a size-8 layer, sized to index any src_local·total_slots + slot.
+    fn ones(t: &[TopologyLevel]) -> (Vec<i8>, usize) {
+        let tot: usize = t.iter().map(|e| e.count as usize).sum();
+        (vec![1i8; 64 * tot], tot)
+    }
+
     #[test]
     fn generate_counts_per_level() {
         let t = topo();
+        let (w, tot) = ones(&t);
         let mut g = empty_groups(&t);
-        generate_into(42, 0, 0, 8, &t, 0, &mut g);
+        generate_into(42, 0, 0, 8, &t, &w, tot, &mut g);
         assert_eq!(g[0].synapses.len(), 6);
         assert_eq!(g[1].synapses.len(), 1);
         // radius 0 targets the source cell itself
@@ -152,9 +158,10 @@ mod tests {
     #[test]
     fn generate_targets_within_radius() {
         let t = topo();
+        let (w, tot) = ones(&t);
         let mut g = empty_groups(&t);
         let (sx, sy) = (3u32, 5u32);
-        generate_into(7, 100, local_of(sx, sy, 8), 8, &t, 0, &mut g);
+        generate_into(7, 100, local_of(sx, sy, 8), 8, &t, &w, tot, &mut g);
         for s in &g[0].synapses {
             let (tx, ty) = xy_of(s.target, 8);
             let dx = ((tx + 8 - sx) & 7).min((sx + 8 - tx) & 7);
@@ -166,16 +173,17 @@ mod tests {
     #[test]
     fn generate_is_deterministic_and_appends() {
         let t = topo();
+        let (w, tot) = ones(&t);
         let mut a = empty_groups(&t);
         let mut b = empty_groups(&t);
-        generate_into(1, 9, 9, 8, &t, 30000, &mut a);
-        generate_into(1, 9, 9, 8, &t, 30000, &mut b);
+        generate_into(1, 9, 9, 8, &t, &w, tot, &mut a);
+        generate_into(1, 9, 9, 8, &t, &w, tot, &mut b);
         assert_eq!(a[0].synapses.len(), b[0].synapses.len());
         for (x, y) in a[0].synapses.iter().zip(&b[0].synapses) {
             assert_eq!((x.target, x.weight), (y.target, y.weight));
         }
         // second call appends (aggregation across firers)
-        generate_into(1, 9, 9, 8, &t, 30000, &mut a);
+        generate_into(1, 9, 9, 8, &t, &w, tot, &mut a);
         assert_eq!(a[0].synapses.len(), 12);
     }
 

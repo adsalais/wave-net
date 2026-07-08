@@ -12,7 +12,7 @@
 //! scale); `Config::validate` enforces it.
 
 use crate::wave_net::config::LayerConfig;
-use crate::wave_net::synapse::{key, map_range, mix, Synapse, TopologyLevel, P_THRESHOLD};
+use crate::wave_net::synapse::{key, map_range, mix, Synapse, TopologyLevel, P_TARGET, P_THRESHOLD};
 
 /// Fixed-point scale for `adapt`: it holds the effective threshold contribution × `2^ADAPT_SHIFT`.
 /// Bounded by the i32 overflow limit on the bump-add (`2·ADAPT_MAX = i16::MAX << (SHIFT+1)` must fit
@@ -40,6 +40,9 @@ pub struct Layer {
     pub adapt_bump: i16,   // added to adapt on each fire (0 = plain LIF)
     pub adapt_decay: u8,   // right-shift decay of adapt per wave
     pub readout: bool,     // non-spiking drain-only output layer: integrates input, never fires
+    pub total_slots: usize,   // Σ topology counts — the stride for out_weights[local·total_slots + slot]
+    pub out_weights: Vec<i8>, // stored plastic weight per (source local, slot); addresses stay procedural
+    pub out_shadow: Vec<f32>, // higher-precision training accumulator, quantised into out_weights
 }
 
 impl Layer {
@@ -53,6 +56,23 @@ impl Layer {
             let jitter = map_range(h as u32, cfg.threshold_jitter as u32) as i32; // [0, jitter)
             *th = (cfg.baseline_init as i32 + jitter).clamp(1, i16::MAX as i32) as i16;
         }
+        // Stored weights: init to the old procedural sign (magnitude 1) so the net is behaviour-identical;
+        // training later moves them into the full int8 range. Addresses stay hash-generated in generate_into.
+        let total_slots: usize = cfg.topology.iter().map(|e| e.count as usize).sum();
+        let mut out_weights = vec![0i8; ls * total_slots];
+        for local in 0..ls {
+            let source_global = (base + local) as u32;
+            let mut slot = 0usize;
+            for entry in &cfg.topology {
+                for k in 0..entry.count {
+                    let h = mix(key(seed, source_global, entry.level, k, P_TARGET));
+                    out_weights[local * total_slots + slot] =
+                        if ((h & 0xFFFF) as u32) < cfg.inhibitor_ratio { -1 } else { 1 };
+                    slot += 1;
+                }
+            }
+        }
+        let out_shadow: Vec<f32> = out_weights.iter().map(|&w| w as f32).collect();
         Layer {
             potential: vec![0; ls],
             cooldown: vec![0; ls],
@@ -67,6 +87,9 @@ impl Layer {
             adapt_bump: cfg.adapt_bump,
             adapt_decay: cfg.adapt_decay,
             readout: false,
+            total_slots,
+            out_weights,
+            out_shadow,
         }
     }
 
