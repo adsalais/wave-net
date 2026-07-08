@@ -189,8 +189,17 @@ pub struct LearnCurve {
 }
 
 /// Deterministic class for trial `t`.
-fn pick_class(seed: u64, t: usize, k: usize) -> usize {
+pub(crate) fn pick_class(seed: u64, t: usize, k: usize) -> usize {
     (mix(key(seed, t as u32, 0, 0, 41)) % k as u64) as usize
+}
+
+/// Build the shared computational reservoir (no readout) and firing-rate-calibrate it — the untrained
+/// substrate both learners share. Used by the regime diagnostic.
+pub(crate) fn calibrated_reservoir(cfg: &EpropConfig) -> Network {
+    let mut net = Network::new(cfg.engine_config());
+    let input = random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16);
+    net.calibrate(&cfg.calib, &input);
+    net
 }
 
 const P_FEEDBACK: u64 = 43; // fixed random feedback weights (broadcast alignment)
