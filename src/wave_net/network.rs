@@ -92,6 +92,7 @@ impl Network {
             let mut g = layer.lock().unwrap();
             g.potential.iter_mut().for_each(|p| *p = 0);
             g.cooldown.iter_mut().for_each(|c| *c = 0);
+            g.adapt.iter_mut().for_each(|a| *a = 0);
             g.inbox.clear();
             g.outbox.clear();
         }
@@ -100,6 +101,10 @@ impl Network {
 
     pub fn potential(&self, layer: usize, local: usize) -> i16 {
         self.layers[layer].lock().unwrap().potential[local]
+    }
+
+    pub fn adaptation(&self, layer: usize, local: usize) -> i16 {
+        self.layers[layer].lock().unwrap().adapt[local]
     }
 
     pub fn size(&self) -> u32 {
@@ -180,6 +185,92 @@ mod tests {
         };
         let l1 = LayerConfig { topology: vec![], ..l0.clone() };
         Config { seed: 99, size: 4, layers: vec![l0, l1] }
+    }
+
+    // 2 layers, L0 -> L1 (level+1, radius 1, 4 targets), low baseline + strong adaptation on L1.
+    fn alif_two_layer() -> Config {
+        let l0 = LayerConfig {
+            topology: vec![TopologyLevel { level: 1, radius: 1, count: 4 }],
+            leak: (3, 5),
+            cooldown_base: 1,
+            inhibitor_ratio: 0,
+            threshold_jitter: 0,
+            baseline_init: 2,
+            adapt_bump: 200,
+            adapt_decay: 4,
+        };
+        let l1 = LayerConfig { topology: vec![], ..l0.clone() };
+        Config { seed: 5, size: 4, layers: vec![l0, l1] }
+    }
+
+    #[test]
+    fn adaptation_accessor_and_reset() {
+        let net = Network::new(alif_two_layer());
+        let all_l0 = (0..16u32).collect::<Vec<u32>>();
+        for _ in 0..3 {
+            net.wave(&all_l0); // injection forces L0 to fire -> bumps L0 adapt
+        }
+        let any_nonzero = (0..16).any(|i| net.adaptation(0, i) > 0);
+        assert!(any_nonzero, "L0 adaptation should be >0 after repeated firing");
+        net.reset_state();
+        for z in 0..net.layer_count() {
+            for i in 0..16 {
+                assert_eq!(net.adaptation(z, i), 0, "reset must zero adaptation");
+            }
+        }
+    }
+
+    #[test]
+    fn determinism_includes_adaptation() {
+        let inputs: [&[u32]; 4] = [&[0, 1, 2, 3], &[4, 5], &[], &[6, 7, 8]];
+        let run = || {
+            let net = Network::new(Config::demo());
+            for _ in 0..6 {
+                for inp in inputs {
+                    net.wave(inp);
+                }
+            }
+            (0..net.layer_count())
+                .flat_map(|z| (0..(net.size() * net.size()) as usize).map(move |i| (z, i)))
+                .map(|(z, i)| net.adaptation(z, i))
+                .collect::<Vec<i16>>()
+        };
+        assert_eq!(run(), run());
+    }
+
+    #[test]
+    fn adaptation_self_limits_rate() {
+        // Same constant drive into L1, with vs. without adaptation. Adaptation must reduce total
+        // L1 firing over the window — the self-limiting effect, robustly measured as a total count.
+        fn total_l1_spikes(adapt_bump: i16) -> usize {
+            let l0 = LayerConfig {
+                topology: vec![TopologyLevel { level: 1, radius: 1, count: 4 }],
+                leak: (3, 5),
+                cooldown_base: 1,
+                inhibitor_ratio: 0,
+                threshold_jitter: 0,
+                baseline_init: 2,
+                adapt_bump,
+                adapt_decay: 4,
+            };
+            let l1 = LayerConfig { topology: vec![], ..l0.clone() };
+            let mut net = Network::new(Config { seed: 5, size: 4, layers: vec![l0, l1] });
+            let count = Arc::new(Mutex::new(0usize));
+            {
+                let c = count.clone();
+                net.on_layer(1, Box::new(move |_w, fired: &[u32]| *c.lock().unwrap() += fired.len()));
+            }
+            let all_l0 = (0..16u32).collect::<Vec<u32>>();
+            for _ in 0..60 {
+                net.wave(&all_l0); // constant maximal drive into L1
+            }
+            let n = *count.lock().unwrap();
+            n
+        }
+        let without = total_l1_spikes(0);
+        let with = total_l1_spikes(30);
+        assert!(without > 0, "L1 should fire under constant drive with no adaptation");
+        assert!(with < without, "adaptation should suppress total L1 firing: {with} vs {without}");
     }
 
     #[test]
