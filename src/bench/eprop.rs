@@ -49,7 +49,9 @@ pub struct EpropConfig {
     pub reward_rate: f64, // EMA rate for R̄
     pub calib: CalibrateParams,
     pub calib_fraction_q16: u32,
-    pub readout: bool, // V2a: append a non-spiking readout layer and score from its potentials
+    pub readout: bool,     // V2a: append a non-spiking readout layer and score from its potentials
+    pub broadcast: bool,   // V2b: per-output broadcast-error credit instead of global reward
+    pub softmax_temp: f64, // temperature for the readout-score softmax
 }
 
 impl EpropConfig {
@@ -82,6 +84,8 @@ impl EpropConfig {
             },
             calib_fraction_q16: 20000,
             readout: false,
+            broadcast: false,
+            softmax_temp: 100.0,
         }
     }
 
@@ -179,6 +183,27 @@ fn pick_class(seed: u64, t: usize, k: usize) -> usize {
     (mix(key(seed, t as u32, 0, 0, 41)) % k as u64) as usize
 }
 
+const P_FEEDBACK: u64 = 43; // fixed random feedback weights (broadcast alignment)
+
+/// Softmax over `scores / temp`, with subtract-max for overflow safety (scores are large potential sums).
+fn softmax(scores: &[i64], temp: f64) -> Vec<f64> {
+    let max = *scores.iter().max().unwrap_or(&0) as f64;
+    let t = temp.max(1e-9);
+    let exps: Vec<f64> = scores.iter().map(|&s| ((s as f64 - max) / t).exp()).collect();
+    let sum: f64 = exps.iter().sum::<f64>().max(1e-300);
+    exps.iter().map(|&e| e / sum).collect()
+}
+
+/// Fixed random feedback weight `±1` for (neuron `global_id`, output `output`) — deterministic,
+/// hash-derived, stored-free. Feedback *alignment*: random and fixed, not the forward readout weights.
+fn feedback_weight(seed: u64, global_id: u32, output: usize) -> f64 {
+    if mix(key(seed, global_id, output as i32, 0, P_FEEDBACK)) & 1 == 1 {
+        1.0
+    } else {
+        -1.0
+    }
+}
+
 /// Class scores from a readout layer's integrated potentials: K contiguous population sums.
 fn readout_scores(net: &Network, readout_z: usize, k: usize) -> Vec<i64> {
     let ls = (net.size() * net.size()) as usize;
@@ -224,9 +249,28 @@ pub fn train(cfg: &EpropConfig, lr: f64) -> LearnCurve {
         let signal = rt.step(correct - best_rival);
 
         if lr != 0.0 {
-            for (zi, layer_e) in elig.iter().enumerate() {
-                for (i, &e) in layer_e.iter().enumerate() {
-                    shadow[zi][i] += -lr * signal * e as f64;
+            if cfg.broadcast {
+                // Per-output broadcast error: softmax the scores, err_i = target_i - p_i (target =
+                // one-hot(class)), projected to each internal neuron via fixed random feedback weights.
+                let ls = (cfg.size * cfg.size) as usize;
+                let p = softmax(&outs, cfg.softmax_temp);
+                let err: Vec<f64> = (0..cfg.k).map(|i| (if i == class { 1.0 } else { 0.0 }) - p[i]).collect();
+                for (zi, layer_e) in elig.iter().enumerate() {
+                    let z = zi + 1; // eligibility index zi <-> engine layer z = zi + 1
+                    for (i, &e) in layer_e.iter().enumerate() {
+                        if e == 0 {
+                            continue;
+                        }
+                        let gid = (z * ls + i) as u32;
+                        let l_j: f64 = (0..cfg.k).map(|o| feedback_weight(cfg.seed, gid, o) * err[o]).sum();
+                        shadow[zi][i] += -lr * l_j * e as f64;
+                    }
+                }
+            } else {
+                for (zi, layer_e) in elig.iter().enumerate() {
+                    for (i, &e) in layer_e.iter().enumerate() {
+                        shadow[zi][i] += -lr * signal * e as f64;
+                    }
                 }
             }
             write_thresholds(&net, &shadow);
@@ -305,6 +349,54 @@ mod tests {
     fn late_mean(curve: &[u64]) -> u64 {
         let h = curve.len() / 2;
         curve[h..].iter().sum::<u64>() / (curve.len() - h).max(1) as u64
+    }
+
+    #[test]
+    fn softmax_is_a_distribution() {
+        let p = softmax(&[3, 1, 1], 1.0);
+        assert!((p.iter().sum::<f64>() - 1.0).abs() < 1e-9, "sums to 1");
+        assert!(p[0] > p[1] && (p[1] - p[2]).abs() < 1e-12, "monotone in the input");
+        let q = softmax(&[1_000_000, 0], 100.0);
+        assert!(q[0].is_finite() && q[1].is_finite() && q[0] > 0.99, "no overflow; peaks on the max");
+    }
+
+    #[test]
+    fn feedback_weights_are_deterministic_and_signed() {
+        let w = |g, o| feedback_weight(7, g, o);
+        assert_eq!(w(10, 0), w(10, 0), "deterministic");
+        assert!([-1.0, 1.0].contains(&w(10, 0)) && [-1.0, 1.0].contains(&w(3, 1)), "values are +/-1");
+        let vals: Vec<f64> = (0..20).map(|g| w(g, 0)).collect();
+        assert!(vals.iter().any(|&v| v > 0.0) && vals.iter().any(|&v| v < 0.0), "both signs occur");
+    }
+
+    fn broadcast_cfg() -> EpropConfig {
+        let mut cfg = EpropConfig::demo();
+        cfg.readout = true;
+        cfg.broadcast = true;
+        cfg.softmax_temp = 10.0; // scores are large potential sums; low temp sharpens the error
+        cfg.trials = 3600;
+        cfg.block = 300;
+        cfg
+    }
+
+    #[test]
+    fn eprop_broadcast_is_deterministic() {
+        let cfg = broadcast_cfg();
+        assert_eq!(train(&cfg, 0.5).accuracy_permille, train(&cfg, 0.5).accuracy_permille);
+    }
+
+    #[test]
+    fn eprop_broadcast_learns_and_beats_frozen() {
+        let cfg = broadcast_cfg();
+        let learn = train(&cfg, 0.5);
+        let frozen = train(&cfg, 0.0);
+        eprintln!("v2b broadcast learn  {:?}", learn.accuracy_permille);
+        eprintln!("v2b broadcast frozen {:?}", frozen.accuracy_permille);
+        let ll = late_mean(&learn.accuracy_permille);
+        let lf = late_mean(&frozen.accuracy_permille);
+        let chance = 1000 / cfg.k as u64;
+        assert!(ll > chance + 80, "broadcast learning {ll} should be above chance {chance}");
+        assert!(ll > lf + 150, "broadcast learning {ll} should beat frozen {lf}");
     }
 
     #[test]
