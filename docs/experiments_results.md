@@ -1,0 +1,173 @@
+# Experiment results — ALIF vs LIF on the wave-net bench
+
+**Date:** 2026-07-08
+**What this is:** a consolidated record of the ALIF-vs-LIF experiments run on the integer bench
+(`src/bench/`), across store-recall (Spec 1), Memory Capacity (Spec 2), temporal XOR (Spec 2b), and an
+architecture robustness sweep over all three. Design rationale lives in the per-spec docs under
+`docs/superpowers/specs/`; the literature framing and forward-looking notes live in
+`docs/related-work.md`. This file is the *results*.
+
+## Setup
+
+- **Substrate:** the integer wave-net engine. **ALIF** = per-neuron adaptive threshold (`adapt_bump > 0`,
+  fixed-point Q12 adaptation, τ ≈ `2^adapt_decay` waves). **LIF** = the *same* network with
+  `adapt_bump = 0`. Every comparison is that single knob, each variant calibrated to the same firing rate.
+- **Isolation:** most experiments use a **feed-forward** topology so recurrence can't carry memory on its
+  own (recurrence confounds the comparison — see the store-recall note below). L0 is a non-adapting input
+  transducer; the computational layers `1..L` carry the dynamics.
+- **Readouts (bench, `f64`; engine stays integer):** integer nearest-centroid classifier (store-recall);
+  ridge regression, factored once (MC and XOR).
+- **Determinism:** every number below is a pure function of `(seed, config, params)`. Configs are small
+  demo networks (size 8–16, 3–6 layers); the findings are qualitative and were stress-tested by the sweep.
+
+## Experiment 1 — Store-recall (delayed match): *held-category* memory
+
+Present one of `K=4` cues, wait a silent delay `N`, then inject a fixed probe and decode which cue it was
+from the spike response. Only ALIF's residual adaptation footprint should survive the delay.
+
+**Memory-horizon (feed-forward), decode accuracy ‰ (chance = 250):**
+
+| delay N | 0 | 8 | 24 |
+|---|---|---|---|
+| **ALIF** | 900 | 550 | 550 |
+| **LIF** | 1000 | 250 | 250 |
+
+**Result: ALIF wins.** LIF collapses to chance by delay 8 (it forgets); ALIF holds the cue at ~550‰ out to
+delay 24. The cue lives in the slow adaptation state, and the probe converts it into a readable spike
+pattern.
+
+## Experiment 2 — Memory Capacity (MC): *delayed linear echo*
+
+Stream i.i.d. bits `u(t)` in bins; fit a linear readout to reconstruct `u(t−k)` from the state; `MC = Σ_k
+r²_k`. Measures how well the reservoir *linearly echoes* specific past bits.
+
+**MC total (feed-forward and recurrent):**
+
+| | feed-forward | recurrent |
+|---|---|---|
+| **LIF** | 1.57 | 1.58 |
+| **ALIF** | 0.39 | 0.38 |
+
+LIF reconstructs the most-recent bit near-perfectly (`r²₁ ≈ 1.0`, via the one-hop delay).
+
+**Result: LIF wins, by ~4×.** MC measures linear echo; adaptation is a slow **low-pass integrator** that
+can't pinpoint one past bit — so it *lowers* MC. `adapt_bump = 0` is the max-MC point. Exposing the raw
+adaptation state to the readout did not help (it's low-pass, not echo).
+
+## Experiment 3 — Temporal XOR: *nonlinear temporal* computation
+
+Target `y(t) = u(t) ⊕ u(t−τ)`, swept over `τ`; thresholded ridge classifier. XOR is not linearly
+separable in the inputs, so the reservoir must provide the nonlinear features.
+
+**Feed-forward accuracy ‰ (chance = 500), inhibitory reservoir:**
+
+| τ | 1 | 2 | 4 | 8 |
+|---|---|---|---|---|
+| **LIF** | 861 | 661 | 561 | 552 |
+| **ALIF** | 595 | 480 | 476 | 576 |
+
+**Result: LIF wins; ALIF near chance.** The hypothesis that adaptation's nonlinearity would *buy* nonlinear
+temporal computation is **falsified** — ALIF does not help.
+
+## Architecture robustness sweep
+
+Each experiment was re-run across the same nine feed-forward architectures — varying width, depth,
+refractory period, connectivity density, and inhibition — to check whether the findings are robust or
+config artifacts.
+
+**Store-recall** (decode ‰ at delay 24, chance 250):
+
+| arch | LIF | ALIF |
+|---|---|---|
+| baseline (dense) | 250 | 950 |
+| wider (size 16) | 250 | 1000 |
+| deeper (6 layers) | 250 | 950 |
+| refractory = 1 | 250 | 950 |
+| refractory = 4 | 250 | 950 |
+| inhibition 0.15 | 250 | 850 |
+| **sparse (count 6)** | 250 | **350** |
+| wide + inhibition | 250 | 1000 |
+
+**MC total** (higher = more linear memory):
+
+| arch | LIF | ALIF |
+|---|---|---|
+| baseline | 1.42 | 0.40 |
+| wider (size 16) | 1.71 | 0.33 |
+| deeper (6 layers) | 1.44 | 0.34 |
+| refractory = 1 | 1.41 | 0.40 |
+| refractory = 4 | 1.41 | 0.38 |
+| inhibition 0.15 | 1.64 | 0.39 |
+| sparse (count 6) | 1.65 | 0.23 |
+| **wide + inhibition** | **2.04** | 0.41 |
+| recurrent | 1.51 | 0.38 |
+
+**XOR** (accuracy ‰ at τ = 1, chance 500):
+
+| arch | LIF | ALIF |
+|---|---|---|
+| baseline (dense) | 727 | 544 |
+| wider (size 16) | 761 | 544 |
+| deeper (6 layers) | 694 | 527 |
+| refractory = 1 | 683 | 544 |
+| refractory = 4 | 738 | 544 |
+| inhibition 0.15 | 800 | 550 |
+| **sparse (count 6)** | **927** | 544 |
+| wide + inhibition | 888 | 638 |
+| recurrent | 555 | 533 |
+
+**Robustness verdict:**
+- **Store-recall (ALIF wins): robust** across width/depth/refractory/inhibition (850–1000‰), **except
+  sparse connectivity**, where ALIF collapses to 350‰.
+- **MC (LIF wins): robust** — richer/inhibitory reservoirs *raise* LIF's MC (up to 2.04) while ALIF stays
+  pinned at ~0.3–0.4, widening the gap.
+- **XOR (LIF wins): robust** — sparsity/inhibition *raise* LIF's accuracy; recurrence hurts; ALIF never
+  helps in any architecture.
+
+## Synthesis
+
+**ALIF's adaptation buys exactly one thing: categorical memory held across a delay and read by a probe
+(store-recall). It does not help linear echo (MC) or nonlinear temporal computation (XOR) — in any
+architecture.** LIF and ALIF occupy different points on a fast-echo ↔ slow-held memory spectrum:
+
+| axis | who wins | why |
+|---|---|---|
+| held-category across a delay | **ALIF** | adaptation footprint persists in a silent, sub-threshold state |
+| linear echo of a specific past bit | **LIF** | fading spike echo; adaptation is low-pass, can't pinpoint |
+| nonlinear temporal computation | **LIF** | adaptation adds history-dependent gain that scrambles bit-level features |
+
+### The connectivity-density tradeoff
+
+The sweep exposed opposite density preferences for the two winning behaviors:
+
+| | dense (count 16) | sparse (count 6) |
+|---|---|---|
+| **Store-recall** (ALIF held memory) | strong (950‰) | weak (350‰) |
+| **XOR** (LIF nonlinear) | weak (727‰) | strong (927‰) |
+
+**Dense fan-out spreads the cue's adaptation footprint across many neurons → good for ALIF held memory;
+sparse fan-out gives more distinct, less-redundant features → good for LIF nonlinear separation.** So a
+heterogeneous network should mix *densities per role*, not just neuron types: dense-ALIF layers to hold
+context, sparse-LIF layers to compute (`adapt_bump` is already per-layer).
+
+## Engine finding along the way — the floored leak
+
+Store-recall *found a real substrate bug*. The potential leak `p -= (p>>a)+(p>>b)` is `0` for `0 < p <
+2^a`, so small sub-threshold potentials **froze forever** — the network had *infinite* sub-threshold
+memory, and plain LIF never forgot a cue (the ALIF-vs-LIF distinction vanished). Fixed by flooring positive
+decay at 1 (`p -= max((p>>a)+(p>>b), 1)`), giving a finite membrane time constant. Cost: the 1/wave floor
+starves sparse cascades, so configs need denser drive (the fix and its density cost are in
+`docs/related-work.md`, with the fixed-point-`potential` upgrade as the follow-up).
+
+## Implications
+
+- **For training (Spec 3, e-prop-style threshold learning):** train against a **held-category /
+  working-memory task** (the store-recall / delayed-match family) — the only thing adaptation buys. **Not**
+  MC or XOR (bit-level tasks LIF already does better). e-prop's eligibility trace on the per-neuron
+  threshold is the machinery that credits exactly this slow held-state. Ensure ALIF layers have **dense**
+  fan-out.
+- **Heterogeneous networks** (mixed LIF/ALIF layers, mixed densities) are the natural way to span both
+  memory axes — worth a bench experiment (a mixed config on store-recall *and* XOR) before or during Spec 3.
+- **Always control for passive memory** when attributing memory to adaptation: recurrence carries memory on
+  its own (use feed-forward to isolate), and — before the floored-leak fix — frozen potentials gave even
+  LIF infinite memory.
