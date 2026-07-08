@@ -99,6 +99,9 @@ mod tests {
             cooldown_base: 2,
             inhibitor_ratio: 0,
             threshold_jitter: 64,
+            baseline_init: i16::MAX,
+            adapt_bump: 0,
+            adapt_decay: 5,
         };
         Config { seed: 0x00C0_FFEE, size: 8, layers: vec![layer; 4] }
     }

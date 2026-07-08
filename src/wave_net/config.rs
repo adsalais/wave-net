@@ -11,7 +11,10 @@ pub struct LayerConfig {
     pub leak: (u8, u8),        // right-shift amounts a, b in `p -= (p>>a) + (p>>b)`
     pub cooldown_base: u8,     // refractory reload on fire
     pub inhibitor_ratio: u32,  // Q16: inhibitory iff (hash & 0xFFFF) < inhibitor_ratio
-    pub threshold_jitter: u16, // threshold = i16::MAX - rand(0..threshold_jitter)
+    pub threshold_jitter: u16, // baseline = baseline_init + rand(0..threshold_jitter)
+    pub baseline_init: i16,    // construction center for the baseline threshold (low, not i16::MAX)
+    pub adapt_bump: i16,       // added to `adapt` on each fire (β); 0 = plain LIF dynamics
+    pub adapt_decay: u8,       // right-shift decay of `adapt` per wave: adapt -= adapt >> adapt_decay (>= 1)
 }
 
 #[derive(Clone, Debug)]
@@ -43,6 +46,9 @@ impl Config {
             cooldown_base: 2,
             inhibitor_ratio: 9830, // ~0.15 * 65536
             threshold_jitter: THRESHOLD_JITTER_DEFAULT,
+            baseline_init: 12,
+            adapt_bump: 16,
+            adapt_decay: 5,
         };
         Config { seed: 0x1234_5678_9ABC_DEF0, size: 16, layers: vec![layer; 6] }
     }
@@ -60,6 +66,9 @@ impl Config {
             }
             if lc.cooldown_base == 0 {
                 return Err(format!("layer {z}: cooldown_base must be >= 1"));
+            }
+            if lc.adapt_decay == 0 {
+                return Err(format!("layer {z}: adapt_decay must be >= 1"));
             }
         }
         Ok(())
@@ -86,6 +95,13 @@ mod tests {
     fn rejects_empty_layers() {
         let mut c = Config::demo();
         c.layers.clear();
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_adapt_decay() {
+        let mut c = Config::demo();
+        c.layers[0].adapt_decay = 0;
         assert!(c.validate().is_err());
     }
 

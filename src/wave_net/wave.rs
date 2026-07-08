@@ -90,6 +90,9 @@ mod tests {
             cooldown_base,
             inhibitor_ratio: 0,
             threshold_jitter: 0,
+            baseline_init: 0,
+            adapt_bump: 0,
+            adapt_decay: 5,
         };
         let mut l = Layer::new(&cfg, 0, 0, size);
         for t in l.threshold.iter_mut() {

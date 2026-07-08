@@ -93,6 +93,9 @@ mod tests {
             cooldown_base: 2,
             inhibitor_ratio: 0,
             threshold_jitter: jitter,
+            baseline_init: i16::MAX,
+            adapt_bump: 0,
+            adapt_decay: 5,
         }
     }
 

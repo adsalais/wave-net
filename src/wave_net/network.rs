@@ -174,6 +174,9 @@ mod tests {
             cooldown_base: 2,
             inhibitor_ratio: 0,
             threshold_jitter: 0,
+            baseline_init: i16::MAX,
+            adapt_bump: 0,
+            adapt_decay: 5,
         };
         let l1 = LayerConfig { topology: vec![], ..l0.clone() };
         Config { seed: 99, size: 4, layers: vec![l0, l1] }
