@@ -2,5 +2,6 @@
 //! tasks that validate the substrate (and, later, training). Uses only the engine's public API.
 
 pub mod linalg;
+pub mod memory_capacity;
 pub mod readout;
 pub mod store_recall;
