@@ -35,6 +35,7 @@ pub struct RsnnConfig {
     pub adapt_bump: i16,  // ALIF adaptation strength (0 = LIF; adaptation is a per-neuron memory)
     pub adapt_decay: u8,  // ALIF adaptation decay shift
     pub rec_init: i8,     // initial recurrent weight (0 = keep procedural ±1; >0 bootstraps self-excitation)
+    pub multi_layer: bool, // train every feed-forward layer (DFA credit), not just the last
     pub calib: CalibrateParams,
     pub calib_fraction_q16: u32,
 }
@@ -66,6 +67,7 @@ impl RsnnConfig {
             adapt_bump: 20,
             adapt_decay: 6,
             rec_init: 0,
+            multi_layer: false,
             calib: CalibrateParams { warmup: 16, waves: 48, max_steps: 24, refine_passes: 3, ..CalibrateParams::default() },
             calib_fraction_q16: 20000,
         }
@@ -186,6 +188,14 @@ pub fn train_readout(cfg: &RsnnConfig) -> u64 {
 
 /// Regenerate the procedural target of source neuron `src_local`'s level-`+1` slot `k` (matches
 /// `generate_into`), so the e-prop update can pair a stored weight with its postsynaptic neuron.
+const P_DFA: u64 = 61; // fixed random Direct-Feedback-Alignment weights
+
+/// Fixed random ±1 DFA feedback weight for (target neuron `neuron_global`, output class `class`) —
+/// deterministic, hash-derived, stored-free. Broadcasts the output error to a deep layer.
+fn dfa_weight(seed: u64, neuron_global: u32, class: usize) -> f32 {
+    if mix(key(seed, neuron_global, class as i32, 0, P_DFA)) & 1 == 1 { 1.0 } else { -1.0 }
+}
+
 fn target_of(seed: u64, source_global: u32, src_local: u32, level: i32, k: u32, radius: u32, size: u32) -> u32 {
     let (sx, sy) = xy_of(src_local, size);
     let h = mix(key(seed, source_global, level, k, P_TARGET));
@@ -204,7 +214,6 @@ pub fn train_eprop(cfg: &RsnnConfig) -> u64 {
     let l = net.layer_count();
     let ls = (cfg.size * cfg.size) as usize;
     let top = l - 1;
-    let z_below = l - 2;
     let up = cfg.up_count as usize;
     let mut w = vec![vec![0f32; ls]; cfg.k]; // readout on the TOP layer only
     let score = |w: &[Vec<f32>], a: &[f32]| -> Vec<f32> {
@@ -222,26 +231,40 @@ pub fn train_eprop(cfg: &RsnnConfig) -> u64 {
             }
         }
         if cfg.hidden_lr != 0.0 {
-            // symmetric-feedback learning signal per top neuron, and factored eligibility pre_i·psi_j
-            let l_sig: Vec<f32> = (0..ls).map(|j| (0..cfg.k).map(|c| w[c][j] * err[c]).sum()).collect();
-            let pre = net.with_layer_mut(z_below, |x| x.elig_pre.clone());
-            let psi = net.with_layer_mut(top, |x| x.elig_post.clone());
-            net.with_layer_mut(z_below, |l1| {
-                for i in 0..ls {
-                    let pre_i = pre[i] as f32;
-                    if pre_i == 0.0 {
-                        continue;
+            let trained: Vec<usize> = if cfg.multi_layer { (0..top).collect() } else { vec![top - 1] };
+            for z in trained {
+                let tgt = z + 1;
+                // learning signal L_j for each target-layer neuron j: symmetric readout feedback for the
+                // top layer, random DFA feedback for deeper layers. Eligibility is factored pre_i·psi_j.
+                let l_sig: Vec<f32> = (0..ls)
+                    .map(|j| {
+                        (0..cfg.k)
+                            .map(|c| {
+                                let b = if tgt == top { w[c][j] } else { dfa_weight(cfg.seed, (tgt * ls + j) as u32, c) };
+                                b * err[c]
+                            })
+                            .sum()
+                    })
+                    .collect();
+                let pre = net.with_layer_mut(z, |x| x.elig_pre.clone());
+                let psi = net.with_layer_mut(tgt, |x| x.elig_post.clone());
+                net.with_layer_mut(z, |lz| {
+                    for i in 0..ls {
+                        let pre_i = pre[i] as f32;
+                        if pre_i == 0.0 {
+                            continue;
+                        }
+                        let sg = (z * ls + i) as u32;
+                        for kk in 0..up {
+                            let j = target_of(cfg.seed, sg, i as u32, 1, kk as u32, cfg.up_radius, cfg.size) as usize;
+                            lz.out_shadow[i * up + kk] += -cfg.hidden_lr * l_sig[j] * pre_i * psi[j] as f32;
+                        }
                     }
-                    let sg = (z_below * ls + i) as u32;
-                    for kk in 0..up {
-                        let j = target_of(cfg.seed, sg, i as u32, 1, kk as u32, cfg.up_radius, cfg.size) as usize;
-                        l1.out_shadow[i * up + kk] += -cfg.hidden_lr * l_sig[j] * pre_i * psi[j] as f32;
+                    for (wq, s) in lz.out_weights.iter_mut().zip(&lz.out_shadow) {
+                        *wq = s.round().clamp(-127.0, 127.0) as i8;
                     }
-                }
-                for (wq, s) in l1.out_weights.iter_mut().zip(&l1.out_shadow) {
-                    *wq = s.round().clamp(-127.0, 127.0) as i8;
-                }
-            });
+                });
+            }
         }
     }
     let mut correct = 0usize;
@@ -444,6 +467,24 @@ mod tests {
             best = best.max(acc);
         }
         assert!(best < 640, "feed-forward (LIF, long delay) must NOT solve temporal XOR (best {best})");
+    }
+
+    #[test]
+    fn dfa_weights_are_deterministic_and_signed() {
+        let f = |g, c| dfa_weight(7, g, c);
+        assert_eq!(f(10, 0), f(10, 0));
+        assert!([-1.0, 1.0].contains(&f(10, 0)) && [-1.0, 1.0].contains(&f(3, 1)));
+        let vals: Vec<f32> = (0..20).map(|g| f(g, 0)).collect();
+        assert!(vals.iter().any(|&v| v > 0.0) && vals.iter().any(|&v| v < 0.0), "both signs occur");
+    }
+
+    #[test]
+    fn multilayer_is_deterministic() {
+        let mut cfg = RsnnConfig::demo();
+        cfg.layers = 4;
+        cfg.multi_layer = true;
+        cfg.trials = 600;
+        assert_eq!(train_eprop(&cfg), train_eprop(&cfg));
     }
 
     #[test]
