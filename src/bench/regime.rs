@@ -135,6 +135,53 @@ pub fn fisher_ratio(states: &[Vec<u32>], labels: &[usize], k: usize) -> f64 {
     sb / sw
 }
 
+/// Participation ratio (tr C)² / tr(C²) of the state covariance — the effective dimensionality.
+pub fn effective_dim(states: &[Vec<f64>]) -> f64 {
+    let n = states.len();
+    if n == 0 {
+        return 0.0;
+    }
+    let d = states[0].len();
+    let mut mu = vec![0f64; d];
+    for x in states {
+        for j in 0..d {
+            mu[j] += x[j];
+        }
+    }
+    for m in &mut mu {
+        *m /= n as f64;
+    }
+    let mut c = vec![vec![0f64; d]; d];
+    for x in states {
+        for a in 0..d {
+            let xa = x[a] - mu[a];
+            for b in 0..d {
+                c[a][b] += xa * (x[b] - mu[b]);
+            }
+        }
+    }
+    let tr: f64 = (0..d).map(|a| c[a][a] / n as f64).sum();
+    let tr_sq: f64 = c.iter().flatten().map(|&v| (v / n as f64).powi(2)).sum();
+    if tr_sq <= 0.0 { 0.0 } else { tr * tr / tr_sq }
+}
+
+/// Cast integer states to f64 rows.
+pub fn as_f64(states: &[Vec<u32>]) -> Vec<Vec<f64>> {
+    states.iter().map(|x| x.iter().map(|&v| v as f64).collect()).collect()
+}
+
+/// Legenstein–Maass power: effective rank across distinct inputs (both classes) minus effective rank
+/// across noisy copies of one input (one class, different noise realizations). PR is the soft rank.
+pub fn kernel_minus_gen_rank(cfg: &EpropConfig) -> f64 {
+    let m = 64usize;
+    let mut net = calibrated_reservoir(cfg);
+    let kernel: Vec<Vec<u32>> = (0..m)
+        .map(|t| top_state(&reservoir_states(&mut net, cfg, pick_class(cfg.seed, t, cfg.k), t, None)))
+        .collect();
+    let noisy: Vec<Vec<u32>> = (0..m).map(|t| top_state(&reservoir_states(&mut net, cfg, 0, t, None))).collect();
+    effective_dim(&as_f64(&kernel)) - effective_dim(&as_f64(&noisy))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,5 +228,33 @@ mod tests {
         let fd = fisher_ratio(&sd, &yd, 2);
         eprintln!("fisher work {fw:.4} dead {fd:.4}");
         assert!(fw > fd, "working Fisher {fw} > dead {fd}");
+    }
+
+    #[test]
+    fn effective_dim_matches_known_participation_ratio() {
+        // rank-1 (all rows a scalar multiple of one direction) → PR ≈ 1
+        let rank1: Vec<Vec<f64>> = (1..=10).map(|a| vec![a as f64, 2.0 * a as f64, 3.0 * a as f64]).collect();
+        let pr1 = effective_dim(&rank1);
+        assert!((pr1 - 1.0).abs() < 0.05, "rank-1 PR ~ 1, got {pr1}");
+        // isotropic 3-D (independent ±unit per axis, equal variance, zero covariance) → PR ≈ 3
+        let iso: Vec<Vec<f64>> = (0..3)
+            .flat_map(|d| {
+                let mut p = vec![0.0; 3];
+                p[d] = 1.0;
+                let mut n = vec![0.0; 3];
+                n[d] = -1.0;
+                [p, n]
+            })
+            .collect();
+        let pr3 = effective_dim(&iso);
+        assert!((pr3 - 3.0).abs() < 0.05, "isotropic PR ~ 3, got {pr3}");
+    }
+
+    #[test]
+    fn kernel_minus_gen_rank_is_finite_and_deterministic() {
+        let a = kernel_minus_gen_rank(&small());
+        let b = kernel_minus_gen_rank(&small());
+        assert!(a.is_finite());
+        assert_eq!(a, b, "deterministic");
     }
 }
