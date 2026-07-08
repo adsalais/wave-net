@@ -1,8 +1,10 @@
 //! `store_recall` — the Tier-0 delayed-match task and the ALIF-vs-LIF memory-horizon experiment.
 
-use crate::bench::readout::record_response;
+use crate::bench::readout::{record_response, NearestCentroid};
+use crate::wave_net::calibrate::{random_l0_input, CalibrateParams};
+use crate::wave_net::config::{Config, LayerConfig};
 use crate::wave_net::network::Network;
-use crate::wave_net::synapse::{key, mix};
+use crate::wave_net::synapse::{key, mix, TopologyLevel};
 
 const P_CUE: u64 = 7; // base cue membership per class
 const P_TRIAL: u64 = 11; // per-trial keep of base sites
@@ -78,12 +80,131 @@ pub fn run_trial(net: &mut Network, tp: &TaskParams, class: usize, trial: usize,
     record_response(net, tp.read_waves, move |_w| probe.clone())
 }
 
+/// Full configuration for the store-recall memory-horizon experiment.
+#[derive(Clone, Debug)]
+pub struct BenchConfig {
+    pub seed: u64,
+    pub size: u32,
+    pub layers: usize,
+    pub k: usize,           // number of cue classes (chance = 1/k)
+    pub baseline_init: i16,
+    pub adapt_bump: i16,    // ALIF value; LIF variant passes 0 to memory_horizon
+    pub adapt_decay: u8,
+    pub trials_per_class: usize,
+    pub delays: Vec<usize>, // swept, ascending
+    pub task: TaskParams,
+    pub calib: CalibrateParams,
+    pub calib_fraction_q16: u32,
+}
+
+impl BenchConfig {
+    /// Small, fast, deterministic config tuned for the inline test. adapt_decay 6 -> tau ~64 waves,
+    /// well past the leak horizon (~15-20 waves for leak (3,5)); the longest delay sits between them.
+    pub fn demo() -> BenchConfig {
+        let seed = 0xB0A7_57ED;
+        let size = 8;
+        BenchConfig {
+            seed,
+            size,
+            layers: 4,
+            k: 4,
+            baseline_init: 6,
+            adapt_bump: 20,
+            adapt_decay: 6,
+            trials_per_class: 10,
+            delays: vec![0, 8, 24],
+            task: TaskParams {
+                seed,
+                size,
+                present_waves: 6,
+                read_waves: 6,
+                base_q16: 18000,
+                keep_q16: 60000,
+                noise_q16: 1500,
+                probe_q16: 20000,
+            },
+            calib: CalibrateParams {
+                warmup: 16,
+                waves: 48,
+                max_steps: 24,
+                refine_passes: 3,
+                ..CalibrateParams::default()
+            },
+            calib_fraction_q16: 20000,
+        }
+    }
+
+    fn to_engine_config(&self, adapt_bump: i16) -> Config {
+        let layer = LayerConfig {
+            // Feed-forward for the store-recall diagnostic: recurrence (level 0 / -1) would let the
+            // reservoir self-sustain activity through the delay and carry the cue on its own,
+            // confounding the ALIF-vs-LIF contrast. Feed-forward goes quiet during the delay, so
+            // only the slow (silent) adaptation state can survive it.
+            topology: vec![TopologyLevel { level: 1, radius: 2, count: 6 }],
+            leak: (3, 5),
+            cooldown_base: 2,
+            inhibitor_ratio: 0,
+            threshold_jitter: 32,
+            baseline_init: self.baseline_init,
+            adapt_bump,
+            adapt_decay: self.adapt_decay,
+        };
+        Config { seed: self.seed, size: self.size, layers: vec![layer; self.layers] }
+    }
+}
+
+/// Accuracy (permille) at each swept delay, for one variant.
+#[derive(Clone, Debug)]
+pub struct HorizonCurve {
+    pub delays: Vec<usize>,
+    pub accuracy_permille: Vec<u64>,
+}
+
+/// Run the store-recall sweep for one variant. `adapt_bump` selects the variant (0 = plain LIF).
+/// The net is built + calibrated once, then trials reuse the calibrated baselines (reset per trial).
+pub fn memory_horizon(cfg: &BenchConfig, adapt_bump: i16) -> HorizonCurve {
+    let mut net = Network::new(cfg.to_engine_config(adapt_bump));
+    let input = random_l0_input(cfg.seed ^ 0xCA11B, cfg.size, cfg.calib_fraction_q16);
+    net.calibrate(&cfg.calib, &input);
+
+    let mut accuracy_permille = Vec::with_capacity(cfg.delays.len());
+    for &delay in &cfg.delays {
+        let mut feats: Vec<Vec<u32>> = Vec::new();
+        let mut labels: Vec<usize> = Vec::new();
+        for t in 0..cfg.trials_per_class {
+            for c in 0..cfg.k {
+                feats.push(run_trial(&mut net, &cfg.task, c, t, delay));
+                labels.push(c);
+            }
+        }
+        // Deterministic split: even trial index -> train, odd -> test (balanced across classes).
+        let (mut tr_f, mut tr_l, mut te_f, mut te_l): (Vec<Vec<u32>>, Vec<usize>, Vec<Vec<u32>>, Vec<usize>) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for (i, (f, l)) in feats.into_iter().zip(labels).enumerate() {
+            if (i / cfg.k) % 2 == 0 {
+                tr_f.push(f);
+                tr_l.push(l);
+            } else {
+                te_f.push(f);
+                te_l.push(l);
+            }
+        }
+        let clf = NearestCentroid::fit(&tr_f, &tr_l, cfg.k);
+        let mut correct = 0usize;
+        for (f, &l) in te_f.iter().zip(&te_l) {
+            if clf.predict(f) == l {
+                correct += 1;
+            }
+        }
+        let acc = if te_f.is_empty() { 0 } else { (correct as u64 * 1000) / te_f.len() as u64 };
+        accuracy_permille.push(acc);
+    }
+    HorizonCurve { delays: cfg.delays.clone(), accuracy_permille }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wave_net::config::{Config, LayerConfig};
-    use crate::wave_net::network::Network;
-    use crate::wave_net::synapse::TopologyLevel;
 
     fn small_net(adapt_bump: i16) -> Network {
         let layer = LayerConfig {
@@ -142,5 +263,37 @@ mod tests {
         assert_eq!(f1, f2, "trial must be deterministic (reset each time)");
         // a probe response should produce some spikes for an ALIF net at a short delay
         assert!(f1.iter().any(|&c| c > 0), "probe should elicit a response");
+    }
+
+    #[test]
+    fn memory_horizon_is_deterministic() {
+        let cfg = BenchConfig::demo();
+        let a = memory_horizon(&cfg, cfg.adapt_bump);
+        let b = memory_horizon(&cfg, cfg.adapt_bump);
+        assert_eq!(a.delays, b.delays);
+        assert_eq!(a.accuracy_permille, b.accuracy_permille);
+    }
+
+    #[test]
+    fn store_recall_alif_beats_lif_at_long_delay() {
+        let cfg = BenchConfig::demo();
+        let alif = memory_horizon(&cfg, cfg.adapt_bump);
+        let lif = memory_horizon(&cfg, 0);
+        eprintln!("delays {:?}", alif.delays);
+        eprintln!("ALIF   {:?}", alif.accuracy_permille);
+        eprintln!("LIF    {:?}", lif.accuracy_permille);
+        let chance = 1000 / cfg.k as u64;
+        let last = cfg.delays.len() - 1;
+        // (1) encodable: both decode well above chance at the shortest delay
+        assert!(alif.accuracy_permille[0] > 650, "ALIF should decode at short delay");
+        assert!(lif.accuracy_permille[0] > 650, "LIF should decode at short delay");
+        // (2) ALIF holds, LIF forgets, at the longest delay
+        assert!(
+            alif.accuracy_permille[last] > lif.accuracy_permille[last] + 100,
+            "ALIF should beat LIF at long delay (ALIF {} vs LIF {})",
+            alif.accuracy_permille[last],
+            lif.accuracy_permille[last]
+        );
+        assert!(alif.accuracy_permille[last] > chance + 80, "ALIF should stay above chance at long delay");
     }
 }
