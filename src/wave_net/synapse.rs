@@ -27,11 +27,22 @@ pub const P_TARGET: u64 = 1;
 pub const P_THRESHOLD: u64 = 3;
 pub const P_INPUT: u64 = 5;
 
+/// splitmix64 finalizer — the default integer mixer (dependency-free, deterministic).
+#[cfg(not(feature = "strong_hash"))]
 #[inline]
 pub fn mix(mut z: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^ (z >> 31)
+}
+
+/// BLAKE3 mixer (test-only, `--features strong_hash`) — rules out procedural-hash quality as a source of
+/// seed-fragility by substituting a cryptographic hash at the single choke point every stream flows through.
+#[cfg(feature = "strong_hash")]
+#[inline]
+pub fn mix(z: u64) -> u64 {
+    let h = blake3::hash(&z.to_le_bytes());
+    u64::from_le_bytes(h.as_bytes()[..8].try_into().unwrap())
 }
 
 const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;

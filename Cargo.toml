@@ -4,3 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+blake3 = { version = "1", optional = true }
+
+# Test-only: swap the procedural hash (`mix`) for BLAKE3 to rule out hash quality as a source of
+# seed-fragility. `cargo test --features strong_hash`. The engine stays dependency-free by default.
+[features]
+strong_hash = ["dep:blake3"]

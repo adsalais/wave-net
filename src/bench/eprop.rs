@@ -30,7 +30,8 @@ impl RewardTracker {
 /// Configuration for the e-prop learning experiment.
 #[derive(Clone, Debug)]
 pub struct EpropConfig {
-    pub seed: u64,
+    pub seed: u64,      // network structure, calibration, feedback weights
+    pub task_seed: u64, // cue/probe patterns and the class sequence (split from `seed` to localize fragility)
     pub size: u32,
     pub layers: usize,
     pub baseline_init: i16,
@@ -63,6 +64,7 @@ impl EpropConfig {
         let seed = 0xE9_0B_0A17;
         EpropConfig {
             seed,
+            task_seed: seed, // same as `seed` by default → identical to pre-split behavior
             size: 8,
             layers: 3,
             baseline_init: 6,
@@ -169,13 +171,13 @@ fn trial_eligibility(net: &mut Network, cfg: &EpropConfig, class: usize, trial: 
     }
     net.reset_state();
     for w in 0..cfg.present_waves {
-        let sites = cue_realization(cfg.seed, cfg.size, class, trial, w, cfg.base_q16, cfg.keep_q16, cfg.noise_q16);
+        let sites = cue_realization(cfg.task_seed, cfg.size, class, trial, w, cfg.base_q16, cfg.keep_q16, cfg.noise_q16);
         net.wave(&sites);
     }
     for _ in 0..cfg.delay {
         net.wave(&[]);
     }
-    let probe = probe_pattern(cfg.seed, cfg.size, cfg.probe_q16);
+    let probe = probe_pattern(cfg.task_seed, cfg.size, cfg.probe_q16);
     for _ in 0..cfg.read_waves {
         net.wave(&probe);
     }
@@ -265,7 +267,7 @@ pub fn train(cfg: &EpropConfig, lr: f64) -> LearnCurve {
     let mut outcomes: Vec<bool> = Vec::with_capacity(cfg.trials);
 
     for t in 0..cfg.trials {
-        let class = pick_class(cfg.seed, t, cfg.k);
+        let class = pick_class(cfg.task_seed, t, cfg.k);
         let elig = trial_eligibility(&mut net, cfg, class, t);
         let outs = score_outs(&net, cfg, &elig);
         let pred = (0..cfg.k).max_by_key(|&i| outs[i]).unwrap();
@@ -308,7 +310,7 @@ pub fn train(cfg: &EpropConfig, lr: f64) -> LearnCurve {
     let holdout = 400usize;
     let mut test_correct = 0usize;
     for t in cfg.trials..cfg.trials + holdout {
-        let class = pick_class(cfg.seed, t, cfg.k);
+        let class = pick_class(cfg.task_seed, t, cfg.k);
         let elig = trial_eligibility(&mut net, cfg, class, t);
         let outs = score_outs(&net, cfg, &elig);
         let pred = (0..cfg.k).max_by_key(|&i| outs[i]).unwrap();

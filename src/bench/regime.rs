@@ -33,7 +33,7 @@ pub fn reservoir_states(
     }
     net.reset_state();
     for w in 0..cfg.present_waves {
-        let mut sites = cue_realization(cfg.seed, cfg.size, class, trial, w, cfg.base_q16, cfg.keep_q16, cfg.noise_q16);
+        let mut sites = cue_realization(cfg.task_seed, cfg.size, class, trial, w, cfg.base_q16, cfg.keep_q16, cfg.noise_q16);
         for &s in flip {
             match sites.iter().position(|&x| x == s) {
                 Some(pos) => {
@@ -47,7 +47,7 @@ pub fn reservoir_states(
     for _ in 0..cfg.delay {
         net.wave(&[]);
     }
-    let probe = probe_pattern(cfg.seed, cfg.size, cfg.probe_q16);
+    let probe = probe_pattern(cfg.task_seed, cfg.size, cfg.probe_q16);
     for _ in 0..cfg.read_waves {
         net.wave(&probe);
     }
@@ -69,7 +69,7 @@ pub fn collect_states(cfg: &EpropConfig, trials: usize) -> (Vec<Vec<u32>>, Vec<u
     let mut states = Vec::with_capacity(trials);
     let mut labels = Vec::with_capacity(trials);
     for t in 0..trials {
-        let class = pick_class(cfg.seed, t, cfg.k);
+        let class = pick_class(cfg.task_seed, t, cfg.k);
         states.push(top_state(&reservoir_states(&mut net, cfg, class, t, &[])));
         labels.push(class);
     }
@@ -176,7 +176,7 @@ pub fn kernel_minus_gen_rank(cfg: &EpropConfig) -> f64 {
     let m = 64usize;
     let mut net = calibrated_reservoir(cfg);
     let kernel: Vec<Vec<u32>> = (0..m)
-        .map(|t| top_state(&reservoir_states(&mut net, cfg, pick_class(cfg.seed, t, cfg.k), t, &[])))
+        .map(|t| top_state(&reservoir_states(&mut net, cfg, pick_class(cfg.task_seed, t, cfg.k), t, &[])))
         .collect();
     let noisy: Vec<Vec<u32>> = (0..m).map(|t| top_state(&reservoir_states(&mut net, cfg, 0, t, &[]))).collect();
     effective_dim(&as_f64(&kernel)) - effective_dim(&as_f64(&noisy))
@@ -218,7 +218,7 @@ pub fn layer_gain(cfg: &EpropConfig, trials: usize) -> Vec<f64> {
     let waves = (cfg.present_waves + cfg.delay + cfg.read_waves).max(1);
     let mut sum: Vec<f64> = Vec::new();
     for t in 0..trials {
-        let layered = reservoir_states(&mut net, cfg, pick_class(cfg.seed, t, cfg.k), t, &[]);
+        let layered = reservoir_states(&mut net, cfg, pick_class(cfg.task_seed, t, cfg.k), t, &[]);
         if sum.is_empty() {
             sum = vec![0.0; layered.len()];
         }
@@ -412,6 +412,34 @@ mod tests {
                 "{name:<12}{ceil:>6}{fish:>8.2}{edim:>7.1}{kg:>7.1}{sig:>7.2}{dead:>6.2}{v1:>6}{v2b:>6}"
             );
         }
+    }
+
+    #[test]
+    #[ignore]
+    fn _verify_seed_split() {
+        use crate::bench::eprop::train;
+        const SEEDS: [u64; 4] = [0xE9_0B_0A17, 0x1234_5678, 0xDEAD_BEEF, 0xA5A5_1111];
+        let v1 = |net: u64, task: u64| -> u64 {
+            let mut c = EpropConfig::demo();
+            c.seed = net;
+            c.task_seed = task;
+            c.trials = 1200;
+            c.block = 300;
+            train(&c, 0.3).test_accuracy
+        };
+        let fixed = SEEDS[0];
+        eprintln!("V1 held-out test — which axis carries the fragility? (feature strong_hash = {})",
+            cfg!(feature = "strong_hash"));
+        eprint!("FIX task=s0, vary NETWORK:");
+        for &n in &SEEDS {
+            eprint!("  {}", v1(n, fixed));
+        }
+        eprintln!();
+        eprint!("FIX network=s0, vary TASK: ");
+        for &t in &SEEDS {
+            eprint!("  {}", v1(fixed, t));
+        }
+        eprintln!();
     }
 
     #[test]

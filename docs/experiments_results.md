@@ -438,6 +438,39 @@ reservoir-coverage story shifts suspicion toward the **task encoding** — but t
 one seed. Disentangling them (separate network vs task seeds) is the next decisive test; "just scale up" is
 dead either way.
 
+### Split the seed (network vs task) + BLAKE3 — a hash artifact *and* a real ceiling
+
+Split `seed` (reservoir/calibration/feedback) from `task_seed` (cue/probe/class sequence) and measured V1
+**held-out** test accuracy varying one axis while fixing the other — under the default `key`/`mix` hash and
+again under BLAKE3 (`--features strong_hash`, a cryptographic hash swapped in at the single `mix` choke point):
+
+| | net/task=s0 | s1 | s2 | s3 |
+|---|---|---|---|---|
+| default, fix task / vary **net** | 845 | 505 | 505 | 507 |
+| default, fix net / vary **task** | 845 | 460 | 472 | 560 |
+| **blake3**, fix task / vary **net** | 417 | 442 | **877** | 442 |
+| **blake3**, fix net / vary **task** | 417 | 505 | **885** | 507 |
+
+**① The "same-seed works" pattern was a hash artifact.** Under the default hash, *only* `(s0,s0)` learned and
+every off-diagonal was chance — i.e. learnability required the reservoir and task to be hashed from the *same*
+seed. Under BLAKE3 that vanishes: `(s0,s0)` drops to chance (417) and *different* pairs learn instead
+(`net=s2`→877, `task=s2`→885). So `key`/`mix` **correlates the network and task streams that share a seed** —
+a genuine engine defect. Our entire dev setup ran with `net==task` (one seed), so the original **"V1 learns
+~770" was partly propped up by this artifact.**
+
+**② A clean hash does *not* fix the fragility.** BLAKE3 only *reshuffles* the lottery — still ~1 of 4 pairs
+learns, the rest chance. So the ceiling is real and hash-independent: **threshold-only training on frozen
+random ±1 weights learns only when the (reservoir × task) pair happens to align.** No calibration, width, or
+hash change makes it reliable.
+
+**Conclusion of the whole verification arc.** The learning results were far weaker than they looked: V2b never
+generalized, most regime "optima" were single-seed coincidences, and even V1's apparent success leaned on a
+hash correlation. The mechanistic core stands (V2a→V2b flip, floored-leak, adapt saturation), but **the
+substrate is not a reliable learner as built.** The trainable degrees of freedom (per-neuron *thresholds*)
+can only gate a fixed random projection; they cannot *shape* it to the task — so success needs luck. The
+decisive next direction is **architectural: make the weights/input projection trainable** (so the network can
+align the reservoir to the task) rather than searching for a cleverer calibration of a fixed random one.
+
 ## Engine finding along the way — the floored leak
 
 Store-recall *found a real substrate bug*. The potential leak `p -= (p>>a)+(p>>b)` is `0` for `0 < p <
