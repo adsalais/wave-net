@@ -5,4 +5,5 @@
 //! calibration. Deterministic and single-threaded. This crate is a library only.
 
 pub mod bench;
-pub mod wave_net;
+pub mod wave_net; // pure procedural engine (reference)
+pub mod wave_state_machine; // memory-efficient LSM fork: procedural reservoir + (to come) stored trained readout
