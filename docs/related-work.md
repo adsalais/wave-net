@@ -204,8 +204,11 @@ The Tier-0/1 bench (Specs 1, 2, 2b) ran three ALIF-vs-LIF experiments. The resul
 narrower — than expected, which directly scopes what an e-prop-style rule (Spec 3) should target.
 
 - **Store-recall / delayed match (Spec 1):** **ALIF wins** — holds a cue across a silent delay that plain
-  LIF forgets (ALIF ~55% decode at delay 24 vs LIF at chance). *Held / probed* memory: the cue lives in the
-  slow adaptation state and a probe converts it to a readable spike pattern.
+  LIF forgets. *Held / probed* memory: the cue lives in the slow adaptation state and a probe converts it to
+  a readable spike pattern. **Robust across the architecture sweep** — ALIF decodes 850–1000‰ (LIF always at
+  chance 250‰) across width/depth/refractory/inhibition — **except under sparse connectivity**, where ALIF
+  collapses to ~350‰: held memory needs enough fan-out to *spread the cue's adaptation footprint* across
+  many neurons.
 - **Memory Capacity (Spec 2):** **LIF wins** (~1.57 vs ~0.39). MC = *delayed linear echo* (reconstruct a
   specific past bit `u(t−k)`). LIF's fading spike echo does it; adaptation is a slow low-pass integrator
   that can't pinpoint a past bit. Exposing the raw adaptation state to the readout did not help. Also
@@ -234,6 +237,13 @@ Implications for Spec 3 (e-prop-style threshold training):
 - **Architecture note:** the dense drive the floored leak requires trades against nonlinear-task
   performance (sparse/inhibitory reservoirs separate better). If nonlinear tasks matter later, revisit the
   fixed-point-`potential` upgrade (which removes the density requirement) alongside sparser topology.
+- **A connectivity-density tradeoff → mix densities, not just neuron types.** The sweeps exposed opposite
+  density preferences: **dense fan-out favors ALIF's held-category memory** (store-recall 950‰ dense vs
+  350‰ sparse), while **sparse favors LIF's nonlinear separation** (XOR 927‰ sparse vs 727‰ dense). Since
+  `adapt_bump` is already per-layer, a heterogeneous network can place *dense ALIF* layers (hold context)
+  and *sparse LIF* layers (compute) — the LSNN-style mix, but tuned per-role on both `adapt_bump` **and**
+  topology density. This is the natural way to span both memory axes; worth a bench experiment (a mixed
+  config on store-recall *and* XOR) before or alongside Spec 3.
 
 ## Sources
 
