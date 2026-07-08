@@ -590,3 +590,28 @@ flows during silent gaps; `level −1` backward recurrence; a slower/finer leak 
 fixed-point-potential upgrade) so recurrent memory can outlast the membrane; or surrogate-gradient BPTT for
 true temporal credit. The reliable results stand: feed-forward e-prop learns robustly, and **ALIF
 adaptation** is itself a strong, already-working temporal memory.
+
+## Multi-layer credit (DFA) — training every layer makes depth usable
+
+Extended feed-forward e-prop to train **all** layers, not just the last: the top layer keeps symmetric
+readout feedback, each deeper layer gets **Direct Feedback Alignment** (fixed random hash-derived feedback
+broadcasting the output error), and every layer's weights update by the factored eligibility × its signal.
+
+**Result (deep net, layers 4, held-out, multi-seed):**
+
+| seed | single-layer (train last only) | multi-layer (train all, DFA) |
+|---|---|---|
+| s0 | 535 | **1000** |
+| s1 | 500 | **1000** |
+| s2 (deadbeef) | 485 | **1000** |
+
+Single-layer e-prop is at **chance on every seed** at depth 4 — training only the last projection can't
+recover the class signal after the fixed intermediate layers have eroded it ([separation decays with
+depth](#deeper-regime-scans-separation-ceiling-as-a-cheap-learnability-proxy)). **Multi-layer DFA credit
+succeeds perfectly (1000) on all seeds** — training every layer (including the input projection `L0→L1`)
+lets each layer preserve/transform the signal, so depth becomes usable. This is the capability that turns
+the earlier "depth erodes separation" finding from a wall into something trainable.
+
+(At depth 5 the globally-degenerate `deadbeef` reservoir is beyond even multi-layer — both fail — while the
+other seeds still hit 1000; depth 4 is reliable for all. DFA's random feedback is noisy but here it was
+clean across seeds.)
