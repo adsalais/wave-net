@@ -648,3 +648,24 @@ size/depth ≥ 4): its problem is *untrained* intermediate layers eroding the si
 only *training* them does. So the levers **compound**: depth erodes → multi-layer training preserves →
 but that training needs enough **width** to succeed on hard seeds. **Wide + multi-layer = reliable deep
 learning**; either alone fails.
+
+**How deep is it stable (size 16, multi-layer)?** Reliable to **~depth 16** — with two distinct limits:
+
+| depth | fixed 16-wave trial | trial length scaled to depth |
+|---|---|---|
+| 10 | 1000 | 1000 |
+| 12 | **485** (chance) | **1000** |
+| 16 | 485 | **1000** |
+| 20 | 465 | **485** (still fails) |
+
+- **The depth-12 cliff (fixed trial) is a *timing* artifact, not a learning limit.** The cue is injected
+  only during the present-waves, so its wavefront needs ~`depth` waves to reach the top; a fixed 16-wave
+  trial closes the read window before it arrives. Scaling `present`/`read` to `depth` **fully recovers
+  depths 12 and 16 to 1000** — the net trains fine that deep given time for the signal to propagate.
+- **A genuine ceiling appears ~depth 18–20** — depth 20 fails even with scaled waves. This is the known
+  **Direct Feedback Alignment** limitation: random per-layer feedback becomes too noisy to credit very deep
+  layers (DFA degrades where backprop wouldn't). Pushing past ~16 layers is the "less-noisy credit
+  (symmetric feedback / BPTT)" lever, not a substrate problem.
+
+So: **size 16 + multi-layer + trial length matched to depth ⇒ reliable to ~16 layers**; the wall beyond is
+the *credit rule* (DFA), not capacity or the reservoir.
