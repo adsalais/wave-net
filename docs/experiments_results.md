@@ -365,11 +365,54 @@ we measured the *achieved* rate and varied the *drive* to check for circularity 
 | 48 | 18.7% | 475 |
 
 **Correction:** the earlier "10% is optimal / denser codes need more drive" was an **artifact of hand-tuning
-the drive to `up_count=16`**. The firing rate is an *epiphenomenon*, not a control knob — the real lever is
-**connectivity** (`up_count≈16` is the separation optimum; denser over-mixes toward saturation, sparser
-under-mixes). Calibration's only job here is to set thresholds *low enough* (any target ≥10% does that,
-after which the exact value is a no-op). **The fix should target separation via connectivity, not chase a
-firing-rate number.** (Credit: this correction came from *not* trusting a suspiciously convenient result.)
+the drive to `up_count=16`**. The firing rate is an *epiphenomenon*, not a control knob. Calibration's only
+job here is to set thresholds *low enough* (any target ≥10% does that). (Credit: this correction came from
+*not* trusting a suspiciously convenient result.)
+
+### Verification pass — multi-seed + held-out (most single-seed findings do NOT survive)
+
+Prompted by the 10%-artifact, we stress-tested the load-bearing claims with a **held-out test split** in
+`train()` and **4 seeds**. The results are sobering — a lot of the single-seed story was noise.
+
+**① V2b does not generalize.** The headline "V2b learns to 687‰" was **prequential** (predict-then-update on
+training trials). With a held-out test (frozen thresholds, unseen cue realizations):
+
+| | train-late ‰ | held-out test ‰ |
+|---|---|---|
+| V1 (spiking, trainable output) | 770 | **697** (generalizes) |
+| **V2b (broadcast readout)** | 687 | **505 = chance** (does NOT) |
+
+With `lr=0.5` the broadcast update *chases recent trials* (inflating the online curve); the frozen classifier
+is at chance. **The V2b "success" was an artifact of the wrong metric.** Only V1 learns a stable classifier.
+
+**② `up_count=16` optimum — refuted (seed artifact).** Separation ceiling across seeds:
+
+| up_count | s0 | s1 | s2 | s3 | mean |
+|---|---|---|---|---|---|
+| 8 | 490 | 550 | 470 | 520 | 507 |
+| **16** | **750** | 550 | 470 | 520 | 572 |
+| 24 | 600 | 920 | 560 | 970 | **762** |
+| 32 | 490 | 570 | 650 | 960 | 667 |
+
+`up_count=16` looked optimal **only at s0** (our dev seed); elsewhere it's near chance, and `24` has the best
+mean. Same failure mode as 10%. **There is no stable density optimum** — the ceiling swings 470–970 for one
+config, so it's a **±~250‰ instrument**, far noisier than the ±100 estimated. Fine-grained density findings
+do not survive.
+
+**③ V1 learnability is itself seed-fragile.** Held-out V1 test for the *baseline*: s0 → 845, s1 → 587, s2
+(`0xdeadbeef`) → **472 (chance)**. At s2 *every* config's ceiling is ~470 and every V1 test ~472 — the
+reservoir is globally degenerate for that seed. So even "V1 reliably learns" is really "V1 learns at ~2 of 3
+seeds"; some random-`±1` reservoirs simply can't be trained.
+
+**④ What *does* survive:** the **causal** V2a-null → V2b-flip (one factor changed behavior — though now known
+not to *generalize*); the **floored-leak** bug; **`layers=2` separates robustly** (~987 across seeds — but
+trivial: the top layer *is* the cue); and the **`adapt_bump` saturation mechanism** (`40≡80`). The
+separation ceiling retains only *coarse* value: a very low ceiling (~470) reliably means chance learning; a
+high one (~750) means it learns — but the broad middle is uninformative.
+
+**Verdict:** most specific regime "optima" were single-seed coincidences, and V2b never generalized. **Any
+future claim must be multi-seed and held-out from the start** — and the deeper question is whether a fixed
+random-`±1` feed-forward integer reservoir is a trainable substrate at all, given even V1 fails on some seeds.
 
 ## Engine finding along the way — the floored leak
 
