@@ -470,6 +470,33 @@ mod tests {
     }
 
     #[test]
+    fn multilayer_beats_single_layer_at_depth() {
+        // Separation erodes with depth: training only the last layer should weaken on a deep net, while
+        // training every layer (multi-layer DFA credit) keeps it reliable.
+        let seeds = [0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF];
+        let depth = 4usize;
+        let mut worst_single = 1000u64;
+        let mut worst_multi = 1000u64;
+        for &s in &seeds {
+            let mut single = RsnnConfig::demo();
+            single.seed = s;
+            single.task_seed = s;
+            single.layers = depth;
+            single.trials = 1500;
+            let mut multi = single.clone();
+            multi.multi_layer = true;
+            let sa = train_eprop(&single);
+            let ma = train_eprop(&multi);
+            eprintln!("depth {depth} seed {s:#x}  single {sa}  multi {ma}");
+            worst_single = worst_single.min(sa);
+            worst_multi = worst_multi.min(ma);
+        }
+        eprintln!("worst single {worst_single}  worst multi {worst_multi}");
+        assert!(worst_multi > 640, "multi-layer learns reliably at depth (worst {worst_multi})");
+        assert!(worst_multi >= worst_single, "multi-layer is at least as good as single-layer at depth");
+    }
+
+    #[test]
     fn dfa_weights_are_deterministic_and_signed() {
         let f = |g, c| dfa_weight(7, g, c);
         assert_eq!(f(10, 0), f(10, 0));
