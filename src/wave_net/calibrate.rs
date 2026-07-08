@@ -53,9 +53,15 @@ impl Network {
         let l = self.layer_count();
         let target = params.target_permille as f64 / 1000.0;
         let tol = params.tol_permille as f64 / 1000.0;
+        // Readout layers never fire, so their rate is always 0 — calibrating them just burns steps
+        // lowering a threshold that can't change the rate. Skip them.
+        let is_readout: Vec<bool> = (0..l).map(|z| self.with_layer_mut(z, |layer| layer.readout)).collect();
 
         // Phase 1 — bottom-up: fix each layer before moving up (its feeder is now firing).
         for z in 1..l {
+            if is_readout[z] {
+                continue;
+            }
             for _ in 0..params.max_steps {
                 let rates = self.measure_layer_rates(params.warmup, params.waves, input);
                 let adjusted = self.with_layer_mut(z, |layer| {
@@ -72,6 +78,9 @@ impl Network {
             let rates = self.measure_layer_rates(params.warmup, params.waves, input);
             let mut moved = false;
             for z in 1..l {
+                if is_readout[z] {
+                    continue;
+                }
                 moved |= self.with_layer_mut(z, |layer| {
                     layer.calibrate_step(rates[z], target, tol, params.step_shift)
                 });
@@ -176,6 +185,32 @@ mod tests {
             (0..net.layer_count()).map(|z| net.layer_thresholds(z)).collect::<Vec<_>>()
         };
         assert_eq!(run(), run());
+    }
+
+    #[test]
+    fn calibrate_skips_readout_layers() {
+        // A readout layer never fires; calibration must leave it untouched rather than burn its
+        // max_steps futilely lowering a threshold that can never change the (zero) rate.
+        let comp = LayerConfig {
+            topology: vec![TopologyLevel { level: 1, radius: 2, count: 8 }],
+            leak: (3, 5),
+            cooldown_base: 2,
+            inhibitor_ratio: 0,
+            threshold_jitter: 0,
+            baseline_init: 120,
+            adapt_bump: 0,
+            adapt_decay: 6,
+        };
+        let readout = LayerConfig { topology: vec![], ..comp.clone() };
+        let cfg = Config { seed: 5, size: 4, layers: vec![comp.clone(), comp.clone(), readout] };
+        let mut net = Network::new_with_readout(cfg);
+        let readout_z = net.layer_count() - 1;
+        let readout_before = net.layer_thresholds(readout_z);
+        let comp_before = net.layer_thresholds(1);
+        let params = CalibrateParams { warmup: 8, waves: 24, max_steps: 12, refine_passes: 2, ..CalibrateParams::default() };
+        net.calibrate(&params, &random_l0_input(9, 4, 20000));
+        assert_eq!(net.layer_thresholds(readout_z), readout_before, "readout layer must be untouched by calibration");
+        assert_ne!(net.layer_thresholds(1), comp_before, "computational layer must still be calibrated");
     }
 
     #[test]
