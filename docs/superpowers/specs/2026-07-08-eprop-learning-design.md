@@ -59,11 +59,14 @@ Per neuron `j` (all computational layers `1..L`, output neurons included):
 - **Update:** `Δθⱼ = − lr · s · eⱼ` (a better-than-expected trial *lowers* active neurons' thresholds →
   reinforces firing in that context; worse-than-expected raises them).
 
-**Integer thresholds + tiny updates → f64 shadow.** Thresholds are `i16`, but `lr · s · eⱼ` is small and
-would round to 0 (the same dead-zone hazard we hit with adaptation). The trainer therefore keeps a **f64
-shadow** of every threshold (initialized from the calibrated integer thresholds), accumulates the fractional
-updates there, and writes the engine's integer threshold each trial as `shadow.round().clamp(1, i16::MAX)`.
-The bench may use `f64` (hybrid policy); the engine stays integer.
+**Integer thresholds + tiny updates → f64 shadow (v1).** Thresholds are `i16`, but `lr · s · eⱼ` is small
+and would round to 0 (the same dead-zone hazard we hit with adaptation). The trainer therefore keeps a
+**f64 shadow** of every threshold (initialized from the calibrated integer thresholds), accumulates the
+fractional updates there, and writes the engine's integer threshold each trial as
+`shadow.round().clamp(1, i16::MAX)`. The bench may use `f64` (hybrid policy); the engine stays integer.
+*(v2 makes the trainer float-free via a high-drive regime — see Deferred. A high threshold init does **not**
+work: the rounding is about update size not `θ` magnitude, a value near `i16::MAX` is silent, and
+calibration drags it back to the operating point anyway.)*
 
 ## Training loop
 
@@ -118,9 +121,18 @@ New `src/bench/eprop.rs`: `EpropConfig`, `LearnCurve`, `train`, the three-factor
 learning), `R=6`, `T≈1000` trials, `acc_window≈100`, `lr` small (tuned so the shadow moves ~1 threshold
 unit over tens of trials). Delay/`lr`/cue-overlap are the main tuning levers.
 
-## Scope guard (YAGNI) — explicitly out
+## Deferred roadmap — explicitly out of v1 (YAGNI)
 
-- Non-spiking potential readout (v2); per-wave / TD credit (v3).
+- **Float-free trainer via a high-drive regime (v2):** drive the reservoir so calibrated thresholds settle
+  in the **hundreds**, where an integer ±1 threshold update is a ~0.5% adjustment — fine-grained enough to
+  learn with *integer* updates and **no f64 shadow**. Caveat: only helps neurons whose thresholds land
+  high (heterogeneous low-threshold neurons stay coarse), so it is less robust than the shadow — hence
+  shadow first, high-drive second. The fully general version is the fixed-point-`potential` upgrade
+  (`related-work.md`), which makes thresholds natively fine-resolution.
+- **Non-spiking potential readout (v2):** the L0/L_top-symmetric leaky readout; graded error `target −
+  potential`. Learning shifts to internal thresholds (feedback-alignment regime).
+- **Per-wave / TD credit (v3):** denser per-wave learning signal; needs to handle the one-hop propagation
+  delay that the trial-level eligibility trace absorbs for free.
 - Broadcast-error alignment (per-output feedback weights); training adaptation params (`adapt_bump`/decay);
   surrogate-gradient e-prop with a differentiable shadow.
 - `K > 2`, curriculum, multiple tasks — not needed to answer "does the three-factor rule learn at all?"
