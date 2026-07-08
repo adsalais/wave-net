@@ -36,7 +36,8 @@ per layer:
 4. **decide** — fire if `cooldown == 0 && potential >= baseline + adaptation` (the ALIF effective
    threshold, in `i32`); on fire reset potential to 0, reload cooldown, and bump adaptation
 5. **generate** — regenerate the firer's synapses, grouped by relative level
-6. **leak** — decay the survivors' potential
+6. **leak** — decay the survivors' potential toward 0 (positive decay floored at 1, so small
+   potentials relax to rest with a finite membrane time constant instead of freezing in the shift dead zone)
 7. **adapt-decay** — decay every neuron's adaptation geometrically toward rest
 
 **Propagation is deferred, one hop per wave.** A firer's deliveries land in the *target* layers'
