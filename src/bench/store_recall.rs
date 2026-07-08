@@ -19,7 +19,7 @@ fn selected(seed: u64, site: u32, class_slot: i32, wave_slot: u32, purpose: u64,
 /// L0 injection set for one wave of one trial: the class's base sites (kept with prob `keep_q16`)
 /// plus a few noise sites (non-base, added with prob `noise_q16`). Base membership per class is
 /// fixed by `base_q16`; per-trial variability comes from `(trial, wave)` folded into the slot.
-fn cue_realization(
+pub(crate) fn cue_realization(
     seed: u64,
     size: u32,
     class: usize,
@@ -47,7 +47,7 @@ fn cue_realization(
 }
 
 /// Fixed probe pattern (same for every cue and trial): L0 sites selected at `density_q16`.
-fn probe_pattern(seed: u64, size: u32, density_q16: u32) -> Vec<u32> {
+pub(crate) fn probe_pattern(seed: u64, size: u32, density_q16: u32) -> Vec<u32> {
     let ls = size * size;
     (0..ls).filter(|&s| selected(seed, s, 0, 0, P_PROBE, density_q16)).collect()
 }
