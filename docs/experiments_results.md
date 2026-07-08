@@ -670,24 +670,51 @@ learning**; either alone fails.
 So: **size 16 + multi-layer + trial length matched to depth ⇒ reliable to ~16 layers**; the wall beyond is
 the *credit rule* (DFA), not capacity or the reservoir.
 
-## Backward recurrence (level −1/−2) + width — confirms ψ is the blocker
+## Backward recurrence (level −1/−2) + sub-threshold ψ — the blocker is sustaining dynamics
+
+> **Correction.** An earlier version of this section read the backward-recurrence null as "ψ (spike-time)
+> is the blocker." That conclusion was **wrong** — it rested on a hidden bug (below). The corrected finding
+> is that the blocker is the *sustaining dynamics*, not the credit rule.
 
 To separate "topology/capacity too weak" from "credit rule too weak," we tried a *stronger* recurrence —
 cross-layer **backward** loops (`level −1` and `−2`, i.e. `Lz → Lz−1 → Lz`) — with the **width fix**
-(size 16, depth 4) and multi-layer credit, all trained by the temporal eligibility. Temporal XOR, LIF,
-delay 20:
+(size 16, depth 4) and multi-layer credit, on temporal XOR (LIF, delay 20). It nulled (FF, +backward both
+~chance). We took that as implicating the spike-time `ψ` and built a **sub-threshold `ψ`**
+(`clamp(decide_potential/θ, 0, 1)` from a new decide-time potential snapshot) so credit could flow to
+neurons that are charged-but-not-firing.
 
-| seed | FF | + backward recurrence |
-|---|---|---|
-| s0 | 482 | 475 |
-| s1 | 497 | 497 |
-| s2 | 507 | 492 |
+**The bug it exposed — a dead readout layer.** A per-layer activity probe showed the 4-layer recurrent net's
+readout layer (L3) was **completely silent** under the default drive: the LIF reservoir is **sub-critical**
+(feed-forward gain < 1), so the sparse transient cue decays with depth (L1 fires ~30/256, L2/L3 = 0).
+Calibration set deep-layer thresholds too high (42/21/11) for the transient to overcome; ALIF only ever
+"worked" because adaptation floors the calibrated baseline threshold to 1. **So the backward and first
+sub-ψ nulls were invalid — they read a dead layer, where nothing can work.** Fixed with an *alive-LIF*
+config (`up_count=32, present_waves=12, base_q16=30000`) that raises gain so all four layers fire ~7%.
 
-**Both at chance — backward recurrence added nothing, any seed.** With topology (cross-layer loops) *and*
-capacity (width + multi-layer credit) controlled out, recurrence *still* can't learn the task. So the
-blocker is **not** the recurrent structure or the neuron count — it's the **credit rule**: the spike-time
-pseudo-derivative `ψ = fired_j` gives *no learning signal during the silent gap*, exactly where the
-recurrence would need to learn to sustain `A`. No neuron fires in the gap → no eligibility → the recurrent
-weights can't be shaped to hold memory. **The indicated next lever is a sub-threshold `ψ`** (credit flows
-when a neuron is *near* threshold, not only when it spikes) — for both recurrence and the multi-layer DFA
-depth ceiling. (This was run deliberately as a diagnostic; the null is the intended, informative result.)
+**Re-run on the alive net — the valid result:**
+
+| variant | best over seeds |
+|---|---|
+| FF | ~500 (chance) |
+| backward + spike-ψ | ~500 |
+| backward + sub-ψ | ~500 |
+
+All at chance, and sub-ψ **byte-identical** to spike-ψ. But sub-ψ was *not* a no-op — it flowed credit to
+thousands of charged-silent neurons/layer (mean ψ ≈ 0.44). It didn't matter because a **per-wave probe shows
+the recurrent activity dies in the gap**: after cue A ends, spikes stop within ~6 waves and the membrane
+trace decays 28→2 over the 20-wave delay — A's trace is gone before B arrives. So **no `ψ` (spike or
+sub-threshold) can help — there is no sustained trace to credit.** The blocker is the **sustaining
+dynamics** (floored leak + weak ±1 recurrence don't self-sustain), confirming [floored-leak-caps-memory]
+with both the dead-readout *and* credit-rule confounds now removed.
+
+**Open issue — generic calibration.** Calibration tunes thresholds to a *sustained random* input at one
+operating point; it does **not** guarantee a *transient, sparse, task-specific* cue propagates through an
+arbitrary-depth stack. Keeping the reservoir near-critical (gain ≈ 1) across depths and input distributions
+is unsolved here — we hand-tuned drive to revive the deep net. A principled generic calibration (per-layer
+gain control / criticality target) is future work.
+
+**What would actually move recurrence (deferred):** self-sustaining recurrent dynamics (trained strong
+recurrent weights at gain ≈ 1 — a criticality/attractor regime the ±1 init never reaches); or a
+slower/finer recurrent-layer leak so the trace outlasts the gap (risking the passive-memory that the floored
+leak fixed); or surrogate-gradient BPTT. Note ALIF adaptation *already* provides a working ~64-wave memory —
+recurrence has to beat that, which is a high bar on this substrate.
