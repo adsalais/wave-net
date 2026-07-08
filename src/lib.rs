@@ -4,4 +4,5 @@
 //! hash-generated synapses (never stored), deferred one-hop wave propagation, and firing-rate
 //! calibration. Deterministic and single-threaded. This crate is a library only.
 
+pub mod bench;
 pub mod wave_net;
