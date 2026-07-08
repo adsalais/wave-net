@@ -177,6 +177,27 @@ exercise. Neither is built; captured here so the learning-layer phase inherits t
 Both alternatives share the same meta-point as the ranked list above: mechanism should be validated by a
 task, not tuned in a vacuum. See ranked items 1 (ALIF threshold) and 4 (liquid/heterogeneous leak).
 
+## Follow-up: fixed-point potential — remove the floored-leak density cost (store-recall bench)
+
+The Tier-0 store-recall bench forced a real engine change and left one open upgrade. The potential leak
+`p -= (p>>a)+(p>>b)` had a dead zone (`0` for `0 < p < 2^a`), freezing small sub-threshold potentials
+*forever* — the network had **infinite** sub-threshold memory, so plain LIF never forgot a cue and the
+ALIF-vs-LIF distinction vanished. Fixed by flooring the positive decay at 1
+(`p -= max((p>>a)+(p>>b), 1)`), giving a finite membrane time constant. LIF then forgot to chance while
+ALIF held ~55% decoding at delay 24 — the adaptive-threshold memory is real and readable.
+
+- **Cost, now on the books:** the 1/wave floor **starves weakly-driven (sparse) cascades** — a neuron
+  receiving < 1 delivery/wave loses more to the floor than it gains, so it can't integrate. Upper layers
+  need much denser drive (the calibration fixture went `level+1 count 6 → 16`). The sub-threshold
+  integration property we'd defended is now confirmed to matter.
+- **The upgrade when it bites — fixed-point `potential`.** Mirror the `adapt` fix: store `potential`
+  scaled up (`i32`, Q-fixed-point), with `±1` deliveries becoming `±scale`. Then the geometric leak
+  `p -= p>>a` decays exponentially to ~0 (finite τ, **no** dead zone) *and* keeps fine sub-threshold
+  integration (accumulation at the fine scale, so a lone delivery leaves a trace over the membrane
+  window). Cost: `potential` i16→i32, redo the drain clamp/overflow, retune rates — a real engine change
+  touching everything (much bigger than the floored-leak two-liner). Do it if/when the density
+  requirement of floored-leak proves limiting; otherwise floored-leak suffices.
+
 ## Sources
 
 Format: *Title* (tag) — Venue Year — link(s).
