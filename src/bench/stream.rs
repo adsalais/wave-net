@@ -22,7 +22,10 @@ pub(crate) fn stream_pattern(seed: u64, size: u32, density_q16: u32) -> Vec<u32>
 }
 
 /// Engine config for the bench. `recurrent` adds level 0 / -1 coupling; feed-forward is level +1
-/// only. Both use the dense drive the floored leak requires.
+/// only. Both use the dense drive the floored leak requires. `inhibitor_ratio` (Q16) sets the
+/// inhibitory fraction — 0 for MC; the XOR bench uses inhibition, which the architecture sweep
+/// showed markedly improves nonlinear separation.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn engine_config(
     seed: u64,
     size: u32,
@@ -30,6 +33,7 @@ pub(crate) fn engine_config(
     baseline_init: i16,
     adapt_bump: i16,
     adapt_decay: u8,
+    inhibitor_ratio: u32,
     recurrent: bool,
 ) -> Config {
     let mut topology = vec![TopologyLevel { level: 1, radius: 3, count: 16 }];
@@ -41,7 +45,7 @@ pub(crate) fn engine_config(
         topology,
         leak: (3, 5),
         cooldown_base: 2,
-        inhibitor_ratio: 0,
+        inhibitor_ratio,
         threshold_jitter: 32,
         baseline_init,
         adapt_bump,

@@ -59,9 +59,9 @@ impl McConfig {
         }
     }
 
-    /// Build the engine config (delegates to the shared builder).
+    /// Build the engine config (delegates to the shared builder; MC uses no inhibition).
     pub fn engine_config(&self, adapt_bump: i16, recurrent: bool) -> Config {
-        stream::engine_config(self.seed, self.size, self.layers, self.baseline_init, adapt_bump, self.adapt_decay, recurrent)
+        stream::engine_config(self.seed, self.size, self.layers, self.baseline_init, adapt_bump, self.adapt_decay, 0, recurrent)
     }
 
     fn stream_params(&self) -> StreamParams {
