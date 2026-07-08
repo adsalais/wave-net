@@ -38,6 +38,7 @@ pub struct RsnnConfig {
     pub multi_layer: bool, // train every feed-forward layer (DFA credit), not just the last
     pub back_count: u32,   // level −1/−2 backward synapses per neuron (0 = feed-forward only)
     pub back_radius: u32,  // backward recurrence radius
+    pub subthreshold_psi: bool, // temporal-eligibility ψ from decide-time potential, not just spikes
     pub calib: CalibrateParams,
     pub calib_fraction_q16: u32,
 }
@@ -72,6 +73,7 @@ impl RsnnConfig {
             multi_layer: false,
             back_count: 0,
             back_radius: 2,
+            subthreshold_psi: false,
             calib: CalibrateParams { warmup: 16, waves: 48, max_steps: 24, refine_passes: 3, ..CalibrateParams::default() },
             calib_fraction_q16: 20000,
         }
@@ -226,7 +228,7 @@ fn topo_entries(cfg: &RsnnConfig) -> Vec<(i32, usize, u32)> {
 
 /// Temporal-XOR trial (reset → cue(a) → delay → cue(b) → read) on a multi-layer net. Records every
 /// computational layer's per-wave fired-set and returns (top-layer read-window spike counts, spikes[z][t]).
-fn xor_trial_layers(net: &mut Network, cfg: &RsnnConfig, a: usize, b: usize, trial: usize) -> (Vec<f32>, Vec<Vec<Vec<u32>>>) {
+fn xor_trial_layers(net: &mut Network, cfg: &RsnnConfig, a: usize, b: usize, trial: usize) -> (Vec<f32>, Vec<Vec<Vec<u32>>>, Vec<Vec<Vec<i16>>>) {
     let l = net.layer_count();
     let ls = (cfg.size * cfg.size) as usize;
     let rec: Arc<Mutex<Vec<Vec<Vec<u32>>>>> = Arc::new(Mutex::new(vec![Vec::new(); l]));
@@ -235,19 +237,29 @@ fn xor_trial_layers(net: &mut Network, cfg: &RsnnConfig, a: usize, b: usize, tri
         net.on_layer(z, Box::new(move |_w, fired: &[u32]| r.lock().unwrap()[z].push(fired.to_vec())));
     }
     net.reset_state();
-    let present = |net: &mut Network, class: usize, phase: usize| {
+    let mut pots: Vec<Vec<Vec<i16>>> = vec![Vec::new(); l];
+    let record = |net: &Network, pots: &mut Vec<Vec<Vec<i16>>>| {
+        for z in 1..l {
+            pots[z].push(net.layer_decide_potential(z));
+        }
+    };
+    for (class, phase) in [(a, 0usize), (b, 1)] {
+        // (delay sits between the two cue presentations)
+        if phase == 1 {
+            for _ in 0..cfg.delay {
+                net.wave(&[]);
+                record(net, &mut pots);
+            }
+        }
         for w in 0..cfg.present_waves {
             let sites = cue_realization(cfg.task_seed, cfg.size, class, trial * 2 + phase, w, cfg.base_q16, cfg.keep_q16, cfg.noise_q16);
             net.wave(&sites);
+            record(net, &mut pots);
         }
-    };
-    present(net, a, 0);
-    for _ in 0..cfg.delay {
-        net.wave(&[]);
     }
-    present(net, b, 1);
     for _ in 0..cfg.read_waves {
         net.wave(&[]);
+        record(net, &mut pots);
     }
     net.clear_listeners();
     let spikes = rec.lock().unwrap().clone();
@@ -258,7 +270,7 @@ fn xor_trial_layers(net: &mut Network, cfg: &RsnnConfig, a: usize, b: usize, tri
             act[loc as usize] += 1.0;
         }
     }
-    (act, spikes)
+    (act, spikes, pots)
 }
 
 const P_DFA: u64 = 61; // fixed random Direct-Feedback-Alignment weights
@@ -504,10 +516,14 @@ pub fn train_recurrent(cfg: &RsnnConfig) -> u64 {
         (0..2).map(|c| w[c].iter().zip(a).map(|(wi, ai)| wi * ai).sum()).collect()
     };
     let decay = 1.0 - 1.0 / cfg.rec_tau.max(1.0);
+    // per-neuron threshold (post-calibration, fixed during weight training) for the sub-threshold ψ ramp
+    let theta: Vec<Vec<f32>> = (0..l)
+        .map(|z| net.layer_thresholds(z.max(1)).iter().map(|&t| (t as f32).max(1.0)).collect())
+        .collect();
     for t in 0..cfg.trials {
         let (a, b) = pick_ab(cfg.task_seed, t);
         let label = a ^ b;
-        let (act, spikes) = xor_trial_layers(&mut net, cfg, a, b, t);
+        let (act, spikes, pots) = xor_trial_layers(&mut net, cfg, a, b, t);
         let p = softmax(&score(&w, &act));
         let err: Vec<f32> = (0..2).map(|c| p[c] - if c == label { 1.0 } else { 0.0 }).collect();
         for c in 0..2 {
@@ -535,6 +551,19 @@ pub fn train_recurrent(cfg: &RsnnConfig) -> u64 {
                 }
             }
         }
+        // postsynaptic factor ψ: spike-time (fired) or sub-threshold ramp clamp(decide_potential/θ, 0, 1)
+        let mut post = vec![vec![vec![0f32; ls]; ttot]; l];
+        for z in 1..l {
+            for tt in 0..ttot {
+                for j in 0..ls {
+                    post[z][tt][j] = if cfg.subthreshold_psi {
+                        (pots[z][tt][j] as f32 / theta[z][j]).clamp(0.0, 1.0)
+                    } else {
+                        fired[z][tt][j]
+                    };
+                }
+            }
+        }
         let l_sig = |tz: usize, j: usize| -> f32 {
             (0..2)
                 .map(|c| {
@@ -559,7 +588,7 @@ pub fn train_recurrent(cfg: &RsnnConfig) -> u64 {
                         let j = target_of(cfg.seed, sg, i as u32, level, k as u32, radius, cfg.size) as usize;
                         let mut e = 0f32;
                         for tt in 0..ttot {
-                            e += pretr[z][tt][i] * fired[tz][tt][j];
+                            e += pretr[z][tt][i] * post[tz][tt][j];
                         }
                         if e != 0.0 {
                             updates.push((i * total_slots + slot + k, -cfg.hidden_lr * l_sig(tz, j) * e));
@@ -582,7 +611,7 @@ pub fn train_recurrent(cfg: &RsnnConfig) -> u64 {
     let holdout = 400usize;
     for t in cfg.trials..cfg.trials + holdout {
         let (a, b) = pick_ab(cfg.task_seed, t);
-        let (act, _) = xor_trial_layers(&mut net, cfg, a, b, t);
+        let (act, _, _) = xor_trial_layers(&mut net, cfg, a, b, t);
         let s = score(&w, &act);
         let pred = if s[1] > s[0] { 1 } else { 0 };
         if pred == (a ^ b) {
@@ -670,6 +699,119 @@ mod tests {
         eprintln!("worst single {worst_single}  worst multi {worst_multi}");
         assert!(worst_multi > 640, "multi-layer learns reliably at depth (worst {worst_multi})");
         assert!(worst_multi >= worst_single, "multi-layer is at least as good as single-layer at depth");
+    }
+
+    #[test]
+    #[ignore]
+    fn _gap_activity_probe() {
+        // Where does the signal die? Total spikes per layer over one XOR trial, for LIF (adapt_bump=0) vs
+        // ALIF (adapt_bump=20) — everything else identical. Isolates whether adaptation is what keeps the
+        // deep layers alive.
+        let mut cfg = RsnnConfig::demo();
+        cfg.seed = 0xE9_0B_0A17;
+        cfg.task_seed = 0xE9_0B_0A17;
+        cfg.size = 16;
+        cfg.layers = 4;
+        cfg.back_count = 8;
+        cfg.adapt_bump = 0;
+        cfg.delay = 20;
+        cfg.up_count = 32; // alive-LIF drive
+        cfg.present_waves = 12;
+        cfg.base_q16 = 30000;
+        let mut net = Network::new(cfg.engine_config_recurrent());
+        net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
+        let l = net.layer_count();
+        let ls = (cfg.size * cfg.size) as usize;
+        let theta: Vec<Vec<f32>> = (0..l)
+            .map(|z| net.layer_thresholds(z.max(1)).iter().map(|&t| (t as f32).max(1.0)).collect())
+            .collect();
+        let (_, spikes, pots) = xor_trial_layers(&mut net, &cfg, 1, 0, 0);
+        let ttot = spikes[l - 1].len();
+        // does sub-ψ (clamp(v/θ)) ever differ from spike-ψ (fired)? count charged-but-silent neurons
+        for z in 1..l {
+            let total: usize = spikes[z].iter().map(|w| w.len()).sum();
+            let mut diff = 0usize;
+            let mut charged = 0usize;
+            let mut sub_sum = 0f64;
+            for tt in 0..ttot {
+                let fs: std::collections::HashSet<u32> = spikes[z][tt].iter().copied().collect();
+                for j in 0..ls {
+                    let f = if fs.contains(&(j as u32)) { 1.0 } else { 0.0 };
+                    let s = (pots[z][tt][j] as f32 / theta[z][j]).clamp(0.0, 1.0);
+                    if (s - f).abs() > 1e-6 {
+                        diff += 1;
+                    }
+                    if f == 0.0 && s > 0.0 {
+                        charged += 1;
+                        sub_sum += s as f64;
+                    }
+                }
+            }
+            let mean_sub = if charged > 0 { sub_sum / charged as f64 } else { 0.0 };
+            println!("L{z}: spikes {total:>5}  subψ≠spikeψ entries {diff:>6}  charged-silent {charged:>6}  mean-subψ {mean_sub:.3}");
+        }
+        // per-wave total activity across all layers: does anything survive the silent gap?
+        println!("present-a 0..12, GAP 12..32, present-b 32..44, read 44..50");
+        let act_per_wave: Vec<(usize, f32)> = (0..ttot)
+            .map(|tt| {
+                let sp: usize = (1..l).map(|z| spikes[z][tt].len()).sum();
+                let mv: f32 = (1..l).map(|z| pots[z][tt].iter().map(|&v| v.max(0) as f32).sum::<f32>()).sum::<f32>() / (ls * (l - 1)) as f32;
+                (sp, mv)
+            })
+            .collect();
+        for (tt, (sp, mv)) in act_per_wave.iter().enumerate() {
+            println!("wave {tt:>3}  spikes(all) {sp:>4}  mean+v {mv:.2}");
+        }
+    }
+
+    #[test]
+    fn subthreshold_psi_is_deterministic() {
+        let mut cfg = RsnnConfig::demo();
+        cfg.size = 16;
+        cfg.layers = 4;
+        cfg.back_count = 8;
+        cfg.subthreshold_psi = true;
+        cfg.adapt_bump = 0;
+        cfg.delay = 20;
+        cfg.trials = 300;
+        assert_eq!(train_recurrent(&cfg), train_recurrent(&cfg));
+    }
+
+    #[test]
+    #[ignore] // expensive; run manually in --release
+    fn subthreshold_psi_vs_spike_psi_on_temporal_xor() {
+        let seeds = [0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF];
+        let mk = |s: u64| {
+            let mut c = RsnnConfig::demo();
+            c.seed = s;
+            c.task_seed = s;
+            c.size = 16;
+            c.layers = 4;
+            c.adapt_bump = 0; // LIF
+            c.delay = 20;
+            c.trials = 1500;
+            // "alive LIF": raise feed-forward gain so the transient cue propagates through all 4 layers
+            // (default drive leaves the readout layer dead — see _gap_activity_probe).
+            c.up_count = 32;
+            c.present_waves = 12;
+            c.base_q16 = 30000;
+            c
+        };
+        let (mut best_ff, mut best_spk, mut best_sub) = (0u64, 0u64, 0u64);
+        for &s in &seeds {
+            let ff = mk(s);
+            let mut spk = ff.clone();
+            spk.back_count = 8;
+            let mut sub = spk.clone();
+            sub.subthreshold_psi = true;
+            let (fa, sa, ua) = (train_recurrent(&ff), train_recurrent(&spk), train_recurrent(&sub));
+            eprintln!("seed {s:#x}  FF {fa}  backward+spikeψ {sa}  backward+subψ {ua}");
+            best_ff = best_ff.max(fa);
+            best_spk = best_spk.max(sa);
+            best_sub = best_sub.max(ua);
+        }
+        eprintln!("best  FF {best_ff}  spikeψ {best_spk}  subψ {best_sub}");
+        assert!(best_sub >= 485, "sanity; verdict is the printed comparison (Step 6)");
     }
 
     #[test]
