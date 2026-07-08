@@ -519,3 +519,38 @@ starves sparse cascades, so configs need denser drive (the fix and its density c
 - **Always control for passive memory** when attributing memory to adaptation: recurrence carries memory on
   its own (use feed-forward to isolate), and — before the floored-leak fix — frozen potentials gave even
   LIF infinite memory.
+
+## Resolution — the RSNN pivot: stored weights + e-prop learns reliably
+
+The verification arc's conclusion (train the *weights*, not just the thresholds) was implemented in
+`wave_net` (the `wave_state_machine` fork stays the pure-procedural reference) and it **works**:
+
+- **Substrate:** synapse **addresses stay procedural** (regenerated from the hash — free); only the plastic
+  **weights are stored (int8 + f32 shadow)**. This is the GeNN split — procedural static structure, stored
+  plastic weights — at a scale where storing weights is trivially cheap.
+- **Learning:** **e-prop** — a factored per-neuron eligibility `e_ij = pre_i · psi_j` (pre-trace × a box
+  pseudo-derivative near threshold, O(neurons) engine state) × a symmetric-feedback learning signal from a
+  trained readout, updating the stored weights through the shadow.
+
+**Result (held-out, multi-seed — the bar threshold-only failed):**
+
+| | seed s0 | s1 | s2 | s3 |
+|---|---|---|---|---|
+| fixed-reservoir top-layer readout | 727 | 500 | 655 | 507 |
+| **+ e-prop hidden-weight training** | **1000** | **965** | **890** | **987** |
+
+A top-layer readout on the *fixed* reservoir is seed-fragile (two seeds at chance) — the class doesn't
+reliably propagate upward. **e-prop on the hidden `L1→L2` weights shapes the reservoir so the top layer is
+reliably separable on *every* seed (890–1000).** Training weights *shapes* the projection (real feature
+learning); training thresholds could only *gate* a fixed one — which is exactly why weights generalize
+across seeds where thresholds did not. `hidden_lr = 0.004` (0.008 destabilizes one seed; ≤0.002 is too slow
+for the fragile seeds).
+
+Also banked, as a reliable baseline: a trained readout on the **full** reservoir hits **1000‰ held-out on
+all seeds** (the class is linearly present across the layers) — the classic LSM, first reliable learning on
+`wave_net`.
+
+**Deferred (next):** recurrence (`level 0/−1` trained → full RSNN); multi-layer credit assignment (train all
+feed-forward layers, not just the last); int8 readout + weight sharing (conv kernels / hashing trick) for
+sub-linear memory; a task that *needs* reservoir computation (so hidden training must beat a full-reservoir
+readout, which here already saturates).
