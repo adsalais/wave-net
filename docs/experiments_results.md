@@ -187,6 +187,21 @@ shape the reservoir to a fixed projection. **This pins the boundary of the crude
 only when the output itself is trainable.** The readout must pair with **per-output broadcast-error credit**
 (V2b), for which the readout layer is now infrastructure.
 
+**V2b — broadcast-error alignment: the readout learns.** Replacing the global scalar with a **per-output
+broadcast error** (softmax error × fixed random hash-derived feedback weights, `Δθⱼ = −lr·Σᵢ B(j,i)·errᵢ·eⱼ`)
+makes the non-spiking readout learn — **~687‰ (peaks ~740)** vs frozen ~500, on par with V1's ~770. The
+learning arc, end to end:
+
+| variant | output | credit | late accuracy ‰ |
+|---|---|---|---|
+| V1 | spiking populations (trainable) | global reward | ~770 |
+| V2a | non-spiking potential readout | global reward | ~490 (null) |
+| **V2b** | non-spiking potential readout | **broadcast error** | **~687** |
+
+So all-internal (feedback-alignment) learning works **once the credit is per-output** — exactly the boundary
+V2a exposed. (`softmax_temp = 10`: the potential-sum scores are large, so a low temperature is needed to keep
+the error from washing out to uniform.)
+
 ## Engine finding along the way — the floored leak
 
 Store-recall *found a real substrate bug*. The potential leak `p -= (p>>a)+(p>>b)` is `0` for `0 < p <

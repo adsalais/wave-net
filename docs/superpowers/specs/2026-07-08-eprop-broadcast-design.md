@@ -79,10 +79,28 @@ Reuse the V2a demo (`size 8`, 3 computational + 1 readout, `K=2`, dense `level+1
 `err ∈ [−1,1]` × spike-count magnitude (so a *larger* `lr` than V2a — the signal is now O(1), not
 hundreds).
 
+## Revision (post-implementation) — it works
+
+**Broadcast-error alignment rescues the readout.** Late-training accuracy reaches **~687‰** (peaks ~740)
+versus a frozen control at ~500, deterministically — **on par with V1's ~770‰**, and a clean win over V2a's
+null. This confirms the V2a diagnosis end to end: all-internal (feedback-alignment) learning works *once the
+credit is per-output* (class-specific), which a global scalar reward could not provide. The full arc:
+
+| variant | output | credit | late accuracy |
+|---|---|---|---|
+| V1 | spiking populations (trainable) | global reward | ~770 |
+| V2a | non-spiking potential readout | global reward | ~490 (null) |
+| **V2b** | non-spiking potential readout | **broadcast error** | **~687** |
+
+**Tuning that mattered:** `softmax_temp = 10` (the scores are large potential sums, so a *low* temperature
+is needed to sharpen the error — `temp ≈ 100` washed it out to ~uniform), `lr = 0.5`, `trials = 3600`. The
+update **sign as written** (`Δθ = −lr·Lⱼ·eⱼ`, `err = target − p`) learned in the right direction — no flip
+needed. The curve is noisy (crude spike-count eligibility), so the metric is the late-half mean.
+
 ## Deferred (updated roadmap)
 
 - **Symmetric feedback:** replace random `B` with the actual readout ±1 projection (hash-derivable) — proper
-  e-prop credit, if feedback-alignment underperforms.
+  e-prop credit, if feedback-alignment underperforms (it didn't need to here, but may matter for `K > 2`).
 - **Potential-based internal eligibility:** let sub-threshold potential contribute to `eⱼ` so silent
   neurons can be recruited.
 - High-drive float-free trainer, per-wave/TD credit, `K > 2`, training adaptation params — later rungs.
