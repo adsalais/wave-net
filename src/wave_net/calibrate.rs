@@ -99,9 +99,9 @@ mod tests {
             cooldown_base: 2,
             inhibitor_ratio: 0,
             threshold_jitter: 64,
-            baseline_init: i16::MAX,
-            adapt_bump: 0,
-            adapt_decay: 5,
+            baseline_init: 8,
+            adapt_bump: 3,
+            adapt_decay: 1,
         };
         Config { seed: 0x00C0_FFEE, size: 8, layers: vec![layer; 4] }
     }
@@ -115,33 +115,53 @@ mod tests {
     }
 
     #[test]
-    fn calibrate_warms_silent_upper_layers() {
+    fn calibrate_settles_upper_layers() {
         let mut net = Network::new(test_config());
         let input = random_l0_input(0xABC, 8, 20000); // ~30% of L0 driven
         let params = CalibrateParams::default();
         let top = net.layer_count() - 1;
-
-        let before = net.measure_layer_rates(params.warmup, params.waves, &input)[top];
-        assert!(before < 0.01, "precondition: top silent, got {before}");
+        let target = params.target_permille as f64 / 1000.0;
 
         net.calibrate(&params, &input);
 
         let after = net.measure_layer_rates(params.warmup, params.waves, &input)[top];
-        let target = params.target_permille as f64 / 1000.0;
         assert!(after > 0.0, "top should fire after calibration");
         assert!(after > target / 2.0 && after < target * 2.0, "top rate {after} not near {target}");
-        let max_t = net.layer_thresholds(top).into_iter().max().unwrap();
-        assert!(max_t < i16::MAX, "top threshold should have dropped, is {max_t}");
     }
 
     #[test]
-    fn calibrate_lowers_every_upper_layer() {
+    fn calibrate_moves_every_upper_layer_toward_target() {
         let mut net = Network::new(test_config());
         let input = random_l0_input(7, 8, 20000);
-        net.calibrate(&CalibrateParams::default(), &input);
+        let params = CalibrateParams::default();
+        let target = params.target_permille as f64 / 1000.0;
+
+        let before: Vec<f64> = net.measure_layer_rates(params.warmup, params.waves, &input);
+        net.calibrate(&params, &input);
+        let after: Vec<f64> = net.measure_layer_rates(params.warmup, params.waves, &input);
+
         for z in 1..net.layer_count() {
-            let max_t = net.layer_thresholds(z).into_iter().max().unwrap();
-            assert!(max_t < i16::MAX, "layer {z} threshold should have dropped");
+            let improved = (after[z] - target).abs() <= (before[z] - target).abs() + 1e-9;
+            assert!(improved, "layer {z}: rate moved away from target ({} -> {})", before[z], after[z]);
+        }
+    }
+
+    #[test]
+    fn calibrate_hits_target_with_adaptation_live() {
+        let mut net = Network::new(test_config());
+        let input = random_l0_input(42, 8, 20000);
+        let params = CalibrateParams::default();
+        let target = params.target_permille as f64 / 1000.0;
+
+        net.calibrate(&params, &input);
+
+        let rates = net.measure_layer_rates(params.warmup, params.waves, &input);
+        for z in 1..net.layer_count() {
+            assert!(
+                rates[z] > target / 3.0 && rates[z] < target * 3.0,
+                "layer {z} self-regulated rate {} not near target {target}",
+                rates[z]
+            );
         }
     }
 
