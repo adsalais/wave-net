@@ -3,7 +3,34 @@
 
 use std::sync::{Arc, Mutex};
 
+use crate::bench::linalg::{xt_x, xt_y, Lu};
 use crate::wave_net::network::Network;
+
+/// Ridge-regression linear readout. Factors `(XᵀX + λI)` once from the training design matrix
+/// (which must already include a bias column); each target column is solved by back-substitution.
+pub struct RidgeReadout {
+    lu: Lu,
+}
+
+impl RidgeReadout {
+    pub fn fit(x_train: &[Vec<f64>], lambda: f64) -> RidgeReadout {
+        let mut a = xt_x(x_train);
+        for (i, row) in a.iter_mut().enumerate() {
+            row[i] += lambda;
+        }
+        RidgeReadout { lu: Lu::factor(a) }
+    }
+
+    /// Weight vector reconstructing one target column `y_train` from `x_train`.
+    pub fn weights(&self, x_train: &[Vec<f64>], y_train: &[f64]) -> Vec<f64> {
+        self.lu.solve(&xt_y(x_train, y_train))
+    }
+
+    /// Prediction `X · w`.
+    pub fn predict(x: &[Vec<f64>], w: &[f64]) -> Vec<f64> {
+        x.iter().map(|row| row.iter().zip(w).map(|(a, b)| a * b).sum()).collect()
+    }
+}
 
 /// Run `waves` waves feeding `input(w)` each wave, returning per-neuron spike counts over the
 /// computational layers `1..L` concatenated (layer 0, the transducer, excluded). Installs counting
@@ -117,6 +144,40 @@ mod tests {
         let driven = record_response(&mut net, 6, move |_w| all_l0.clone());
         assert_eq!(driven.len(), ls);
         assert!(driven.iter().any(|&c| c > 0), "driven run must record L1 spikes");
+    }
+
+    use crate::wave_net::synapse::mix;
+
+    fn synth_design(n: usize, d: usize) -> Vec<Vec<f64>> {
+        // Deterministic rows in [-1,1) with a trailing bias column of 1.0.
+        (0..n)
+            .map(|i| {
+                let mut row: Vec<f64> = (0..d - 1)
+                    .map(|j| {
+                        let h = mix(((i as u64) << 20) ^ ((j as u64) << 3) ^ 0x9E37_79B9);
+                        ((h & 0xFFFF) as f64 / 65536.0) * 2.0 - 1.0
+                    })
+                    .collect();
+                row.push(1.0);
+                row
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ridge_recovers_planted_linear_map() {
+        let (n, d) = (60usize, 4usize); // 3 features + bias
+        let x = synth_design(n, d);
+        let w_true = [1.5, -2.0, 0.5, 0.25];
+        let y: Vec<f64> = x.iter().map(|r| r.iter().zip(&w_true).map(|(a, b)| a * b).sum()).collect();
+        let ridge = RidgeReadout::fit(&x, 1e-6);
+        let w = ridge.weights(&x, &y);
+        for (got, want) in w.iter().zip(&w_true) {
+            assert!((got - want).abs() < 1e-2, "weight {got} != {want}");
+        }
+        let pred = RidgeReadout::predict(&x, &w);
+        let max_err = pred.iter().zip(&y).map(|(p, t)| (p - t).abs()).fold(0.0, f64::max);
+        assert!(max_err < 1e-2, "prediction error {max_err} too large");
     }
 
     #[test]
