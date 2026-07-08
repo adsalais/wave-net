@@ -9,9 +9,10 @@ pub struct TopologyLevel {
 pub struct Synapse {
     // neuron that will receive the input
     pub target: u32,
-    /// `true` for an inhibitory synapse (delivers `-1`); `false` for excitatory (`+1`).
-    /// Weights collapsed to binary {-1,+1}, so the sign is all that remains — one bool.
-    pub inhibitory: bool,
+    /// Signed integer weight delivered to `target`. Default build: `±1` (binary sign only). With
+    /// `--features random_weights`: `sign × magnitude`, magnitude hash-drawn from `1..=16` (a richer,
+    /// still-procedural projection — as in GeNN, where procedural weights follow a distribution).
+    pub weight: i16,
 }
 
 /// A firing neuron's outgoing synapses for one topology entry, tagged with the entry's
@@ -26,6 +27,7 @@ pub struct SynapseGroup {
 pub const P_TARGET: u64 = 1;
 pub const P_THRESHOLD: u64 = 3;
 pub const P_INPUT: u64 = 5;
+pub const P_WEIGHT: u64 = 7;
 
 /// splitmix64 finalizer — the default integer mixer (dependency-free, deterministic).
 #[cfg(not(feature = "strong_hash"))]
@@ -111,8 +113,12 @@ pub fn generate_into(
             let dy = map_range24(((h >> 16) as u32) & 0x00FF_FFFF, span) as i32 - entry.radius as i32;
             let tx = wrap(sx, dx, size);
             let ty = wrap(sy, dy, size);
-            let inhibitory = ((h & 0xFFFF) as u32) < inhibitor_ratio;
-            group.synapses.push(Synapse { target: local_of(tx, ty, size), inhibitory });
+            let sign: i16 = if ((h & 0xFFFF) as u32) < inhibitor_ratio { -1 } else { 1 };
+            #[cfg(not(feature = "random_weights"))]
+            let magnitude: i16 = 1;
+            #[cfg(feature = "random_weights")]
+            let magnitude: i16 = 1 + (mix(key(seed, source_global, entry.level, k, P_WEIGHT)) & 0x0F) as i16;
+            group.synapses.push(Synapse { target: local_of(tx, ty, size), weight: sign * magnitude });
         }
     }
 }
@@ -166,7 +172,7 @@ mod tests {
         generate_into(1, 9, 9, 8, &t, 30000, &mut b);
         assert_eq!(a[0].synapses.len(), b[0].synapses.len());
         for (x, y) in a[0].synapses.iter().zip(&b[0].synapses) {
-            assert_eq!((x.target, x.inhibitory), (y.target, y.inhibitory));
+            assert_eq!((x.target, x.weight), (y.target, y.weight));
         }
         // second call appends (aggregation across firers)
         generate_into(1, 9, 9, 8, &t, 30000, &mut a);

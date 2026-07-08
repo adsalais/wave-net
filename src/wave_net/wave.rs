@@ -30,7 +30,7 @@ pub fn process_layer(
         *a = 0;
     }
     for s in layer.inbox.iter() {
-        acc[s.target as usize] += if s.inhibitory { -1 } else { 1 };
+        acc[s.target as usize] += s.weight as i32;
     }
     layer.inbox.clear();
     for i in 0..ls {
@@ -135,7 +135,7 @@ mod tests {
         l.adapt_bump = 8;
         l.adapt_decay = 5;
         for _ in 0..3 {
-            l.inbox.push(Synapse { target: 0, inhibitory: false });
+            l.inbox.push(Synapse { target: 0, weight: 1 });
         }
         let mut acc = vec![0i32; 16];
         let mut out = groups_for(&l);
@@ -168,7 +168,7 @@ mod tests {
             let mut l = low_layer(1, 5, 2, vec![]);
             l.adapt[0] = eff_adapt << ADAPT_SHIFT; // effective contribution eff_adapt
             for _ in 0..10 {
-                l.inbox.push(Synapse { target: 0, inhibitory: false });
+                l.inbox.push(Synapse { target: 0, weight: 1 });
             }
             let mut acc = vec![0i32; 1];
             let mut out: Vec<SynapseGroup> = Vec::new();
@@ -190,7 +190,7 @@ mod tests {
         for _ in 0..3 {
             l.inbox.clear();
             for _ in 0..3 {
-                l.inbox.push(Synapse { target: 0, inhibitory: false });
+                l.inbox.push(Synapse { target: 0, weight: 1 });
             }
             process_layer(&mut l, 0, 0, 4, &[], &mut acc, &mut out, &mut fired);
             assert_eq!(l.adapt[0], 0, "adapt must stay 0 when adapt_bump is 0");
@@ -238,7 +238,7 @@ mod tests {
     fn integration_fires_and_resets() {
         let mut l = low_layer(4, 3, 2, vec![TopologyLevel { level: 1, radius: 0, count: 1 }]);
         for _ in 0..3 {
-            l.inbox.push(Synapse { target: 0, inhibitory: false });
+            l.inbox.push(Synapse { target: 0, weight: 1 });
         }
         let mut acc = vec![0i32; 16];
         let mut out = groups_for(&l);
@@ -262,7 +262,7 @@ mod tests {
         assert_eq!(fired, vec![0]);
         // wave B: strong drive but still refractory (cooldown 2 -> 1)
         for _ in 0..100 {
-            l.inbox.push(Synapse { target: 0, inhibitory: false });
+            l.inbox.push(Synapse { target: 0, weight: 1 });
         }
         process_layer(&mut l, 0, 0, 1, &[], &mut acc, &mut out, &mut fired);
         assert!(fired.is_empty(), "must not fire while refractory");
@@ -303,11 +303,11 @@ mod tests {
             let mut l = low_layer(1, 30_000, 2, vec![]);
             l.potential[0] = 40;
             if exc_first {
-                for _ in 0..100 { l.inbox.push(Synapse { target: 0, inhibitory: false }); }
-                for _ in 0..10 { l.inbox.push(Synapse { target: 0, inhibitory: true }); }
+                for _ in 0..100 { l.inbox.push(Synapse { target: 0, weight: 1 }); }
+                for _ in 0..10 { l.inbox.push(Synapse { target: 0, weight: -1 }); }
             } else {
-                for _ in 0..10 { l.inbox.push(Synapse { target: 0, inhibitory: true }); }
-                for _ in 0..100 { l.inbox.push(Synapse { target: 0, inhibitory: false }); }
+                for _ in 0..10 { l.inbox.push(Synapse { target: 0, weight: -1 }); }
+                for _ in 0..100 { l.inbox.push(Synapse { target: 0, weight: 1 }); }
             }
             let mut acc = vec![0i32; 1];
             let mut out: Vec<SynapseGroup> = Vec::new();
