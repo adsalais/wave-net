@@ -126,6 +126,57 @@ eligibility trace under a reward/three-factor signal (gradient-free, no shadow),
 FPTT-style toward a running reference — with a surrogate-gradient shadow as a ceiling/benchmark and
 ETLP as the on-chip-local target.
 
+## Design notes from the ALIF iteration (2026-07-08) — two alternatives weighed
+
+After the ALIF-threshold branch landed, two alternative directions were analysed as a critical-thinking
+exercise. Neither is built; captured here so the learning-layer phase inherits the reasoning.
+
+### A. Online baseline-homeostasis (as a replacement for offline calibration)
+
+- **What.** Replace the offline `calibrate` pass with a per-neuron online rule: a spike-triggered
+  **rate trace** (geometric decay, same shape as `adapt`) plus a slow **baseline nudge** toward a
+  target rate. Structurally the same integer slow-variable pattern as ALIF.
+- **Cost.** Code is *low* (≈ the ALIF change). The difficulty is **dynamical, not code**: stable
+  timescale separation (homeostasis ≪ adaptation ≪ wave), avoiding oscillation in the coupled
+  recurrent stack, noise-robust rate estimation. Offline calibration deliberately dodges all of this
+  via reset → measure → step → freeze (and its bottom-up ordering tames the recurrent coupling).
+- **Risk.** Strict per-neuron rate homeostasis **homogenises** firing rates, which can *hurt* reservoir
+  richness — edge-of-chaos/criticality wants heterogeneity. Calibration's uniform per-layer shift
+  preserves per-neuron jitter; naive homeostasis erases it. Mitigate with a soft/slow rule or a target
+  *distribution* rather than a single rate.
+- **Strategic.** An online homeostatic baseline rule already *is* a gradient-free intrinsic-plasticity
+  learning rule (three-factor family). Its real payoff is when the baseline is nudged by **task
+  reward**, not a fixed rate — so build it *with* the learning layer, against a task, not as a
+  calibration replacement now.
+- **Recommendation.** Don't cold-drop calibration. Either (a) keep calibration as a **warm-start** and
+  add online maintenance on top (removes the hardest cold-start stability problem — the rule only has
+  to *hold* a good operating point, not *find* one), or (b) defer entirely to the learning-layer phase.
+
+### B. Adaptive / heterogeneous leak (vs. the adaptive threshold we built)
+
+- **What.** Make the **leak** (integration time constant) per-neuron — heterogeneous-fixed or dynamic.
+  Memory then lives in the *existing* `potential` (an **input-integration** memory), giving a spectrum
+  of temporal receptive fields (coincidence-detector → accumulator). This is a *different* memory from
+  ALIF's **output/firing-rate** memory, and composes natively with the sub-threshold-integration dead
+  zone we deliberately kept (slow-leak → near-perfect accumulator; fast-leak → leaky).
+- **Memory usage — much lighter.** `adapt` is `i32` = **4 bytes/neuron**, the single heaviest
+  per-neuron field (44% of the 9-byte footprint `potential`/`cooldown`/`threshold`/`adapt`), inflated
+  to i32 by the Q-fixed-point dead-zone fix. Per-neuron leak is a `u8` shift = **1 byte** stored, or
+  **0 bytes** if hash-derived (`leak_shift(seed, id)` computed on demand, exactly like synapses and
+  threshold jitter). The fixed-heterogeneous form adds **no new dynamic state at all** — the
+  multi-timescale memory is just `potential` decaying at per-neuron rates. (Hash-derived trades 1 byte
+  of storage for one `mix()` per neuron per wave in the leak loop; storing the byte is likely the
+  better trade.)
+- **Trade.** Leak buys input-timescale memory + reservoir richness but **not** ALIF's rate
+  self-regulation — dropping ALIF for leak shifts all rate control onto calibration/homeostasis. The
+  two are **not mutually exclusive**.
+- **Recommendation.** Add heterogeneous (hash-derived) leak **additively** first — cheap, deterministic,
+  on-brand for a store-nothing engine — and measure what each contributes before deciding whether leak
+  makes `adapt` droppable (reclaiming the 4 bytes). Final adjudication needs a temporal task.
+
+Both alternatives share the same meta-point as the ranked list above: mechanism should be validated by a
+task, not tuned in a vacuum. See ranked items 1 (ALIF threshold) and 4 (liquid/heterogeneous leak).
+
 ## Sources
 
 Format: *Title* (tag) — Venue Year — link(s).
