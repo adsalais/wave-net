@@ -95,12 +95,12 @@ impl EpropConfig {
         }
     }
 
-    /// V2a engine config: computational layers + an appended non-spiking readout layer (empty
-    /// topology sink). Build the resulting `Config` with `Network::new_with_readout`.
-    fn engine_config_readout(&self) -> Config {
+    /// A dense feed-forward ALIF computational layer built from the sweepable knobs. Shared by the V1
+    /// and readout configs so both paths sweep identically (feed-forward isolates adaptation).
+    fn comp_layer(&self) -> crate::wave_net::config::LayerConfig {
         use crate::wave_net::config::LayerConfig;
         use crate::wave_net::synapse::TopologyLevel;
-        let comp = LayerConfig {
+        LayerConfig {
             topology: vec![TopologyLevel { level: 1, radius: self.up_radius, count: self.up_count }],
             leak: (3, 5),
             cooldown_base: self.cooldown_base,
@@ -109,7 +109,14 @@ impl EpropConfig {
             baseline_init: self.baseline_init,
             adapt_bump: self.adapt_bump,
             adapt_decay: self.adapt_decay,
-        };
+        }
+    }
+
+    /// V2a engine config: computational layers + an appended non-spiking readout layer (empty
+    /// topology sink). Build the resulting `Config` with `Network::new_with_readout`.
+    fn engine_config_readout(&self) -> Config {
+        use crate::wave_net::config::LayerConfig;
+        let comp = self.comp_layer();
         let readout = LayerConfig { topology: vec![], ..comp.clone() };
         let mut layers = vec![comp; self.layers];
         layers.push(readout);
@@ -117,10 +124,7 @@ impl EpropConfig {
     }
 
     fn engine_config(&self) -> Config {
-        // Dense feed-forward ALIF (held memory needs dense fan-out; feed-forward isolates adaptation).
-        crate::bench::stream::engine_config(
-            self.seed, self.size, self.layers, self.baseline_init, self.adapt_bump, self.adapt_decay, 0, false,
-        )
+        Config { seed: self.seed, size: self.size, layers: vec![self.comp_layer(); self.layers] }
     }
 }
 
