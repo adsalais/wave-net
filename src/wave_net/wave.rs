@@ -55,14 +55,21 @@ pub fn process_layer(
         return;
     }
 
-    // 4. decide (ALIF effective threshold = baseline + adapt, in i32; fire bumps adapt)
+    // 4. decide (ALIF effective threshold = baseline + adapt, in i32; fire bumps adapt). Also accrue the
+    // e-prop eligibility factors: post pseudo-derivative ψ (box surrogate near threshold) for every neuron,
+    // and the pre-trace (spike count) for firers.
+    const PSI_BAND: i32 = 8;
     for i in 0..ls {
         let eff = layer.threshold[i] as i32 + (layer.adapt[i] >> ADAPT_SHIFT);
+        if ((layer.potential[i] as i32) - eff).abs() <= PSI_BAND {
+            layer.elig_post[i] += 1;
+        }
         if layer.cooldown[i] == 0 && (layer.potential[i] as i32) >= eff {
             layer.potential[i] = 0;
             layer.cooldown[i] = layer.cooldown_base;
             let bumped = layer.adapt[i] + ((layer.adapt_bump as i32) << ADAPT_SHIFT);
             layer.adapt[i] = bumped.clamp(0, ADAPT_MAX);
+            layer.elig_pre[i] += 1;
             fired.push(i as u32);
         }
     }
@@ -196,6 +203,21 @@ mod tests {
             process_layer(&mut l, 0, 0, 4, &[], &mut acc, &mut out, &mut fired);
             assert_eq!(l.adapt[0], 0, "adapt must stay 0 when adapt_bump is 0");
         }
+    }
+
+    #[test]
+    fn eligibility_accumulates_pre_and_post() {
+        let mut l = low_layer(4, 1, 2, vec![TopologyLevel { level: 1, radius: 0, count: 1 }]);
+        for c in l.cooldown.iter_mut() {
+            *c = 0;
+        }
+        l.potential[0] = 1; // at threshold 1 -> within the ψ band AND fires
+        let mut acc = vec![0i32; 16];
+        let mut out = groups_for(&l);
+        let mut fired = Vec::new();
+        process_layer(&mut l, 0, 0, 4, &[], &mut acc, &mut out, &mut fired);
+        assert_eq!(l.elig_pre[0], 1, "a spike bumps the pre-trace");
+        assert!(l.elig_post[0] >= 1, "near-threshold bumps the post pseudo-derivative");
     }
 
     #[test]

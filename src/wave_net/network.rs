@@ -114,6 +114,8 @@ impl Network {
             g.potential.iter_mut().for_each(|p| *p = 0);
             g.cooldown.iter_mut().for_each(|c| *c = 0);
             g.adapt.iter_mut().for_each(|a| *a = 0);
+            g.elig_pre.iter_mut().for_each(|e| *e = 0);
+            g.elig_post.iter_mut().for_each(|e| *e = 0);
             g.inbox.clear();
             g.outbox.clear();
         }

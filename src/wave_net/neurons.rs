@@ -43,6 +43,8 @@ pub struct Layer {
     pub total_slots: usize,   // Σ topology counts — the stride for out_weights[local·total_slots + slot]
     pub out_weights: Vec<i8>, // stored plastic weight per (source local, slot); addresses stay procedural
     pub out_shadow: Vec<f32>, // higher-precision training accumulator, quantised into out_weights
+    pub elig_pre: Vec<i32>,   // e-prop presynaptic trace: this neuron's spike count this trial
+    pub elig_post: Vec<i32>,  // e-prop postsynaptic pseudo-derivative accumulated this trial
 }
 
 impl Layer {
@@ -90,6 +92,8 @@ impl Layer {
             total_slots,
             out_weights,
             out_shadow,
+            elig_pre: vec![0; ls],
+            elig_post: vec![0; ls],
         }
     }
 
