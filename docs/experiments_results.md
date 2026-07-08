@@ -554,3 +554,39 @@ all seeds** (the class is linearly present across the layers) — the classic LS
 feed-forward layers, not just the last); int8 readout + weight sharing (conv kernels / hashing trick) for
 sub-linear memory; a task that *needs* reservoir computation (so hidden training must beat a full-reservoir
 readout, which here already saturates).
+
+## Recurrence attempt — an honest null (and a finding about ALIF vs the leak)
+
+Enabled trainable `level 0` lateral weights + a temporal e-prop eligibility
+(`e_ij = Σ_t pre_trace_i(t)·fired_j(t)`, computed from recorded per-wave spikes) and tested on **temporal
+XOR** (present `A` → delay → present `B`, label `A XOR B`).
+
+**Finding 1 — ALIF adaptation solves temporal XOR feed-forward.** With adaptation on, a *feed-forward* net
+solves it at every delay tested (997 / 965 / 882 at delay 4 / 20 / 40). Adaptation is a powerful per-neuron
+memory; it holds `A` and supplies the nonlinearity XOR needs. So the task only tests recurrence if we strip
+adaptation.
+
+**Finding 2 — the trained recurrence's memory horizon ≈ the membrane-leak horizon, so it doesn't beat FF.**
+With **LIF** (`adapt_bump = 0`):
+
+| delay | FF (rec off) | + level-0 recurrence |
+|---|---|---|
+| 12 | **835** (leak already holds ~12 waves) | 732 (no help — worse) |
+| 20 | 455–552 (**~chance**) | 475–595 (**~chance**) |
+
+There is **no delay where FF fails and recurrence succeeds**: at short delays the LIF membrane leak already
+gives the feed-forward net ~12 waves of memory (so FF wins), and at delay 20 — where FF is at chance — the
+level-0 recurrence **can't sustain `A` across the silent gap** either (activity dies; a stronger recurrent
+init `∈{3,6,10}` doesn't rescue it — it saturates). Tuned across `delay`, `rec_count`, `rec_radius`,
+`rec_tau`, `hidden_lr`, `rec_init`.
+
+**Reading.** The **floored leak** — the fix that gave the engine a *finite* membrane memory (killing the
+infinite-memory bug) — now also **caps how long recurrence can hold a memory**: trained level-0 recurrence
+holds ~as long as the leak, not longer. So on this substrate, level-0 lateral recurrence with a crude
+spike-timing pseudo-derivative adds no net memory over the leak. Honest null.
+
+**What would move it (deferred):** a proper pseudo-derivative `ψ` (sub-threshold, not just spikes) so credit
+flows during silent gaps; `level −1` backward recurrence; a slower/finer leak on the recurrent layer (the
+fixed-point-potential upgrade) so recurrent memory can outlast the membrane; or surrogate-gradient BPTT for
+true temporal credit. The reliable results stand: feed-forward e-prop learns robustly, and **ALIF
+adaptation** is itself a strong, already-working temporal memory.
