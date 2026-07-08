@@ -1,7 +1,8 @@
 //! `wave` — one layer's per-wave step: integrate (drain inbox) → inject → decide →
-//! generate outgoing synapses → leak. Touches only this layer; the Network routes the
-//! generated synapses into other layers' inboxes for the next wave. The only clamp is the
-//! `i16` narrowing in drain — pure overflow protection; firing and leak bound the potential.
+//! generate outgoing synapses → leak, then decay adaptation. Touches only this layer; the
+//! Network routes the generated synapses into other layers' inboxes for the next wave. Firing
+//! uses the ALIF effective threshold `threshold + adapt` (computed in i32); a fire bumps `adapt`
+//! (saturating, >= 0) and every neuron's `adapt` decays geometrically each wave, like the leak.
 
 use crate::wave_net::neurons::Layer;
 use crate::wave_net::synapse::{generate_into, SynapseGroup};
@@ -43,12 +44,14 @@ pub fn process_layer(
         layer.cooldown[a as usize] = 0;
     }
 
-    // 4. decide
+    // 4. decide (ALIF effective threshold = baseline + adapt, in i32; fire bumps adapt)
     fired.clear();
     for i in 0..ls {
-        if layer.cooldown[i] == 0 && layer.potential[i] >= layer.threshold[i] {
+        let eff = layer.threshold[i] as i32 + layer.adapt[i] as i32;
+        if layer.cooldown[i] == 0 && (layer.potential[i] as i32) >= eff {
             layer.potential[i] = 0;
             layer.cooldown[i] = layer.cooldown_base;
+            layer.adapt[i] = (layer.adapt[i] as i32 + layer.adapt_bump as i32).clamp(0, i16::MAX as i32) as i16;
             fired.push(i as u32);
         }
     }
@@ -72,6 +75,12 @@ pub fn process_layer(
     for p in layer.potential.iter_mut() {
         let v = *p;
         *p = v - (v >> la) - (v >> lb);
+    }
+
+    // 7. decay adaptation toward rest (geometric, like the potential leak)
+    let d = layer.adapt_decay;
+    for a in layer.adapt.iter_mut() {
+        *a -= *a >> d;
     }
 }
 
@@ -103,6 +112,72 @@ mod tests {
 
     fn groups_for(l: &Layer) -> Vec<SynapseGroup> {
         l.topology.iter().map(|e| SynapseGroup { level: e.level, synapses: Vec::new() }).collect()
+    }
+
+    #[test]
+    fn fire_bumps_adaptation() {
+        let mut l = low_layer(4, 3, 2, vec![TopologyLevel { level: 1, radius: 0, count: 1 }]);
+        l.adapt_bump = 8;
+        l.adapt_decay = 7; // decay of 8 is 8>>7 == 0, so the bump is observable this wave
+        for _ in 0..3 {
+            l.inbox.push(Synapse { target: 0, inhibitory: false });
+        }
+        let mut acc = vec![0i32; 16];
+        let mut out = groups_for(&l);
+        let mut fired = Vec::new();
+        process_layer(&mut l, 0, 0, 4, &[], &mut acc, &mut out, &mut fired);
+        assert_eq!(fired, vec![0]);
+        assert_eq!(l.adapt[0], 8, "fire should bump adapt by adapt_bump");
+    }
+
+    #[test]
+    fn adaptation_decays_each_wave() {
+        let mut l = low_layer(1, 20_000, 2, vec![]); // threshold high -> no firing
+        l.adapt_decay = 3;
+        l.adapt[0] = 100;
+        let mut acc = vec![0i32; 1];
+        let mut out: Vec<SynapseGroup> = Vec::new();
+        let mut fired = Vec::new();
+        process_layer(&mut l, 0, 0, 1, &[], &mut acc, &mut out, &mut fired);
+        // 100 - (100 >> 3) = 100 - 12 = 88
+        assert_eq!(l.adapt[0], 88);
+        assert!(fired.is_empty());
+    }
+
+    #[test]
+    fn high_adaptation_blocks_firing() {
+        // potential clears the baseline but not baseline + adapt.
+        let drive = |adapt0: i16| {
+            let mut l = low_layer(1, 5, 2, vec![]);
+            l.adapt[0] = adapt0;
+            for _ in 0..10 {
+                l.inbox.push(Synapse { target: 0, inhibitory: false });
+            }
+            let mut acc = vec![0i32; 1];
+            let mut out: Vec<SynapseGroup> = Vec::new();
+            let mut fired = Vec::new();
+            process_layer(&mut l, 0, 0, 1, &[], &mut acc, &mut out, &mut fired);
+            fired
+        };
+        assert_eq!(drive(0), vec![0], "baseline 5, potential 10 -> fires with no adaptation");
+        assert!(drive(100).is_empty(), "effective threshold 105 blocks potential 10");
+    }
+
+    #[test]
+    fn bump_zero_leaves_adaptation_at_rest() {
+        let mut l = low_layer(4, 3, 1, vec![TopologyLevel { level: 1, radius: 0, count: 1 }]);
+        l.adapt_bump = 0; // plain LIF
+        let mut acc = vec![0i32; 16];
+        let mut out = groups_for(&l);
+        let mut fired = Vec::new();
+        for _ in 0..3 {
+            l.inbox.clear();
+            for _ in 0..3 {
+                l.inbox.push(Synapse { target: 0, inhibitory: false });
+            }
+            process_layer(&mut l, 0, 0, 4, &[], &mut acc, &mut out, &mut fired);
+            assert_eq!(l.adapt[0], 0, "adapt must stay 0 when adapt_bump is 0");
+        }
     }
 
     #[test]
