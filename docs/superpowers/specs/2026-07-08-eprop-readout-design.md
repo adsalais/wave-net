@@ -96,9 +96,27 @@ Reuse V1's demo but add a readout layer: `size 8`, computational layers `3` + 1 
 `present/delay/read` as V1, dense `level+1` count 16, `trials ≈ 2400`, `block 200`, `lr` tuned (the graded
 potential margin has a different scale than V1's spike margin, so `lr` and `reward_rate` re-tune).
 
-## Deferred (unchanged roadmap)
+## Revision (post-implementation) — engine works, global-reward learning is a null
 
-- **Potential-based *internal* eligibility (V2b):** the readout fixes output silence but internal
-  silent-neuron recruitment still needs sub-threshold-potential eligibility.
-- **High-drive float-free trainer**, broadcast-error alignment, per-wave/TD credit, `K > 2`, training
-  adaptation params — as in the V1 spec's roadmap.
+**The readout engine change works** (`readout_layer_integrates_and_never_fires` passes; regression clean).
+**The learning does not** with a global scalar reward: readout accuracy stays at chance (~490‰) versus a
+frozen control at ~510‰ at *every* `lr`, while V1's spiking-trainable-output path learns to ~770‰. The
+headline test was reframed to `eprop_readout_global_reward_does_not_learn`, which documents the null.
+
+**Why (the informative part).** A non-spiking readout has no trainable output, so learning is entirely
+*internal* (feedback-alignment). The fixed ±1 readout projection doesn't separate the classes, so the
+class-score margin `R` is class-uninformative → `(R − R̄) → 0` → no threshold updates track the class. **A
+global *scalar* reward is too weak to shape the reservoir to a fixed projection.** This also explains why
+V1 learned: its output populations were spiking with *trainable* thresholds, so the scalar reward could
+directly shape the output layer.
+
+**Conclusion → V2b.** The potential readout must pair with **per-output broadcast-error credit**, not a
+scalar reward. The readout engine layer is now committed infrastructure for that. (So V2b = readout +
+broadcast-error alignment, not the "potential-based internal eligibility" originally penciled as V2b.)
+
+## Deferred (updated roadmap)
+
+- **V2b = readout + broadcast-error alignment:** per-output error `(target − score)ᵢ` fed to internal
+  neurons via fixed random feedback weights — the credit signal a scalar reward can't provide.
+- Potential-based *internal* eligibility (wake silent neurons), high-drive float-free trainer, per-wave/TD
+  credit, `K > 2`, training adaptation params — later rungs.

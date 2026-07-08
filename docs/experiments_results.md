@@ -177,6 +177,16 @@ block-to-block (crude credit + threshold random-walk), so the metric is the late
 - **The `f64` shadow is essential.** `lr` an order of magnitude below 0.3 never moved the integer
   thresholds at all — tiny updates round to 0 without the fractional accumulator.
 
+**V2a — non-spiking potential readout: engine works, global-reward learning is a null.** A dedicated
+non-spiking *readout layer* (drain-only integrator, `Layer.readout`; the L0/L_top symmetry) was added to
+the engine and works. But learning with a **global scalar reward** fails: readout accuracy sits at chance
+(~490‰ vs frozen ~510‰) at *every* `lr`, while V1's spiking-trainable-output path learns (~770‰). Reason: a
+non-spiking readout has no trainable output, so learning is entirely *internal* (feedback-alignment); the
+fixed ±1 readout projection doesn't separate classes, so `(R − R̄) → 0` — a scalar reward is too weak to
+shape the reservoir to a fixed projection. **This pins the boundary of the crude rule: global reward learns
+only when the output itself is trainable.** The readout must pair with **per-output broadcast-error credit**
+(V2b), for which the readout layer is now infrastructure.
+
 ## Engine finding along the way — the floored leak
 
 Store-recall *found a real substrate bug*. The potential leak `p -= (p>>a)+(p>>b)` is `0` for `0 < p <
