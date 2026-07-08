@@ -332,6 +332,38 @@ trial length**; and note that **more depth costs separation**, so the fix must a
 class signal up the stack (e.g. skip/residual-style projection or per-layer separation targets), not just
 add layers.
 
+**Width × depth interact — width buys ~one extra layer of separation.** Ceiling over `size × layers`:
+
+| size\L | 2 | 3 | 4 | 5 | 6 |
+|---|---|---|---|---|---|
+| 8 | 1000 | 728 | 628 | 628 | 628 |
+| 16 | 1000 | 628 | 628 | 628 | 628 |
+| 32 | 1000 | 680 | 680 | 680 | 680 |
+| 64 | 1000 | **1000** | 680 | 680 | 680 |
+
+`size=64` holds *full* separation through depth 3 (where `size=8` has already decayed to 728), and raises
+the deep-net floor (680 vs 628). But every width plateaus by depth 4–5 — **wider carries the class signal
+about one layer deeper, not arbitrarily.** So a deep network needs *proportionally wider* layers to keep
+separating, and even then depth eventually wins.
+
+**Calibration target rate — 10% is at the knee (and higher is unreachable without more drive).** Ceiling +
+learnability vs `calib.target_permille`:
+
+| target | ceiling | V1 | V2b |
+|---|---|---|---|
+| 2% | 525 | 556 | 494 |
+| 5% | 525 | 514 | 666 |
+| **10%** | 750 | 772 | 621 |
+| 20% | 750 | 772 | 621 |
+| 40% | 750 | 772 | 621 |
+
+Below ~10% the code is too sparse and separation **collapses to chance**. At ≥10% the results are
+**bit-identical** — the reservoir physically can't fire faster than ~10–15% at this drive, so calibration
+bottoms out at threshold = 1 and a higher target is a no-op. **10% sits right at the productive edge:**
+lower starves it, higher is unreachable *unless drive (density/leak) is increased first*. This ties the
+firing-rate target to the density lever — to exploit denser codes the fix must raise drive, not just the
+target.
+
 ## Engine finding along the way — the floored leak
 
 Store-recall *found a real substrate bug*. The potential leak `p -= (p>>a)+(p>>b)` is `0` for `0 < p <
