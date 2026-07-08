@@ -632,3 +632,19 @@ seed can still fail (the non-monotonic 485/902/485 is just which seed is unlucki
 makes depth **usable** (vs single-layer's total failure) but **not arbitrarily reliable** — depth 4 is the
 clean sweet spot; deeper, the fixed random reservoir's seed lottery + noisy DFA feedback cap it. Pushing
 deeper needs a better reservoir (recurrence/criticality) and/or less-noisy credit (symmetric feedback / BPTT).
+
+**Does width fix the depth degradation? Yes — for multi-layer.** Worst-seed held-out, size × depth:
+
+| size (N/layer) | depth 4 single / multi | depth 5 | depth 6 |
+|---|---|---|---|
+| 8 (64) | 485 / 1000 | 485 / **485** | 485 / 902 |
+| 16 (256) | 485 / 1000 | 485 / **1000** | 485 / **1000** |
+| 32 (1024) | 485 / 1000 | 485 / 1000 | — |
+
+**Width fixes multi-layer's deep reliability** (size 16 → clean 1000 through depth 6, hard seed included) —
+the "brutal" size-8 degradation was a **capacity shortage**: 64 neurons/layer is too few to reliably train
+the *hard* seed's deep layers; 256 is enough. **But width does nothing for single-layer** (chance at every
+size/depth ≥ 4): its problem is *untrained* intermediate layers eroding the signal — no width fixes that;
+only *training* them does. So the levers **compound**: depth erodes → multi-layer training preserves →
+but that training needs enough **width** to succeed on hard seeds. **Wide + multi-layer = reliable deep
+learning**; either alone fails.
