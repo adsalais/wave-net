@@ -21,9 +21,11 @@ whether the cleaner signal outweighs losing the trainable output layer.
 - **`network.rs`:** add `Network::new_with_readout(config)` — constructs like `new` (which already forces
   L0 to a transducer) and additionally flags the **last** layer `readout = true`. Refactor `new` to
   delegate to a private builder taking a `readout_last: bool` so there is no duplication.
-- **`wave.rs`:** in `process_layer`, after the inbox drain (step 2), if `layer.readout`: clear `fired`,
-  apply the potential **leak**, and return — skipping inject/decide/fire/generate/adapt. The readout is a
-  pure **leaky integrator sink**: its potential is the integral of its ±1 input, never reset by firing.
+- **`wave.rs`:** in `process_layer`, after the inbox drain (step 2), if `layer.readout`: clear `fired` and
+  **return** — skipping inject/decide/fire/generate/**leak**/adapt. The readout is a **drain-only perfect
+  integrator sink** (per trial): its potential is the clean cumulative sum of its ±1 input, never reset by
+  firing. *(Not leaky: our floored leak would eat weak ±1 input to ~0; reset-per-trial keeps the
+  accumulation bounded, and the drain's i16 clamp is the overflow guard.)*
 - `LayerConfig` / `Config` structs are **untouched** — no struct-literal churn across the codebase. TDD the
   readout mode as its own engine unit.
 
@@ -33,7 +35,8 @@ Determinism and integer purity are preserved (the readout is drain + leak, both 
 
 Stack: **L0 transducer** + computational layers `1..L−1` (trained) + **readout layer `L`** (non-spiking).
 The computational top layer projects `level+1` into the readout (fixed ±1); the readout layer has empty
-outgoing topology (a sink). Built with `new_with_readout`.
+outgoing topology (a sink), and integrates its input over the trial (reset per trial). Built with
+`new_with_readout`.
 
 ## Output — reuse the existing accessor
 
