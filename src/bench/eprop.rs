@@ -52,9 +52,10 @@ pub struct EpropConfig {
     pub readout: bool,     // V2a: append a non-spiking readout layer and score from its potentials
     pub broadcast: bool,   // V2b: per-output broadcast-error credit instead of global reward
     pub softmax_temp: f64, // temperature for the readout-score softmax
-    pub cooldown_base: u8, // refractory period of the computational layers
-    pub up_count: u32,     // level+1 synapse count (fan-out density)
-    pub up_radius: u32,    // level+1 synapse radius
+    pub cooldown_base: u8,    // refractory period of the computational layers
+    pub up_count: u32,        // level+1 synapse count (fan-out density)
+    pub up_radius: u32,       // level+1 synapse radius
+    pub threshold_jitter: u16, // spread of the initial per-neuron threshold
 }
 
 impl EpropConfig {
@@ -92,6 +93,7 @@ impl EpropConfig {
             cooldown_base: 2,
             up_count: 16,
             up_radius: 3,
+            threshold_jitter: 32,
         }
     }
 
@@ -105,7 +107,7 @@ impl EpropConfig {
             leak: (3, 5),
             cooldown_base: self.cooldown_base,
             inhibitor_ratio: 0,
-            threshold_jitter: 32,
+            threshold_jitter: self.threshold_jitter,
             baseline_init: self.baseline_init,
             adapt_bump: self.adapt_bump,
             adapt_decay: self.adapt_decay,

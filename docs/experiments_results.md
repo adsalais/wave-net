@@ -285,6 +285,53 @@ the coupling, likely co-tuning drive/adaptation) to maximise the top-layer separ
 stops depending on landing on the ridge by hand. For V2b specifically, also enforce depth ≥ 2 computational
 layers.
 
+### Deeper regime scans (separation ceiling as a cheap learnability proxy)
+
+> Caveat: the ceiling is a single-seed held-out estimate over ~70–100 test trials, so it carries **±~100‰
+> noise** (the *same* config reads 490 at 200 trials but 628 at 140). Read the **trends**, not single cells.
+
+**adapt_bump saturates with trial length — your intuition, confirmed.** Ceiling over `adapt_bump × read_waves`:
+
+| bump\read | 3 | 6 | 12 | 24 |
+|---|---|---|---|---|
+| 20 | 628 | 728 | 757 | 700 |
+| **40** | 628 | 628 | 628 | 628 |
+| **80** | 628 | 628 | 628 | 628 |
+
+`bump=40` and `bump=80` are **identical (628) at every read length** — beyond a critical bump, adaptation is
+inert: one fire already maxes its within-trial effect (the effective threshold jumps past reach), so a
+larger bump, or a longer trial, changes nothing. The mechanism: adaptation accumulates `≈ N·bump` over `N`
+fires, and once one fire silences the neuron for the rest of the (~16-wave) trial, extra bump is wasted.
+**So `adapt_bump` should be read relative to trial length, and capped ~one-fire-to-silence.**
+
+**Depth: the class signal *decays* upward — deeper does not help.** Ceiling vs `layers` (rows) × `up_count`:
+
+| L\cnt | 8 | 16 | 24 | 32 |
+|---|---|---|---|---|
+| **2** | 1000 | 1000 | 971 | 1000 |
+| 3 | 628 | 728 | 414 | 614 |
+| 4–6 | ~628 | ~628 | ~628 | ~400–628 |
+
+One computational layer (`layers=2`) separates **perfectly** (the top layer *is* the cue); every added
+layer *loses* separation, flattening at ~628 by depth 3 and **not recovering at 5–6 layers**. The class
+signal attenuates through the feed-forward stack. (This is why V1 — reading the top layer directly — is fine
+shallow, while V2b needs depth for broadcast but pays a separation cost for it.)
+
+**Width helps; initial threshold does not.** Wider layers separate better — at depth 3, `size=64` (64²
+neurons) reaches **1000** vs `size=8`'s ~728 (more neurons → higher-dimensional, more separable top-layer
+code); depth still erodes it (`size=64, layers=5 → 680`). But sweeping `baseline_init ∈ {1..256}` and
+`threshold_jitter ∈ {0..512}` against `up_count` left the ceiling **essentially flat** — **calibration
+overrides the initial thresholds** (it tunes them to the firing-rate target regardless of where they start),
+so the initial-threshold-vs-synapse-count coupling is **decoupled by calibration**, not a usable lever. The
+residual density structure (`up_count=16` robustly good, `24` a persistent bad resonance) is **structural**,
+independent of the initial threshold.
+
+**Net for the fix:** target **separation** (thresholds are calibration's job, so tune *drive/adaptation/
+density*, not init); **scale width** to buy separation headroom; keep **`adapt_bump` bounded relative to
+trial length**; and note that **more depth costs separation**, so the fix must actively *preserve* the
+class signal up the stack (e.g. skip/residual-style projection or per-layer separation targets), not just
+add layers.
+
 ## Engine finding along the way — the floored leak
 
 Store-recall *found a real substrate bug*. The potential leak `p -= (p>>a)+(p>>b)` is `0` for `0 < p <
