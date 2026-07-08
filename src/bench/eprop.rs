@@ -49,6 +49,7 @@ pub struct EpropConfig {
     pub reward_rate: f64, // EMA rate for R̄
     pub calib: CalibrateParams,
     pub calib_fraction_q16: u32,
+    pub readout: bool, // V2a: append a non-spiking readout layer and score from its potentials
 }
 
 impl EpropConfig {
@@ -80,7 +81,29 @@ impl EpropConfig {
                 ..CalibrateParams::default()
             },
             calib_fraction_q16: 20000,
+            readout: false,
         }
+    }
+
+    /// V2a engine config: computational layers + an appended non-spiking readout layer (empty
+    /// topology sink). Build the resulting `Config` with `Network::new_with_readout`.
+    fn engine_config_readout(&self) -> Config {
+        use crate::wave_net::config::LayerConfig;
+        use crate::wave_net::synapse::TopologyLevel;
+        let comp = LayerConfig {
+            topology: vec![TopologyLevel { level: 1, radius: 3, count: 16 }],
+            leak: (3, 5),
+            cooldown_base: 2,
+            inhibitor_ratio: 0,
+            threshold_jitter: 32,
+            baseline_init: self.baseline_init,
+            adapt_bump: self.adapt_bump,
+            adapt_decay: self.adapt_decay,
+        };
+        let readout = LayerConfig { topology: vec![], ..comp.clone() };
+        let mut layers = vec![comp; self.layers];
+        layers.push(readout);
+        Config { seed: self.seed, size: self.size, layers }
     }
 
     fn engine_config(&self) -> Config {
@@ -156,10 +179,23 @@ fn pick_class(seed: u64, t: usize, k: usize) -> usize {
     (mix(key(seed, t as u32, 0, 0, 41)) % k as u64) as usize
 }
 
+/// Class scores from a readout layer's integrated potentials: K contiguous population sums.
+fn readout_scores(net: &Network, readout_z: usize, k: usize) -> Vec<i64> {
+    let ls = (net.size() * net.size()) as usize;
+    let group = (ls / k).max(1);
+    (0..k)
+        .map(|c| ((c * group)..((c + 1) * group).min(ls)).map(|i| net.potential(readout_z, i) as i64).sum())
+        .collect()
+}
+
 /// Train per-neuron thresholds by global-reward × eligibility. `lr = 0.0` freezes the thresholds
 /// (the control). Returns block-windowed accuracy over training.
 pub fn train(cfg: &EpropConfig, lr: f64) -> LearnCurve {
-    let mut net = Network::new(cfg.engine_config());
+    let mut net = if cfg.readout {
+        Network::new_with_readout(cfg.engine_config_readout())
+    } else {
+        Network::new(cfg.engine_config())
+    };
     let input = random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16);
     net.calibrate(&cfg.calib, &input);
 
@@ -170,11 +206,16 @@ pub fn train(cfg: &EpropConfig, lr: f64) -> LearnCurve {
     for t in 0..cfg.trials {
         let class = pick_class(cfg.seed, t, cfg.k);
         let elig = trial_eligibility(&mut net, cfg, class, t);
-        // Population output coding: split the top layer into K contiguous groups; class score c is the
-        // total spikes in group c. (Two single output neurons are too often silent to carry a signal.)
-        let top = &elig[elig.len() - 1];
-        let group = (top.len() / cfg.k).max(1);
-        let outs: Vec<u32> = (0..cfg.k).map(|c| top[c * group..(c + 1) * group].iter().copied().sum()).collect();
+        // Population output coding: split the output surface into K contiguous groups; class score c is
+        // the group total. V1 sums top-layer spike counts; V2a sums the readout layer's potentials.
+        // (Single output neurons are too often silent to carry a signal.)
+        let outs: Vec<i64> = if cfg.readout {
+            readout_scores(&net, net.layer_count() - 1, cfg.k)
+        } else {
+            let top = &elig[elig.len() - 1];
+            let group = (top.len() / cfg.k).max(1);
+            (0..cfg.k).map(|c| top[c * group..(c + 1) * group].iter().map(|&x| x as i64).sum()).collect()
+        };
         let pred = (0..cfg.k).max_by_key(|&i| outs[i]).unwrap();
         outcomes.push(pred == class);
 
@@ -264,6 +305,36 @@ mod tests {
     fn late_mean(curve: &[u64]) -> u64 {
         let h = curve.len() / 2;
         curve[h..].iter().sum::<u64>() / (curve.len() - h).max(1) as u64
+    }
+
+    #[test]
+    fn eprop_readout_is_deterministic() {
+        let mut cfg = EpropConfig::demo();
+        cfg.readout = true;
+        let a = train(&cfg, 0.3);
+        let b = train(&cfg, 0.3);
+        assert_eq!(a.accuracy_permille, b.accuracy_permille);
+    }
+
+    // Finding: with a non-spiking readout (no trainable output layer) and a GLOBAL scalar reward,
+    // learning is all-internal (feedback-alignment). The fixed ±1 readout projection does not separate
+    // the classes, so (R − R̄) → 0 and no learning happens — at any lr. (V1's spiking, *trainable* output
+    // populations are what let global reward work; the readout needs a richer per-output error signal,
+    // i.e. broadcast-error alignment — V2b.) The readout *engine* works (see wave.rs); the *learning*
+    // does not, and this documents that null.
+    #[test]
+    fn eprop_readout_global_reward_does_not_learn() {
+        let mut cfg = EpropConfig::demo();
+        cfg.readout = true;
+        let learn = train(&cfg, 0.3);
+        let frozen = train(&cfg, 0.0);
+        eprintln!("readout learn  {:?}", learn.accuracy_permille);
+        eprintln!("readout frozen {:?}", frozen.accuracy_permille);
+        let ll = late_mean(&learn.accuracy_permille);
+        let lf = late_mean(&frozen.accuracy_permille);
+        let chance = 1000 / cfg.k as u64;
+        assert!(ll < chance + 80, "global-reward readout stays near chance (no learning): {ll}");
+        assert!((ll as i64 - lf as i64).abs() < 120, "readout learning ≈ frozen — no gap: {ll} vs {lf}");
     }
 
     #[test]
