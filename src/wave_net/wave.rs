@@ -38,8 +38,11 @@ pub fn process_layer(
         layer.potential[i] = v.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
     }
 
-    // 3. inject forced-fire input (L0 only; other layers get &[]). i16::MAX is >= every
-    // possible threshold, so injected neurons always fire this wave.
+    // 3. inject forced-fire input (L0 only; other layers get &[]). L0 is the input transducer
+    // (baseline i16::MAX, no adaptation — forced in Network::new), so its effective threshold is
+    // exactly i16::MAX and setting potential to i16::MAX fires precisely the injected neurons.
+    // (In general the ALIF effective threshold `baseline + adapt` can exceed i16::MAX, which is
+    // why the transducer must not adapt — otherwise a saturated neuron could swallow an input.)
     for &a in input {
         layer.potential[a as usize] = i16::MAX;
         layer.cooldown[a as usize] = 0;
@@ -120,7 +123,7 @@ mod tests {
     fn fire_bumps_adaptation() {
         let mut l = low_layer(4, 3, 2, vec![TopologyLevel { level: 1, radius: 0, count: 1 }]);
         l.adapt_bump = 8;
-        l.adapt_decay = 15; // Q8 bump is 8<<8; decay (>>15) is 0 at this magnitude, so it's observable
+        l.adapt_decay = 5;
         for _ in 0..3 {
             l.inbox.push(Synapse { target: 0, inhibitory: false });
         }
@@ -129,7 +132,9 @@ mod tests {
         let mut fired = Vec::new();
         process_layer(&mut l, 0, 0, 4, &[], &mut acc, &mut out, &mut fired);
         assert_eq!(fired, vec![0]);
-        assert_eq!(l.adapt[0], 8 << ADAPT_SHIFT, "fire should bump adapt by adapt_bump (Q8)");
+        // a fire adds bump<<SHIFT in Q-fixed-point, then step 7 decays it once
+        let bumped = 8i32 << ADAPT_SHIFT;
+        assert_eq!(l.adapt[0], bumped - (bumped >> 5), "fire bumps adapt by bump<<SHIFT, then decays once");
     }
 
     #[test]

@@ -4,16 +4,20 @@
 //! neuron also carries `adapt`, a slow variable bumped on fire and decayed each wave; the
 //! effective firing threshold is `threshold + (adapt >> ADAPT_SHIFT)`.
 //!
-//! `adapt` is stored in **Q8 fixed point** (i32, scaled by `2^ADAPT_SHIFT`) so its geometric
-//! decay `adapt -= adapt >> adapt_decay` stays exponential with time constant ≈ `2^adapt_decay`
-//! waves *independent of magnitude* — the fixed-point scale pushes the integer right-shift dead
-//! zone below ~1/256 of a threshold unit, so adaptation always relaxes (no ratchet / lock-out).
+//! `adapt` is stored in **fixed point** (i32, scaled by `2^ADAPT_SHIFT`) so its geometric decay
+//! `adapt -= adapt >> adapt_decay` stays exponential with time constant ≈ `2^adapt_decay` waves
+//! *independent of magnitude* — the fixed-point scale pushes the integer right-shift dead zone below
+//! `1 / 2^ADAPT_SHIFT` of a threshold unit, so adaptation always relaxes (no ratchet / lock-out).
+//! This holds only while `adapt_decay <= ADAPT_SHIFT` (beyond that the dead zone returns at the real
+//! scale); `Config::validate` enforces it.
 
 use crate::wave_net::config::LayerConfig;
 use crate::wave_net::synapse::{key, map_range, mix, Synapse, TopologyLevel, P_THRESHOLD};
 
 /// Fixed-point scale for `adapt`: it holds the effective threshold contribution × `2^ADAPT_SHIFT`.
-pub const ADAPT_SHIFT: u32 = 8;
+/// Bounded by the i32 overflow limit on the bump-add (`2·ADAPT_MAX = i16::MAX << (SHIFT+1)` must fit
+/// i32, i.e. `SHIFT <= 14`); 12 keeps ~8× margin and allows `adapt_decay` up to 12 (τ ≈ 4096 waves).
+pub const ADAPT_SHIFT: u32 = 12;
 /// Ceiling for `adapt`, so the effective contribution never exceeds `i16::MAX` (overflow guard).
 pub const ADAPT_MAX: i32 = (i16::MAX as i32) << ADAPT_SHIFT;
 

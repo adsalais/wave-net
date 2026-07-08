@@ -50,6 +50,11 @@ a local negative-feedback controller that settles the firing rate (spike-frequen
 ALIF mechanism). Input is a sparse `Vec<u32>` of L0 local addresses (spike injection), not graded
 current. `adapt_bump = 0` recovers plain LIF dynamics.
 
+**L0 is the input transducer.** `Network::new` forces layer 0 to baseline `i16::MAX` with no
+adaptation, so it fires *only* on injection and never self-adapts — input encoding stays decoupled
+from adaptation, and injected spikes always fire. The boots-hot ALIF dynamics apply to the
+computational layers `1..L` (which calibration tunes); L0 is left as-is.
+
 ## Calibration
 
 `Network::calibrate(params, input)` tunes per-layer **baselines** until each layer fires near a target

@@ -25,7 +25,15 @@ impl Network {
         let l = config.layers.len();
         let mut layers = Vec::with_capacity(l);
         for (z, lc) in config.layers.iter().enumerate() {
-            let layer = Layer::new(lc, config.seed, z as u32, size);
+            let mut layer = Layer::new(lc, config.seed, z as u32, size);
+            if z == 0 {
+                // L0 is the input transducer: forced to fire only on injection (baseline i16::MAX)
+                // and to never adapt (adapt_bump 0). This keeps input encoding decoupled from
+                // adaptation and guarantees injected spikes always fire (effective threshold stays
+                // == baseline <= i16::MAX). ALIF dynamics apply to the computational layers 1..L.
+                layer.threshold.iter_mut().for_each(|t| *t = i16::MAX);
+                layer.adapt_bump = 0;
+            }
             layers.push(Mutex::new(layer));
         }
         Network {
@@ -208,11 +216,12 @@ mod tests {
     fn adaptation_accessor_and_reset() {
         let net = Network::new(alif_two_layer());
         let all_l0 = (0..16u32).collect::<Vec<u32>>();
-        for _ in 0..3 {
-            net.wave(&all_l0); // injection forces L0 to fire -> bumps L0 adapt
+        for _ in 0..5 {
+            net.wave(&all_l0); // injection drives L0 (transducer, no adapt) -> L1 fires and adapts
         }
-        let any_nonzero = (0..16).any(|i| net.adaptation(0, i) > 0);
-        assert!(any_nonzero, "L0 adaptation should be >0 after repeated firing");
+        let any_nonzero = (0..16).any(|i| net.adaptation(1, i) > 0);
+        assert!(any_nonzero, "L1 adaptation should be >0 after firing");
+        assert!((0..16).all(|i| net.adaptation(0, i) == 0), "L0 transducer must never adapt");
         net.reset_state();
         for z in 0..net.layer_count() {
             for i in 0..16 {

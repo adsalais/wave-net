@@ -67,8 +67,11 @@ impl Config {
             if lc.cooldown_base == 0 {
                 return Err(format!("layer {z}: cooldown_base must be >= 1"));
             }
-            if lc.adapt_decay == 0 {
-                return Err(format!("layer {z}: adapt_decay must be >= 1"));
+            if lc.adapt_decay == 0 || lc.adapt_decay as u32 > crate::wave_net::neurons::ADAPT_SHIFT {
+                return Err(format!(
+                    "layer {z}: adapt_decay must be in 1..={} (ADAPT_SHIFT; larger reintroduces the fixed-point dead zone)",
+                    crate::wave_net::neurons::ADAPT_SHIFT
+                ));
             }
         }
         Ok(())
@@ -103,6 +106,16 @@ mod tests {
         let mut c = Config::demo();
         c.layers[0].adapt_decay = 0;
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_adapt_decay_above_shift() {
+        use crate::wave_net::neurons::ADAPT_SHIFT;
+        let mut c = Config::demo();
+        c.layers[0].adapt_decay = (ADAPT_SHIFT + 1) as u8; // beyond the dead-zone-free range
+        assert!(c.validate().is_err());
+        c.layers[0].adapt_decay = ADAPT_SHIFT as u8; // exactly the ceiling is allowed
+        assert!(c.validate().is_ok());
     }
 
     #[test]

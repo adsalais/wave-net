@@ -237,3 +237,23 @@ accumulate toward threshold). Flooring the potential leak would make a lone `+1`
 gutting sub-threshold integration (and breaking `deferred_delivery_is_one_hop`). Potential also cannot
 lock out — firing resets it and negative potentials always relax toward 0. So: fixed-point exponential
 decay for `adapt`; `potential` leak unchanged.
+
+## Revision (post-review): L0 transducer, and the `ADAPT_SHIFT` guard
+
+Two issues surfaced in a critical review of the branch:
+
+**L0 is now an explicit transducer.** With low baselines, L0 (the input surface) could fire on
+recurrent drive rather than injection alone, and injected fires bumped its adaptation — coupling input
+history to input excitability. Worse, because the ALIF effective threshold `baseline + (adapt >>
+ADAPT_SHIFT)` can exceed `i16::MAX` while injection only sets `potential = i16::MAX`, a saturated L0
+neuron could *silently swallow an injected input spike*. Fix: `Network::new` forces layer 0 to baseline
+`i16::MAX` with `adapt_bump = 0`, so it fires only on injection, never adapts, and its effective
+threshold stays `== baseline <= i16::MAX` (injection always fires). The ALIF dynamics apply to layers
+`1..L`; calibration already skips L0. The stale `wave.rs` comment claiming `i16::MAX >= every possible
+threshold` is corrected.
+
+**The fixed-point fix has a bounded range, now guarded.** `ADAPT_SHIFT` gives dead-zone-free decay only
+for `adapt_decay <= ADAPT_SHIFT`; beyond that the dead zone returns at the real scale. `ADAPT_SHIFT` was
+raised from 8 to **12** (the i32 overflow bound is `SHIFT <= 14`, since worst-case `2·ADAPT_MAX =
+i16::MAX << (SHIFT+1)` must fit `i32`; 12 leaves ~8× margin and allows τ up to ~4096 waves), and
+`Config::validate` now rejects `adapt_decay == 0 || adapt_decay > ADAPT_SHIFT`.
