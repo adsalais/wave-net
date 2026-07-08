@@ -208,7 +208,9 @@ narrower — than expected, which directly scopes what an e-prop-style rule (Spe
   slow adaptation state and a probe converts it to a readable spike pattern.
 - **Memory Capacity (Spec 2):** **LIF wins** (~1.57 vs ~0.39). MC = *delayed linear echo* (reconstruct a
   specific past bit `u(t−k)`). LIF's fading spike echo does it; adaptation is a slow low-pass integrator
-  that can't pinpoint a past bit. Exposing the raw adaptation state to the readout did not help.
+  that can't pinpoint a past bit. Exposing the raw adaptation state to the readout did not help. Also
+  **robust across the same architecture sweep** — richer/inhibitory reservoirs raise LIF's MC (up to ~2.0)
+  while ALIF stays pinned at ~0.3–0.4, *widening* the gap.
 - **Temporal XOR (Spec 2b):** **LIF wins** (~86% at `τ=1`); **ALIF near chance**. And this survived an
   architecture sweep — width, depth, refractory, density, inhibition: XOR solvability varies a lot
   (sparsity/inhibition help; the dense all-excitatory topology the floored leak favors is *poor* for
