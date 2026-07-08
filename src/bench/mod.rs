@@ -5,3 +5,4 @@ pub mod linalg;
 pub mod memory_capacity;
 pub mod readout;
 pub mod store_recall;
+pub mod stream;

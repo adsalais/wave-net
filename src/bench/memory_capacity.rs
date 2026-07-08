@@ -2,25 +2,11 @@
 //! reservoir in bins of `B` waves (continuously, no reset); per-bin spike counts form the state
 //! `x(t)`, and a ridge readout reconstructs `u(t-k)` for each lag `k`. `MC = Σ_k r²_k`.
 
-use crate::bench::readout::{record_response, RidgeReadout};
+use crate::bench::readout::RidgeReadout;
+use crate::bench::stream::{self, StreamParams};
 use crate::wave_net::calibrate::{random_l0_input, CalibrateParams};
-use crate::wave_net::config::{Config, LayerConfig};
+use crate::wave_net::config::Config;
 use crate::wave_net::network::Network;
-use crate::wave_net::synapse::{key, mix, TopologyLevel};
-
-const P_BIT: u64 = 23; // input bit per timestep
-const P_STREAM: u64 = 29; // fixed L0 pattern injected on a "1" bit
-
-/// The i.i.d. input bit for timestep `t`.
-fn bit(bit_seed: u64, t: usize) -> bool {
-    (mix(key(bit_seed, t as u32, 0, 0, P_BIT)) & 1) == 1
-}
-
-/// The fixed L0 pattern injected whenever the bit is 1 (same every timestep).
-fn stream_pattern(seed: u64, size: u32, density_q16: u32) -> Vec<u32> {
-    let ls = size * size;
-    (0..ls).filter(|&s| ((mix(key(seed, s, 0, 0, P_STREAM)) & 0xFFFF) as u32) < density_q16).collect()
-}
 
 /// Configuration for the Memory Capacity experiment.
 #[derive(Clone, Debug)]
@@ -73,55 +59,22 @@ impl McConfig {
         }
     }
 
-    /// Build the engine config. `recurrent` adds level 0 / -1 coupling; feed-forward is level +1
-    /// only. Both use the dense drive the floored leak requires.
+    /// Build the engine config (delegates to the shared builder).
     pub fn engine_config(&self, adapt_bump: i16, recurrent: bool) -> Config {
-        let mut topology = vec![TopologyLevel { level: 1, radius: 3, count: 16 }];
-        if recurrent {
-            topology.push(TopologyLevel { level: 0, radius: 1, count: 3 });
-            topology.push(TopologyLevel { level: -1, radius: 1, count: 3 });
-        }
-        let layer = LayerConfig {
-            topology,
-            leak: (3, 5),
-            cooldown_base: 2,
-            inhibitor_ratio: 0,
-            threshold_jitter: 32,
-            baseline_init: self.baseline_init,
-            adapt_bump,
-            adapt_decay: self.adapt_decay,
-        };
-        Config { seed: self.seed, size: self.size, layers: vec![layer; self.layers] }
+        stream::engine_config(self.seed, self.size, self.layers, self.baseline_init, adapt_bump, self.adapt_decay, recurrent)
     }
-}
 
-/// Drive the continuous bit stream and collect per-bin state rows (per-neuron spike counts over the
-/// bin, layers 1..L, ++ a bias 1.0) and the bit sequence. Warmup bins advance the reservoir but are
-/// not collected. No reset between bins.
-///
-/// Note: we read *spike counts*, the standard reservoir readout. An earlier experiment also exposed
-/// the raw adaptation state to the readout; it did not help (it slightly hurt, via overfitting) —
-/// adaptation is a slow low-pass trace, not the delayed echo MC rewards. See the spec's revision.
-fn collect_states(net: &mut Network, cfg: &McConfig) -> (Vec<Vec<f64>>, Vec<f64>) {
-    let pattern = stream_pattern(cfg.seed, cfg.size, cfg.stream_density_q16);
-    for t in 0..cfg.warmup_bins {
-        let on = bit(cfg.bit_seed, t);
-        for _ in 0..cfg.bin_waves {
-            net.wave(if on { &pattern } else { &[] });
+    fn stream_params(&self) -> StreamParams {
+        StreamParams {
+            seed: self.seed,
+            size: self.size,
+            stream_density_q16: self.stream_density_q16,
+            bit_seed: self.bit_seed,
+            bin_waves: self.bin_waves,
+            warmup_bins: self.warmup_bins,
+            collect_bins: self.collect_bins,
         }
     }
-    let mut xs = Vec::with_capacity(cfg.collect_bins);
-    let mut us = Vec::with_capacity(cfg.collect_bins);
-    for i in 0..cfg.collect_bins {
-        let on = bit(cfg.bit_seed, cfg.warmup_bins + i);
-        let pat = if on { pattern.clone() } else { Vec::new() };
-        let counts = record_response(net, cfg.bin_waves, move |_w| pat.clone());
-        let mut row: Vec<f64> = counts.iter().map(|&c| c as f64).collect();
-        row.push(1.0); // bias
-        xs.push(row);
-        us.push(if on { 1.0 } else { 0.0 });
-    }
-    (xs, us)
 }
 
 /// The memory curve: `r2[k-1]` for lag `k = 1..=K`, and their sum.
@@ -158,7 +111,7 @@ pub fn memory_capacity(cfg: &McConfig, adapt_bump: i16, recurrent: bool) -> McCu
     let mut net = Network::new(cfg.engine_config(adapt_bump, recurrent));
     let input = random_l0_input(cfg.seed ^ 0x3EC0, cfg.size, cfg.calib_fraction_q16);
     net.calibrate(&cfg.calib, &input);
-    let (xs, us) = collect_states(&mut net, cfg);
+    let (xs, us) = stream::collect_states(&mut net, &cfg.stream_params());
 
     let n = xs.len();
     let k = cfg.k_lags;
@@ -187,10 +140,10 @@ mod tests {
     #[test]
     fn bit_stream_is_deterministic_and_balanced() {
         let n = 2000;
-        let ones = (0..n).filter(|&t| bit(42, t)).count();
+        let ones = (0..n).filter(|&t| stream::bit(42, t)).count();
         assert_eq!(
-            (0..n).map(|t| bit(42, t)).collect::<Vec<_>>(),
-            (0..n).map(|t| bit(42, t)).collect::<Vec<_>>()
+            (0..n).map(|t| stream::bit(42, t)).collect::<Vec<_>>(),
+            (0..n).map(|t| stream::bit(42, t)).collect::<Vec<_>>()
         );
         let frac = ones as f64 / n as f64;
         assert!((frac - 0.5).abs() < 0.05, "bit stream not ~balanced: {frac}");
@@ -203,7 +156,7 @@ mod tests {
             let mut net = Network::new(cfg.engine_config(cfg.adapt_bump, true));
             let input = random_l0_input(cfg.seed ^ 0x3EC0, cfg.size, cfg.calib_fraction_q16);
             net.calibrate(&cfg.calib, &input);
-            collect_states(&mut net, &cfg)
+            stream::collect_states(&mut net, &cfg.stream_params())
         };
         let (xs, us) = build();
         assert_eq!(xs.len(), cfg.collect_bins);
