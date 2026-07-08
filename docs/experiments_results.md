@@ -238,6 +238,53 @@ peak.
    presentation but still needs a short read window (its drain-only readout over-integrates — `read=12`
    drops *below* chance).
 
+### Regime diagnostic — what predicts learnability (and topology × adaptation coupling)
+
+To explain the brittleness we measured eight properties of the *calibrated-but-untrained* reservoir (top
+computational layer — what the readout accesses) and correlated them with learned accuracy for both rules:
+
+| cfg | sep.ceiling | Fisher | eff.dim | k−g rank | σ | V1 | V2b |
+|---|---|---|---|---|---|---|---|
+| baseline | 750 | 0.48 | 1.2 | 0.0 | 0.33 | 772 | 621 |
+| up_count=8 | 490 | 0.00 | 0.0 | 0.0 | 0.00 | 505 | 505 |
+| up_count=24 | 600 | 0.12 | 4.1 | −1.0 | 0.20 | 557 | 558 |
+| up_radius=2 | 490 | 0.26 | 1.0 | 0.0 | 0.00 | 505 | 505 |
+| layers=2 | 1000 | 1.52 | 2.6 | −6.7 | 0.00 | 788 | 505 |
+| layers=4 | 490 | 0.00 | 0.0 | 0.0 | 0.33 | 505 | 505 |
+
+**Findings:**
+
+1. **Separation ceiling predicts V1 cleanly.** `ceiling ≥ 600 → V1 learns` (baseline, up_count=24, layers=2);
+   `ceiling ≈ 490 (chance) → V1 dead` (up_count=8, up_radius=2, layers=4). A perfect split. **This is the
+   metric a fix should target** — the reservoir must make the classes linearly separable *at the top layer*.
+2. **V2b needs separation *and depth*.** `layers=2` separates perfectly (ceiling 1000) and V1 reads it off
+   (788), but **V2b stays at chance (505)** — with only one computational layer the broadcast credit has no
+   internal layer to shape. So separation is *necessary but not sufficient* for feedback-alignment; it also
+   needs ≥2 trainable layers. (Explains the depth knife-edge differing by rule.)
+3. **The dynamical / rank metrics do *not* predict here.** σ (edge-of-chaos), kernel−gen rank, effective
+   dim, and degeneracy all fail to split learns-from-collapses — σ and k−g are confounded by depth
+   (`layers=2` learns at σ=0; `layers=4` is dead at σ=0.33). **The working pocket is about top-layer
+   *separation*, not criticality.** An honest negative for the fancier metrics.
+4. **Topology × adaptation is a coupled ridge (hypothesis confirmed).** Separation ceiling over `up_count ×
+   adapt_bump`:
+
+   | cnt\bump | 5 | 10 | 20 | 40 |
+   |---|---|---|---|---|
+   | 8 | 787 | 637 | 525 | 525 |
+   | 12 | 650 | **925** | 525 | 525 |
+   | 16 | 675 | 575 | **750** | 525 |
+   | 24 | 662 | **800** | 512 | 525 |
+
+   The best `up_count` **shifts with `adapt_bump`**: weak adaptation (bump=5) separates at any density; the
+   optimum moves to count=12 at bump=10, count=16 at bump=20, and nothing survives bump=40. More adaptation
+   → more resistive neurons → needs denser fan-out to reach threshold. The OAT sweep's "fragile spike"
+   (bump=10 → 901) was simply crossing this ridge. **The knobs are not independent — they trade off.**
+
+**Scopes the fix:** a **separation-targeting calibration** that tunes the reservoir (thresholds, and given
+the coupling, likely co-tuning drive/adaptation) to maximise the top-layer separation ceiling — so learning
+stops depending on landing on the ridge by hand. For V2b specifically, also enforce depth ≥ 2 computational
+layers.
+
 ## Engine finding along the way — the floored leak
 
 Store-recall *found a real substrate bug*. The potential leak `p -= (p>>a)+(p>>b)` is `0` for `0 < p <

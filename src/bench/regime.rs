@@ -366,4 +366,73 @@ mod tests {
         assert!((dead - 0.25).abs() < 1e-9, "one of four dead: {dead}");
         assert!((sat - 0.25).abs() < 1e-9, "one of four saturated: {sat}");
     }
+
+    fn learned(mut cfg: EpropConfig, readout: bool, broadcast: bool, lr: f64) -> u64 {
+        use crate::bench::eprop::train;
+        cfg.readout = readout;
+        cfg.broadcast = broadcast;
+        if broadcast {
+            cfg.softmax_temp = 10.0;
+        }
+        cfg.trials = 1500;
+        cfg.block = 250;
+        let c = train(&cfg, lr).accuracy_permille;
+        let h = c.len() / 2;
+        c[h..].iter().sum::<u64>() / (c.len() - h).max(1) as u64
+    }
+
+    #[test]
+    #[ignore]
+    fn _regime_vs_learnability() {
+        let base = small();
+        let cases: Vec<(&str, EpropConfig)> = vec![
+            ("baseline", base.clone()),
+            ("up_count=8", { let mut c = base.clone(); c.up_count = 8; c }),
+            ("up_count=24", { let mut c = base.clone(); c.up_count = 24; c }),
+            ("up_radius=2", { let mut c = base.clone(); c.up_radius = 2; c }),
+            ("layers=2", { let mut c = base.clone(); c.layers = 2; c }),
+            ("layers=4", { let mut c = base.clone(); c.layers = 4; c }),
+        ];
+        let waves = (base.present_waves + base.delay + base.read_waves) as u32;
+        eprintln!(
+            "{:<12}{:>6}{:>8}{:>7}{:>7}{:>7}{:>6}{:>6}{:>6}",
+            "cfg", "ceil", "fisher", "edim", "k-g", "sigma", "dead", "V1", "V2b"
+        );
+        for (name, cfg) in &cases {
+            let ceil = separation_ceiling(cfg, 200);
+            let (s, y) = collect_states(cfg, 200);
+            let fish = fisher_ratio(&s, &y, cfg.k);
+            let edim = effective_dim(&as_f64(&s));
+            let kg = kernel_minus_gen_rank(cfg);
+            let sig = perturbation_spread(cfg);
+            let (dead, _sat, _sync) = degeneracy(&s, waves);
+            let v1 = learned(cfg.clone(), false, false, 0.3);
+            let v2b = learned(cfg.clone(), true, true, 0.5);
+            eprintln!(
+                "{name:<12}{ceil:>6}{fish:>8.2}{edim:>7.1}{kg:>7.1}{sig:>7.2}{dead:>6.2}{v1:>6}{v2b:>6}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn _topology_interaction_grid() {
+        let base = small();
+        eprintln!("separation ceiling — rows up_count, cols adapt_bump");
+        eprint!("{:>10}", "cnt\\bump");
+        for b in [5i16, 10, 20, 40] {
+            eprint!("{b:>6}");
+        }
+        eprintln!();
+        for cnt in [8u32, 12, 16, 24] {
+            eprint!("{cnt:>10}");
+            for b in [5i16, 10, 20, 40] {
+                let mut c = base.clone();
+                c.up_count = cnt;
+                c.adapt_bump = b;
+                eprint!("{:>6}", separation_ceiling(&c, 160));
+            }
+            eprintln!();
+        }
+    }
 }
