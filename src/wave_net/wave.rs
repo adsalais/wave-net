@@ -48,8 +48,14 @@ pub fn process_layer(
         layer.cooldown[a as usize] = 0;
     }
 
-    // 4. decide (ALIF effective threshold = baseline + adapt, in i32; fire bumps adapt)
+    // A readout layer is a non-spiking drain-only integrator: its potential (folded above) is the
+    // clean cumulative ±1 input for the trial. No fire, no generate, no leak, no adapt — return now.
     fired.clear();
+    if layer.readout {
+        return;
+    }
+
+    // 4. decide (ALIF effective threshold = baseline + adapt, in i32; fire bumps adapt)
     for i in 0..ls {
         let eff = layer.threshold[i] as i32 + (layer.adapt[i] >> ADAPT_SHIFT);
         if layer.cooldown[i] == 0 && (layer.potential[i] as i32) >= eff {
@@ -189,6 +195,43 @@ mod tests {
             process_layer(&mut l, 0, 0, 4, &[], &mut acc, &mut out, &mut fired);
             assert_eq!(l.adapt[0], 0, "adapt must stay 0 when adapt_bump is 0");
         }
+    }
+
+    #[test]
+    fn readout_layer_integrates_and_never_fires() {
+        use crate::wave_net::config::{Config, LayerConfig};
+        use crate::wave_net::network::Network;
+        use std::sync::{Arc, Mutex};
+        let build = |readout: bool| -> (usize, i16) {
+            let l0 = LayerConfig {
+                topology: vec![TopologyLevel { level: 1, radius: 1, count: 4 }],
+                leak: (3, 5),
+                cooldown_base: 2,
+                inhibitor_ratio: 0,
+                threshold_jitter: 0,
+                baseline_init: 2,
+                adapt_bump: 0,
+                adapt_decay: 5,
+            };
+            let l1 = LayerConfig { topology: vec![], ..l0.clone() };
+            let cfg = Config { seed: 1, size: 4, layers: vec![l0, l1] };
+            let mut net = if readout { Network::new_with_readout(cfg) } else { Network::new(cfg) };
+            let fires = Arc::new(Mutex::new(0usize));
+            {
+                let f = fires.clone();
+                net.on_layer(1, Box::new(move |_w, fired: &[u32]| *f.lock().unwrap() += fired.len()));
+            }
+            let all: Vec<u32> = (0..16).collect();
+            for _ in 0..8 {
+                net.wave(&all);
+            }
+            (*fires.lock().unwrap(), net.potential(1, 0))
+        };
+        let (normal_fires, _) = build(false);
+        let (readout_fires, readout_pot) = build(true);
+        assert!(normal_fires > 0, "control: a normal L1 fires under the drive");
+        assert_eq!(readout_fires, 0, "readout L1 must never fire");
+        assert!(readout_pot > 1, "readout L1 must integrate its input (potential {readout_pot})");
     }
 
     #[test]

@@ -20,6 +20,16 @@ pub struct Network {
 
 impl Network {
     pub fn new(config: Config) -> Network {
+        Network::build(config, false)
+    }
+
+    /// Like `new`, but flags the **last** layer as a non-spiking drain-only readout (output sink):
+    /// it integrates its input into potential and never fires. Mirrors L0's input-transducer role.
+    pub fn new_with_readout(config: Config) -> Network {
+        Network::build(config, true)
+    }
+
+    fn build(config: Config, readout_last: bool) -> Network {
         config.validate().expect("invalid config");
         let size = config.size;
         let l = config.layers.len();
@@ -33,6 +43,9 @@ impl Network {
                 // == baseline <= i16::MAX). ALIF dynamics apply to the computational layers 1..L.
                 layer.threshold.iter_mut().for_each(|t| *t = i16::MAX);
                 layer.adapt_bump = 0;
+            }
+            if readout_last && z == l - 1 {
+                layer.readout = true;
             }
             layers.push(Mutex::new(layer));
         }
