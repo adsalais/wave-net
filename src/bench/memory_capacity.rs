@@ -4,9 +4,9 @@
 
 use crate::bench::readout::RidgeReadout;
 use crate::bench::stream::{self, StreamParams};
-use crate::wave_net::calibrate::{random_l0_input, CalibrateParams};
-use crate::wave_net::config::Config;
-use crate::wave_net::network::Network;
+use crate::wave_state_machine::calibrate::{random_l0_input, CalibrateParams};
+use crate::wave_state_machine::config::Config;
+use crate::wave_state_machine::network::Network;
 
 /// Configuration for the Memory Capacity experiment.
 #[derive(Clone, Debug)]

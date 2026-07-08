@@ -4,8 +4,8 @@
 
 use crate::bench::readout::RidgeReadout;
 use crate::bench::stream::{self, StreamParams};
-use crate::wave_net::calibrate::{random_l0_input, CalibrateParams};
-use crate::wave_net::network::Network;
+use crate::wave_state_machine::calibrate::{random_l0_input, CalibrateParams};
+use crate::wave_state_machine::network::Network;
 
 /// XOR of two bits held as f64 `0.0`/`1.0`.
 fn xor(a: f64, b: f64) -> f64 {

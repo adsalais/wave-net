@@ -4,7 +4,7 @@
 use crate::bench::eprop::{calibrated_reservoir, pick_class, EpropConfig};
 use crate::bench::readout::NearestCentroid;
 use crate::bench::store_recall::{cue_realization, probe_pattern};
-use crate::wave_net::network::Network;
+use crate::wave_state_machine::network::Network;
 use std::sync::{Arc, Mutex};
 
 /// One trial (reset → present cue → delay → probe); returns per-computational-layer spike counts. Each
@@ -186,7 +186,7 @@ pub fn kernel_minus_gen_rank(cfg: &EpropConfig) -> f64 {
 /// (neurons whose count differs) between base and perturbed states, and return the geometric growth of
 /// divergence up the stack. (A single-site flip is too weak to register in these small integer nets.)
 pub fn perturbation_spread(cfg: &EpropConfig) -> f64 {
-    use crate::wave_net::synapse::{key, mix};
+    use crate::wave_state_machine::synapse::{key, mix};
     let mut net = calibrated_reservoir(cfg);
     let ls = cfg.size * cfg.size;
     let nflip = (ls / 16).max(4);

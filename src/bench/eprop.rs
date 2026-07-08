@@ -3,10 +3,10 @@
 //! neurons. Trains thresholds to beat a frozen-threshold control. Reuses `store_recall`'s cue/probe.
 
 use crate::bench::store_recall::{cue_realization, probe_pattern};
-use crate::wave_net::calibrate::{random_l0_input, CalibrateParams};
-use crate::wave_net::config::Config;
-use crate::wave_net::network::Network;
-use crate::wave_net::synapse::{key, mix};
+use crate::wave_state_machine::calibrate::{random_l0_input, CalibrateParams};
+use crate::wave_state_machine::config::Config;
+use crate::wave_state_machine::network::Network;
+use crate::wave_state_machine::synapse::{key, mix};
 use std::sync::{Arc, Mutex};
 
 /// Reward-prediction-error tracker: returns `R − R̄` and updates the running mean `R̄` (EMA).
@@ -101,9 +101,9 @@ impl EpropConfig {
 
     /// A dense feed-forward ALIF computational layer built from the sweepable knobs. Shared by the V1
     /// and readout configs so both paths sweep identically (feed-forward isolates adaptation).
-    fn comp_layer(&self) -> crate::wave_net::config::LayerConfig {
-        use crate::wave_net::config::LayerConfig;
-        use crate::wave_net::synapse::TopologyLevel;
+    fn comp_layer(&self) -> crate::wave_state_machine::config::LayerConfig {
+        use crate::wave_state_machine::config::LayerConfig;
+        use crate::wave_state_machine::synapse::TopologyLevel;
         LayerConfig {
             topology: vec![TopologyLevel { level: 1, radius: self.up_radius, count: self.up_count }],
             leak: (3, 5),
@@ -119,7 +119,7 @@ impl EpropConfig {
     /// V2a engine config: computational layers + an appended non-spiking readout layer (empty
     /// topology sink). Build the resulting `Config` with `Network::new_with_readout`.
     fn engine_config_readout(&self) -> Config {
-        use crate::wave_net::config::LayerConfig;
+        use crate::wave_state_machine::config::LayerConfig;
         let comp = self.comp_layer();
         let readout = LayerConfig { topology: vec![], ..comp.clone() };
         let mut layers = vec![comp; self.layers];
@@ -331,9 +331,9 @@ pub fn train(cfg: &EpropConfig, lr: f64) -> LearnCurve {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wave_net::config::{Config, LayerConfig};
-    use crate::wave_net::network::Network;
-    use crate::wave_net::synapse::TopologyLevel;
+    use crate::wave_state_machine::config::{Config, LayerConfig};
+    use crate::wave_state_machine::network::Network;
+    use crate::wave_state_machine::synapse::TopologyLevel;
 
     fn tiny_net() -> Network {
         let layer = LayerConfig {

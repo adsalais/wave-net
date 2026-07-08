@@ -4,7 +4,7 @@
 use std::sync::{Arc, Mutex};
 
 use crate::bench::linalg::{xt_x, xt_y, Lu};
-use crate::wave_net::network::Network;
+use crate::wave_state_machine::network::Network;
 
 /// Ridge-regression linear readout. Factors `(XᵀX + λI)` once from the training design matrix
 /// (which must already include a bias column); each target column is solved by back-substitution.
@@ -109,9 +109,9 @@ impl NearestCentroid {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wave_net::config::{Config, LayerConfig};
-    use crate::wave_net::network::Network;
-    use crate::wave_net::synapse::TopologyLevel;
+    use crate::wave_state_machine::config::{Config, LayerConfig};
+    use crate::wave_state_machine::network::Network;
+    use crate::wave_state_machine::synapse::TopologyLevel;
 
     fn two_layer_low() -> Config {
         // L0 -> L1 straight up; L1 baseline low so L0 injection makes it fire.
@@ -146,7 +146,7 @@ mod tests {
         assert!(driven.iter().any(|&c| c > 0), "driven run must record L1 spikes");
     }
 
-    use crate::wave_net::synapse::mix;
+    use crate::wave_state_machine::synapse::mix;
 
     fn synth_design(n: usize, d: usize) -> Vec<Vec<f64>> {
         // Deterministic rows in [-1,1) with a trailing bias column of 1.0.

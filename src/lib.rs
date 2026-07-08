@@ -4,6 +4,6 @@
 //! hash-generated synapses (never stored), deferred one-hop wave propagation, and firing-rate
 //! calibration. Deterministic and single-threaded. This crate is a library only.
 
-pub mod bench;
-pub mod wave_net; // pure procedural engine (reference)
-pub mod wave_state_machine; // memory-efficient LSM fork: procedural reservoir + (to come) stored trained readout
+pub mod bench; // experiments, pinned to the wave_state_machine reference
+pub mod wave_net; // active R&D engine — being modified to store weights (moving beyond pure procedural)
+pub mod wave_state_machine; // frozen reference: the memory-efficient (pure procedural) LSM

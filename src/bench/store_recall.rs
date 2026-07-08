@@ -1,10 +1,10 @@
 //! `store_recall` — the Tier-0 delayed-match task and the ALIF-vs-LIF memory-horizon experiment.
 
 use crate::bench::readout::{record_response, NearestCentroid};
-use crate::wave_net::calibrate::{random_l0_input, CalibrateParams};
-use crate::wave_net::config::{Config, LayerConfig};
-use crate::wave_net::network::Network;
-use crate::wave_net::synapse::{key, mix, TopologyLevel};
+use crate::wave_state_machine::calibrate::{random_l0_input, CalibrateParams};
+use crate::wave_state_machine::config::{Config, LayerConfig};
+use crate::wave_state_machine::network::Network;
+use crate::wave_state_machine::synapse::{key, mix, TopologyLevel};
 
 const P_CUE: u64 = 7; // base cue membership per class
 const P_TRIAL: u64 = 11; // per-trial keep of base sites

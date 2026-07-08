@@ -3,9 +3,9 @@
 //! builder (recurrent vs feed-forward). Used by `memory_capacity` and `temporal_xor`.
 
 use crate::bench::readout::record_response;
-use crate::wave_net::config::{Config, LayerConfig};
-use crate::wave_net::network::Network;
-use crate::wave_net::synapse::{key, mix, TopologyLevel};
+use crate::wave_state_machine::config::{Config, LayerConfig};
+use crate::wave_state_machine::network::Network;
+use crate::wave_state_machine::synapse::{key, mix, TopologyLevel};
 
 const P_BIT: u64 = 23; // input bit per timestep
 const P_STREAM: u64 = 29; // fixed L0 pattern injected on a "1" bit
