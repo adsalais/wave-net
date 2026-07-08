@@ -202,31 +202,41 @@ So all-internal (feedback-alignment) learning works **once the credit is per-out
 V2a exposed. (`softmax_temp = 10`: the potential-sum scores are large, so a low temperature is needed to keep
 the error from washing out to uniform.)
 
-**V2b parameter sensitivity — the learnable regime is a narrow pocket.** One-at-a-time sweep around the
-working baseline (late-half accuracy ‰, 2000 trials, chance 500, baseline ~652):
+**Parameter sensitivity — V1 vs V2b (the surprising part: V1 is the brittle one).** One-at-a-time sweep of
+both learners around their shared baseline (late-half accuracy ‰, 2000 trials, chance 500; `485` is the
+dead/no-learning value — argmax defaults to the majority class). **Bold** = collapse-to-chance or notable
+peak.
 
-| knob | values → late ‰ | reading |
+| knob (values) | V1 late ‰ (base 805) | V2b late ‰ (base 652) |
 |---|---|---|
-| size (width) | 8→652, 16→641 | robust — width barely matters |
-| **layers (depth)** | 2→485, **3→652**, 4→485 | **knife-edge — only depth 3 learns; ±1 collapses to chance** |
-| refractory (cooldown) | 1→652, 2→652, 4→611 | robust for low/mid |
-| **up_count (density)** | 8→485, **16→652**, 24→501 | **narrow band — sparse *and* dense collapse** |
-| **up_radius** | 2→485, **3→652**, 4→544 | brittle — needs radius 3 |
-| **adapt_bump** | 0→587, 5→377, **10→901**, 15→498, 20→652, 40→504 | **non-monotonic/knife-edge — 10 is a fragile spike, not a trend** |
-| adapt_decay | 4→705, 6→652, 8→626 | robust; faster decay mildly better |
-| present_waves | 3→504, 6→652, 12→696 | longer cue → better |
-| delay | 0→573, 2→513, **4→652**, 8→625, 16→513 | ~4 optimal (needs *some* held delay, but memory decays if too long) |
-| read_waves | 3→573, **6→652**, 12→382 | ~6 optimal; **long read over-integrates and destroys the signal** |
+| size 8 / 16 | 805 / **485** | 652 / 641 |
+| layers 2 / 3 / 4 | 663 / 805 / **485** | **485** / 652 / **485** |
+| cooldown 1 / 2 / 4 | 805 / 805 / **485** | 652 / 652 / 611 |
+| up_count 8 / 16 / 24 | **485** / 805 / 554 | **485** / 652 / 501 |
+| up_radius 2 / 3 / 4 | **485** / 805 / 527 | **485** / 652 / 544 |
+| adapt_bump 0/10/20/40 | 609 / 548 / **805** / **485** | 587 / **901** / 652 / **504** |
+| adapt_decay 4 / 6 / 8 | **531** / 805 / **485** | 705 / 652 / 626 |
+| present 3 / 6 / 12 | 483 / **805** / 594 | 504 / 652 / **696** |
+| delay 0/4/8/16 | 653 / 805 / 726 / 597 | 573 / 652 / 625 / 513 |
+| read 3 / 6 / 12 | **485** / 805 / **485** | 573 / 652 / **382** |
 
-**Takeaway:** V2b learns only inside a narrow pocket of *connectivity/depth/adaptation* space — depth,
-`up_count`, `up_radius`, and `adapt_bump` each collapse to chance under small perturbations, while *width,
-refractory, and adapt_decay* are robust. This is the [density-tradeoff finding](#the-connectivity-density-tradeoff)
-resurfacing under learning: broadcast credit only shapes the reservoir when its dynamics already sit in the
-right regime. The `adapt_bump=10 → 901‰` result is a *fragile resonance* (neighbours 5→377, 15→498 are
-null), **not** a robust improvement — so it was **not** adopted; the committed baseline (`adapt_bump=20`)
-sits in a stable pocket. On timing: more presentation helps, a delay of ~4 is the working-memory sweet spot,
-and the readout window must stay short (long integration washes the class signal out — a readout-specific
-caveat).
+**Three findings:**
+
+1. **V1 wins on peak, V2b wins on robustness.** V1 reaches higher (~805 vs ~652) but lives in a *much*
+   tighter pocket: it collapses to chance on `size=16`, `cooldown=4`, `adapt_decay∈{4,8}`, `read∈{3,12}`,
+   `present=3` — all of which V2b tolerates (graceful degradation, not collapse). The broadcast learner's
+   *distributed per-neuron* credit is more forgiving of off-nominal dynamics than V1's *global* reward,
+   which needs the spiking output populations precisely in regime. A genuine robustness/performance tradeoff
+   between the two rules.
+2. **Shared brittleness = the reservoir's dynamical regime, not the rule.** *Both* collapse on depth
+   (only 3 layers), `up_count` (only 16), and `up_radius` (only 3) — the [density
+   tradeoff](#the-connectivity-density-tradeoff) again: neither credit signal can learn unless the
+   connectivity puts the reservoir in the right regime first.
+3. **Adaptation strength is resonant for both.** `adapt_bump` is non-monotonic: V1 peaks at 20, V2b spikes
+   at 10 (a *fragile* spike — neighbours 5→377, 15→498 are null, so **not** adopted). Timing: a delay of ~4
+   is the working-memory sweet spot for both; V1 wants a tight `present=6`/`read=6` while V2b likes longer
+   presentation but still needs a short read window (its drain-only readout over-integrates — `read=12`
+   drops *below* chance).
 
 ## Engine finding along the way — the floored leak
 
