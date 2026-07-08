@@ -75,11 +75,15 @@ pub fn process_layer(
         );
     }
 
-    // 6. leak survivors into the next wave
+    // 6. leak survivors into the next wave. Floor the decay at 1 for positive membrane so small
+    // potentials relax to 0 (finite membrane time constant) instead of freezing in the integer
+    // shift dead zone (`(v>>la)+(v>>lb) == 0` for `0 < v < 2^la`). Negatives already relax —
+    // arithmetic shift of a negative is <= -1 — so they keep the raw geometric decay.
     let (la, lb) = layer.leak;
     for p in layer.potential.iter_mut() {
         let v = *p;
-        *p = v - (v >> la) - (v >> lb);
+        let decay = (v >> la) + (v >> lb);
+        *p = v - if v > 0 { decay.max(1) } else { decay };
     }
 
     // 7. decay adaptation toward rest (geometric, like the potential leak)
@@ -231,6 +235,21 @@ mod tests {
         process_layer(&mut l, 0, 0, 1, &[], &mut acc, &mut out, &mut fired);
         // leak (3,5): 1000 - 125 - 31 = 844
         assert_eq!(l.potential[0], 844);
+    }
+
+    #[test]
+    fn leak_drives_small_positive_potential_to_zero() {
+        // Small positive potentials must relax to 0 (finite membrane time constant), not freeze in
+        // the integer shift dead zone where (v>>a)+(v>>b) == 0 for v < 2^a.
+        let mut l = low_layer(1, 20_000, 2, vec![]); // high threshold: never fires
+        l.potential[0] = 5;
+        let mut acc = vec![0i32; 1];
+        let mut out: Vec<SynapseGroup> = Vec::new();
+        let mut fired = Vec::new();
+        for _ in 0..6 {
+            process_layer(&mut l, 0, 0, 1, &[], &mut acc, &mut out, &mut fired);
+        }
+        assert_eq!(l.potential[0], 0, "small potential must leak to 0, not freeze in the dead zone");
     }
 
     #[test]

@@ -92,9 +92,9 @@ mod tests {
     fn test_config() -> Config {
         let layer = LayerConfig {
             topology: vec![
-                TopologyLevel { level: 1, radius: 2, count: 6 },
-                TopologyLevel { level: 0, radius: 1, count: 2 },
-                TopologyLevel { level: -1, radius: 1, count: 2 },
+                TopologyLevel { level: 1, radius: 3, count: 16 },
+                TopologyLevel { level: 0, radius: 1, count: 3 },
+                TopologyLevel { level: -1, radius: 1, count: 3 },
             ],
             leak: (3, 5),
             cooldown_base: 2,

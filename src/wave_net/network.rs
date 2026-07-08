@@ -177,7 +177,7 @@ impl Network {
 mod tests {
     use super::*;
     use crate::wave_net::config::{Config, LayerConfig};
-    use crate::wave_net::synapse::{local_of, TopologyLevel};
+    use crate::wave_net::synapse::TopologyLevel;
     use std::sync::{Arc, Mutex};
 
     // two 4x4 layers, L0 -> L1 straight up (level+1, radius 0), all excitatory
@@ -302,11 +302,24 @@ mod tests {
 
     #[test]
     fn deferred_delivery_is_one_hop() {
-        let net = Network::new(two_layer());
-        net.wave(&[0]); // L0 neuron 0 fires; delivery queued for L1
-        assert_eq!(net.potential(1, local_of(0, 0, 4) as usize), 0, "not delivered same wave");
-        net.wave(&[]); // L1 drains: +1 arrives
-        assert_eq!(net.potential(1, local_of(0, 0, 4) as usize), 1, "delivered next wave");
+        // With L1 baseline 1, a single +1 delivery makes L1 fire — on the wave AFTER L0 fires, not
+        // the same wave. (Verified via firing, not a residual potential, which the leak floor would
+        // erase.) two_layer sets L1 near i16::MAX; drop it to 1 so the delivery is decisive.
+        let mut cfg = two_layer();
+        cfg.layers[1].baseline_init = 1;
+        let mut net = Network::new(cfg);
+        let fired_waves = Arc::new(Mutex::new(Vec::<usize>::new()));
+        {
+            let f = fired_waves.clone();
+            net.on_layer(1, Box::new(move |w, fired: &[u32]| {
+                if !fired.is_empty() {
+                    f.lock().unwrap().push(w);
+                }
+            }));
+        }
+        net.wave(&[0]); // wave 0: L0 neuron 0 fires; delivery queued for L1
+        net.wave(&[]); // wave 1: L1 drains the +1 and fires
+        assert_eq!(*fired_waves.lock().unwrap(), vec![1], "L1 fires only on the wave after L0's spike");
     }
 
     #[test]

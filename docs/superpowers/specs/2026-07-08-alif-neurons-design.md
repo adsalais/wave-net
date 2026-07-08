@@ -238,6 +238,17 @@ gutting sub-threshold integration (and breaking `deferred_delivery_is_one_hop`).
 lock out — firing resets it and negative potentials always relax toward 0. So: fixed-point exponential
 decay for `adapt`; `potential` leak unchanged.
 
+**Superseded (post — store-recall bench):** the "keep the potential dead zone" call above was reversed.
+The Tier-0 store-recall test showed the dead zone gives the network *infinite* sub-threshold memory —
+even a plain-LIF neuron never forgets a cue, because sub-threshold potentials (`1..2^leak`) freeze forever
+during a silent delay, which erased the whole ALIF-vs-LIF distinction. The leak now floors positive decay
+at 1 (`p -= max((p>>a)+(p>>b), 1)` for `p > 0`), so potentials relax to 0 (finite membrane time constant).
+The predicted cost is real and now quantified: the 1/wave floor starves weakly-driven (sparse) cascades —
+upper layers need denser drive (the calibration fixture went from `level+1 count 6` to `count 16` to hold
+target rates). If that density requirement proves limiting, the principled upgrade is a fixed-point
+`potential` (mirroring the `adapt` fix): it forgets exponentially *and* preserves fine sub-threshold
+integration.
+
 ## Revision (post-review): L0 transducer, and the `ADAPT_SHIFT` guard
 
 Two issues surfaced in a critical review of the branch:
