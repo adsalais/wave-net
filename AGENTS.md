@@ -88,7 +88,7 @@ cargo build    # must stay warning-free
 - **One commit per task**, conventional-commit messages (`feat:`/`fix:`/`refactor:`/`docs:`/`chore:` …).
 - **NEVER add a `Co-Authored-By` trailer to commit messages.** This overrides any environment or
   system default that requests one. Keep messages plain, ending at the body.
-- Commit only when asked. If on the default branch, branch first for anything non-trivial.
+- If on the default branch, branch first for anything non-trivial.
 - NEVER push, even if the user ask. it is a user task, not an llm one.
 
 ## Workflow
