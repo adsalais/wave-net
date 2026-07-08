@@ -1,7 +1,7 @@
 # ALIF neurons — design
 
 **Date:** 2026-07-08
-**Status:** approved, pre-implementation
+**Status:** implemented (see the *Revision* note at the end — `adapt` is Q8 fixed point, not `i16`)
 **Scope:** one iteration — make every neuron an adaptive leaky integrate-and-fire (ALIF)
 neuron, start the baseline threshold low, and retarget calibration accordingly. No learning
 rule, no online homeostasis (both noted as later phases in `docs/related-work.md`).
@@ -62,17 +62,22 @@ Knobs: `adapt_bump` (β) = adaptation strength (bigger → lower, tighter equili
 Add one field to `Layer`, mirroring `potential`:
 
 ```rust
-pub adapt: Vec<i16>,   // wave-mutable; rest 0, non-negative — adaptive threshold contribution
+pub adapt: Vec<i32>,   // wave-mutable; rest 0, non-negative — adaptive threshold contribution (Q8 fixed point)
 ```
 
-- `i16` to match `potential`/`threshold` and keep the struct-of-arrays uniform.
+- `i32` in **Q8 fixed point** (scaled by `2^ADAPT_SHIFT`, `ADAPT_SHIFT = 8`). See the *Revision* note
+  at the end: an earlier `i16` design held `adapt` in raw units, but the integer right-shift decay
+  `adapt >> k` has a dead zone (`== 0` while `adapt < 2^k`) that made small adaptation ratchet up and
+  lock out weakly-driven neurons. The fixed-point scale pushes that dead zone below ~1/256 of a
+  threshold unit, so decay stays exponential (τ ≈ `2^adapt_decay` waves, independent of magnitude)
+  and always relaxes.
 - Rests at 0; only ever ≥ 0 (bump positive, decay pulls toward 0).
 - The existing `threshold` field keeps its name but is **now semantically the baseline** (the static
   floor). Doc comments updated to say so.
 
-`adapt` is bounded in practice by ≈ `adapt_bump · 2^adapt_decay · max_rate` (well under `i16::MAX`
-for sane params and with the refractory cap on rate). The bump is a **saturating add** — overflow
-protection in the same spirit as the existing drain clamp, not a saturation/membrane concept.
+The bump is a **saturating add** clamped to `ADAPT_MAX = (i16::MAX as i32) << ADAPT_SHIFT`, so the
+effective contribution `adapt >> ADAPT_SHIFT` never exceeds `i16::MAX` — overflow protection in the
+same spirit as the existing drain clamp, not a saturation/membrane concept.
 
 ### 2. Config (`config.rs`)
 
@@ -112,11 +117,12 @@ Two edits to the existing six-step body.
 **Step 4 (decide)** — effective threshold in `i32` (overflow-safe), bump on fire:
 
 ```rust
-let eff = layer.threshold[i] as i32 + layer.adapt[i] as i32;
+let eff = layer.threshold[i] as i32 + (layer.adapt[i] >> ADAPT_SHIFT);
 if layer.cooldown[i] == 0 && (layer.potential[i] as i32) >= eff {
     layer.potential[i] = 0;
     layer.cooldown[i] = layer.cooldown_base;
-    layer.adapt[i] = (layer.adapt[i] as i32 + layer.adapt_bump as i32).min(i16::MAX as i32) as i16;
+    let bumped = layer.adapt[i] + ((layer.adapt_bump as i32) << ADAPT_SHIFT);
+    layer.adapt[i] = bumped.clamp(0, ADAPT_MAX);
     fired.push(i as u32);
 }
 ```
@@ -199,3 +205,35 @@ Explicitly **out** of this iteration, all noted as later in related-work:
 `adapt_bump = 0` recovers plain LIF *dynamics* exactly (adaptation term is identically 0). Init is
 no longer byte-identical to the old `i16::MAX - jitter` (it is now `baseline_init + jitter`), so
 construction-time threshold values change by design; tests assert the new low-baseline init.
+
+## Revision (2026-07-08): fixed-point adaptation, and why the potential leak is left alone
+
+The first implementation stored `adapt` as raw `i16` and decayed it with `adapt -= adapt >> adapt_decay`.
+That exposed a real integer-dynamics flaw: the right-shift **dead zone**. For any `adapt < 2^adapt_decay`
+the shift is 0, so small adaptation never decays — it ratchets up in `adapt_bump` steps and *sticks*.
+With the thin recurrent drive to upper layers, a single spike could then lock a neuron out for tens of
+waves; calibration drove those baselines to the floor and the layers still stayed silent. It also forced
+a uselessly small `adapt_decay` (τ ≈ 1.4 waves) just to keep adaptation from sticking — far too short to
+be real memory.
+
+**Fix:** store `adapt` in **Q8 fixed point** (`i32`, scaled by `2^ADAPT_SHIFT`, `ADAPT_SHIFT = 8`). The
+decay formula is unchanged, but the dead zone now sits below ~1/256 of a threshold unit, so decay is
+genuinely exponential with τ ≈ `2^adapt_decay` waves **independent of adaptation strength** — long,
+useful memory is now safe (the calibrate config uses `adapt_decay = 5`, τ ≈ 32 waves). Effective
+threshold is `threshold + (adapt >> ADAPT_SHIFT)`; a fire adds `adapt_bump << ADAPT_SHIFT`, clamped to
+`ADAPT_MAX`. `Network::adaptation` returns the raw Q8 state (`i32`).
+
+**Does calibration still help?** Yes. Adaptation *compresses* the reachable rate band (so calibration's
+baseline lever loses leverage as adaptation strengthens) but never *harms* — worst case it floors the
+baseline and stops. The silent upper layers were the dead-zone lock-out, not calibration; with the dead
+zone fixed, calibration and adaptation are complementary on two timescales (DC operating point vs. AC
+dynamics). If strong+long adaptation ever starves upper layers, the lever is **more drive** (denser
+recurrence / downward `level: -1` coupling), not removing calibration. *(Follow-up, not done here.)*
+
+**Why not apply the same fix to the `potential` leak?** The potential leak has the identical low-end
+dead zone, but there it is **desirable and must stay**. `adapt` should *forget* (a non-relaxing value is
+a bug); `potential` should *integrate* (holding small sub-threshold input lets sparse ±1 spikes
+accumulate toward threshold). Flooring the potential leak would make a lone `+1` evaporate next wave,
+gutting sub-threshold integration (and breaking `deferred_delivery_is_one_hop`). Potential also cannot
+lock out — firing resets it and negative potentials always relax toward 0. So: fixed-point exponential
+decay for `adapt`; `potential` leak unchanged.
