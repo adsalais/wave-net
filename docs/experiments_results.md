@@ -202,6 +202,32 @@ So all-internal (feedback-alignment) learning works **once the credit is per-out
 V2a exposed. (`softmax_temp = 10`: the potential-sum scores are large, so a low temperature is needed to keep
 the error from washing out to uniform.)
 
+**V2b parameter sensitivity — the learnable regime is a narrow pocket.** One-at-a-time sweep around the
+working baseline (late-half accuracy ‰, 2000 trials, chance 500, baseline ~652):
+
+| knob | values → late ‰ | reading |
+|---|---|---|
+| size (width) | 8→652, 16→641 | robust — width barely matters |
+| **layers (depth)** | 2→485, **3→652**, 4→485 | **knife-edge — only depth 3 learns; ±1 collapses to chance** |
+| refractory (cooldown) | 1→652, 2→652, 4→611 | robust for low/mid |
+| **up_count (density)** | 8→485, **16→652**, 24→501 | **narrow band — sparse *and* dense collapse** |
+| **up_radius** | 2→485, **3→652**, 4→544 | brittle — needs radius 3 |
+| **adapt_bump** | 0→587, 5→377, **10→901**, 15→498, 20→652, 40→504 | **non-monotonic/knife-edge — 10 is a fragile spike, not a trend** |
+| adapt_decay | 4→705, 6→652, 8→626 | robust; faster decay mildly better |
+| present_waves | 3→504, 6→652, 12→696 | longer cue → better |
+| delay | 0→573, 2→513, **4→652**, 8→625, 16→513 | ~4 optimal (needs *some* held delay, but memory decays if too long) |
+| read_waves | 3→573, **6→652**, 12→382 | ~6 optimal; **long read over-integrates and destroys the signal** |
+
+**Takeaway:** V2b learns only inside a narrow pocket of *connectivity/depth/adaptation* space — depth,
+`up_count`, `up_radius`, and `adapt_bump` each collapse to chance under small perturbations, while *width,
+refractory, and adapt_decay* are robust. This is the [density-tradeoff finding](#the-connectivity-density-tradeoff)
+resurfacing under learning: broadcast credit only shapes the reservoir when its dynamics already sit in the
+right regime. The `adapt_bump=10 → 901‰` result is a *fragile resonance* (neighbours 5→377, 15→498 are
+null), **not** a robust improvement — so it was **not** adopted; the committed baseline (`adapt_bump=20`)
+sits in a stable pocket. On timing: more presentation helps, a delay of ~4 is the working-memory sweet spot,
+and the readout window must stay short (long integration washes the class signal out — a readout-specific
+caveat).
+
 ## Engine finding along the way — the floored leak
 
 Store-recall *found a real substrate bug*. The potential leak `p -= (p>>a)+(p>>b)` is `0` for `0 < p <
