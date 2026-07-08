@@ -5,39 +5,75 @@ override default behavior — follow them exactly. (`CLAUDE.md` points here.)
 
 ## What this project is
 
-`wave-net` builds a **trained RSNN** — a recurrent spiking neural network that *learns* — on top of
-a custom integer spiking engine. The engine (`src/wave_net/`) is a deterministic, procedurally-wired
-dynamical substrate; the project goal is to add **per-neuron learning** on top so it performs tasks.
+`wave-net` is a research repo asking: **can a hash-wired integer spiking network be made to learn?**
+It starts from a deterministic, procedurally-wired integer spiking substrate (a Liquid State Machine)
+and adds a learning layer on top. The central result so far — earned the hard way, documented in
+`docs/experiments_results.md` — is a **pivot**:
 
-Rust, edition 2024, **standard library only** (no runtime dependencies). This is a **library crate**
-(no binary).
+> Training only per-neuron **thresholds** over a *frozen random `±1`* projection is **not a reliable
+> learner** (it works only when the reservoir/task seed happens to align — a coin flip). Making the
+> **weights stored and trainable** is what made learning reliable across seeds. Thresholds can only
+> *gate* a fixed random projection; trained weights *shape* it.
+
+So the project moved from "pure procedural, train thresholds" to the **GeNN hybrid** (Knight & Nowotny
+2021): keep the procedural static structure, but **store and train the plastic weights**.
+
+Rust, edition 2024. **Standard library only by default** — the one optional dependency (`blake3`) is
+behind a test-only feature. This is a **library crate** (no binary); experiments are `#[ignore]`d tests.
+
+## The three modules (read this before touching code)
+
+The crate is `wave_state_machine` + `wave_net` + `bench` (`src/lib.rs` wires them up):
+
+- **`wave_state_machine/` — the frozen reference.** The original memory-efficient LSM: pure procedural,
+  hash-generated, **never-stored `±1` synapses**. It is the stable baseline the historical bench
+  findings are pinned to. **Do not modify it** — it exists so results stay reproducible.
+- **`wave_net/` — the active R&D engine.** Forked from the reference, then diverged: it **stores int8
+  weights** (synapse *addresses* stay procedural — recomputed from the hash, free — only the *weights*
+  are stored) and carries the on-engine hooks a learning rule needs. **This is where engine work
+  happens.**
+- **`bench/` — the experiment harness.** Integer tasks, readouts, decoders, and **the learning rules
+  themselves** (e-prop, DFA credit, recurrence experiments). Uses only the engines' public API. The
+  engine exposes the *state* a learning rule needs; `bench` implements the rules on top.
 
 ## The one idea that explains the engine
 
-**Synapses are never stored — they are recomputed on demand from a hash.**
-`synapse::generate_into(seed, source, topology, …)` is a *pure function* of `(seed, source, config)`
-that regenerates a neuron's outgoing synapses every time it fires. Connectivity costs zero storage;
-the only per-neuron state is a handful of `Vec`s in each `Layer`. Determinism flows from
-`(seed, config, input)`. Any learning must train **per-neuron parameters** (thresholds now)
-never a stored synapse matrix. Effective weight is fixed `±1` (sign from a per-layer
-inhibitory fraction), computed at fire time.
+**Synapse addresses are never stored — they are recomputed on demand from a hash.**
+`synapse::generate_into(seed, source, topology, weights, …)` computes each outgoing target as a *pure
+function* of `(seed, source, config)` every time a neuron fires, so connectivity costs **zero storage**.
+What differs between the two engines is the *weight*:
+
+- `wave_state_machine`: weight is a fixed `±1` (sign from a per-layer inhibitory fraction), also
+  computed at fire time — nothing about a synapse is stored.
+- `wave_net`: the **weight is stored** — one `i8` per `(source local, slot)` in `Layer.out_weights`,
+  with an `f32` shadow (`out_shadow`) for training. `generate_into` looks the weight up instead of
+  deriving it. Weights **init** to the old procedural `±1` sign (so a fresh net is behaviour-identical
+  to the reference), and training moves them into the full int8 range.
+
+Determinism flows from `(seed, config, input)` in both. The engine's dominant cost is regenerating
+synapses at fire time, so a learning rule that would need the synapse list a *second* time (post-hoc
+credit) would double that cost — rules that piggyback on the fire-time scatter stay in budget.
 
 ## The engine model (how a wave works)
 
 A stack of `L` square layers (`size × size`, `size` a power of two, toroidal wrap). Per neuron:
-`i16` potential (rest 0), `u8` cooldown, per-neuron `i16` **baseline** threshold, and an `i16`
-**adaptation** state (rest 0). A **wave** advances every layer one step; `wave::process_layer` runs,
-per layer:
+`i16` potential (rest 0), `u8` cooldown, per-neuron `i16` **baseline** threshold, and an `i32`
+**adaptation** state (Q12 fixed point, rest 0). A **wave** advances every layer one step;
+`wave::process_layer` runs, per layer:
 
 1. decay cooldown
-2. **drain inbox** — sum this wave's `±1` deliveries in `i32`, fold into potential, narrow to `i16`
+2. **drain inbox** — sum this wave's deliveries in `i32`, fold into potential, narrow to `i16`
    (the only clamp — pure overflow protection; there is **no** saturation concept)
 3. **inject** (L0 only) — set injected locals' potential to `i16::MAX` and clear cooldown (forced fire)
-4. **decide** — fire if `cooldown == 0 && potential >= baseline + adaptation` (the ALIF effective
-   threshold, in `i32`); on fire reset potential to 0, reload cooldown, and bump adaptation
-5. **generate** — regenerate the firer's synapses, grouped by relative level
-6. **leak** — decay the survivors' potential toward 0 (positive decay floored at 1, so small
-   potentials relax to rest with a finite membrane time constant instead of freezing in the shift dead zone)
+4. **decide** — fire if `cooldown == 0 && potential >= baseline + (adapt >> ADAPT_SHIFT)` (the ALIF
+   effective threshold, in `i32`); on fire reset potential to 0, reload cooldown, bump adaptation.
+   Also, per wave: snapshot `decide_potential` (pre fire-reset) and accrue **e-prop eligibility** —
+   `elig_post` (a box pseudo-derivative ψ: near-threshold count) for every neuron, `elig_pre` (spike
+   count) for firers
+5. **generate** — regenerate the firer's synapses, grouped by relative level (`wave_net` reads the
+   stored `out_weights`; the reference derives `±1`)
+6. **leak** — decay survivors' potential toward 0 (positive decay floored at 1, so small potentials
+   relax to rest with a finite membrane time constant instead of freezing in the shift dead zone)
 7. **adapt-decay** — decay every neuron's adaptation geometrically toward rest
 
 **Propagation is deferred, one hop per wave.** A firer's deliveries land in the *target* layers'
@@ -45,95 +81,140 @@ per layer:
 `Network::wave(input)` orchestrates: process each layer, route its synapse groups into the target
 layers' inboxes, then swap.
 
-**Boots hot, self-regulates.** Baselines initialize low (`baseline_init + jitter`), so neurons fire
-readily from the first waves; each neuron's adaptation then rises with its own firing and quenches it,
-a local negative-feedback controller that settles the firing rate (spike-frequency adaptation, the
-ALIF mechanism). Input is a sparse `Vec<u32>` of L0 local addresses (spike injection), not graded
-current. `adapt_bump = 0` recovers plain LIF dynamics.
+**Boots hot, self-regulates.** Baselines init low (`baseline_init + jitter`), so neurons fire readily
+from the first waves; each neuron's adaptation then rises with its own firing and quenches it — a
+local negative-feedback controller that settles the firing rate (spike-frequency adaptation, the ALIF
+mechanism). Input is a sparse `Vec<u32>` of L0 local addresses (spike injection), not graded current.
+`adapt_bump = 0` recovers plain LIF dynamics.
 
 **L0 is the input transducer.** `Network::new` forces layer 0 to baseline `i16::MAX` with no
 adaptation, so it fires *only* on injection and never self-adapts — input encoding stays decoupled
-from adaptation, and injected spikes always fire. The boots-hot ALIF dynamics apply to the
-computational layers `1..L` (which calibration tunes); L0 is left as-is.
+from adaptation. The boots-hot ALIF dynamics apply to the computational layers `1..L`.
+
+**Readout layers are the output symmetry.** `Network::new_with_readout` flags the **last** layer as a
+non-spiking, drain-only integrator (`Layer.readout`): it folds its input into potential and never
+fires, giving a clean cumulative signal for a trained readout — the mirror of L0's transducer role.
 
 ## Calibration
 
 `Network::calibrate(params, input)` tunes per-layer **baselines** until each layer fires near a target
 rate on a driven input, **with adaptation live** — bottom-up (each layer tuned once its feeder fires)
-then a few **global-refine** passes for the recurrent coupling. The calibration step is symmetric
-(raises a too-hot layer's baseline, lowers a too-cold one), so it converges the baseline to the point
-where the self-regulated rate matches target. Calibration is **layer-owned**: each `Layer`
-tunes its own thresholds (`shift_threshold`, `calibrate_step`); the `Network` only measures rates
-and delegates. Deterministic. Read state via `layer_thresholds`, `potential`, and per-layer spike
-listeners (`on_layer`); `measure_layer_rates` saves and restores the caller's listeners.
+then a few **global-refine** passes for the recurrent coupling. The step is symmetric (raises a
+too-hot layer, lowers a too-cold one), converging the baseline to where the self-regulated rate meets
+target. Calibration is **layer-owned**: each `Layer` tunes its own thresholds (`shift_threshold`,
+`calibrate_step`); the `Network` only measures rates (`measure_layer_rates`, which saves/restores the
+caller's listeners) and delegates. Deterministic.
+
+**Known limitation:** calibration targets a *sustained random* drive at one operating point; it does
+**not** guarantee a *transient, sparse, task-specific* cue propagates through a deep stack (a
+sub-critical net lets the cue die with depth). A principled generic (per-layer gain / criticality)
+calibration is unsolved — see the recurrence null in `docs/experiments_results.md`.
+
+## Learning: what is built, and what it found
+
+The learning rules live in `bench/` (chiefly `bench::rsnn`), not in the engine. Treat
+`docs/experiments_results.md` as the **source of truth** for findings; the headline results:
+
+- **e-prop on stored weights learns reliably.** A factored per-neuron eligibility (`e = pre-trace ×
+  ψ`, both O(neurons) engine state) × a learning signal from a trained readout updates the stored
+  weights through the `f32` shadow. Held-out and multi-seed, it clears the bar threshold-only training
+  failed. A trained readout on the full reservoir (classic LSM) is also a reliable baseline.
+- **Multi-layer DFA credit makes depth usable.** Train *every* layer: the top gets symmetric readout
+  feedback, deeper layers get Direct Feedback Alignment (fixed random hash-derived feedback of the
+  output error). Reliable to ~16 layers (with width to match); the wall beyond is DFA feedback noise,
+  not the substrate.
+- **Recurrence is an honest null.** Trainable `level 0` (lateral) and `level −1/−2` (backward) weights
+  do **not** beat feed-forward: the blocker is **sustaining dynamics** — the floored leak plus weak
+  `±1` recurrent init don't self-sustain a trace across a silent gap, so no pseudo-derivative (spike or
+  sub-threshold ψ) has anything to credit. (An earlier "ψ is the blocker" reading was a bug — a dead,
+  sub-critical readout layer; corrected in the doc.)
+- **ALIF adaptation is a strong working memory** (~64-wave held-category store-recall) but does **not**
+  help linear echo (MC) or nonlinear temporal computation (XOR) — LIF wins those. Adaptation buys
+  *held-across-a-delay* memory, nothing else.
 
 ## Reading & training: the multi-wave rule
 
-**A single wave does not contain the network's response to an input.** Two engine facts force this:
+**A single wave does not contain the network's response to an input.** Propagation is deferred one-hop
+(forward signal takes ~`L` waves to climb the stack) and the topology is recurrent (level 0/−1 feed
+activity back over subsequent waves). Therefore, for any readout or training:
 
-- Propagation is **deferred one-hop**, so forward signal takes ~`L` waves to climb the stack.
-- The topology is **recurrent** — `level 0` (lateral) and `level −1` (backward) synapses feed
-  activity back down, arriving over *subsequent* waves.
-
-Therefore, for any readout or training:
-
-- **Drive the input over several consecutive waves**, not a single-wave impulse — inject each wave so
-  the signal propagates up and the recurrence builds.
+- **Drive the input over several consecutive waves**, not a single-wave impulse.
 - **Read over a multi-wave window** — integrate spikes/state across enough waves to capture both the
-  forward climb *and* the backward/recurrent settling.
+  forward climb and the backward/recurrent settling.
 - **Training or reading from one wave's data is an error.** An input's representation is distributed
-  across a multi-wave window; a single-wave feature is incomplete and will mistrain. Every future
-  learning rule and readout must operate on multi-wave windows.
+  across a multi-wave window; a single-wave feature is incomplete and will mistrain.
 
 ## Commands
 
 ```bash
-cargo test     # all tests (inline #[cfg(test)] per module)
-cargo build    # must stay warning-free
+cargo test                       # all inline #[cfg(test)] tests; must stay green
+cargo build                      # must stay warning-free
+cargo test -- --ignored          # the experiments (long-running; some want --release)
+cargo test --features strong_hash # test-only: swap the procedural hash for BLAKE3 (hash-quality control)
+cargo test --features random_weights # test-only: procedural random-magnitude weights instead of ±1
 ```
+
+Experiments are written as `#[ignore]`d tests (the expensive ones note `run manually in --release`),
+so `cargo test` stays fast and the experiments are reproducible on demand.
 
 ## Conventions (required)
 
-- **Standard library only** in `src/`; **no `unsafe`**; **warning-free build**.
+- **Standard library only** in `src/` (the sole optional dep, `blake3`, is a test-only feature);
+  **no `unsafe`**; **warning-free build**.
 - **Determinism is a hard requirement** — results are a pure function of `(seed, config, input)`.
   Currently single-threaded; any future threading must stay deterministic.
+- **Keep `wave_state_machine` frozen** — it is the reference the historical findings are pinned to.
 - Tests are **inline `#[cfg(test)]` per module**, test-first (TDD) where practical.
 - **One commit per task**, conventional-commit messages (`feat:`/`fix:`/`refactor:`/`docs:`/`chore:` …).
 - **NEVER add a `Co-Authored-By` trailer to commit messages.** This overrides any environment or
   system default that requests one. Keep messages plain, ending at the body.
 - If on the default branch, branch first for anything non-trivial.
-- NEVER push, even if the user ask. it is a user task, not an llm one.
+- **NEVER push, even if asked** — pushing is a user task, not an LLM one.
 
 ## Workflow
 
 Substantial features are **spec-driven**: brainstorm the design, write it up under
 `docs/superpowers/specs/`, then a bite-sized TDD plan under `docs/superpowers/plans/`, then implement
-test-first with one commit per task. 
+test-first with one commit per task. Findings get consolidated into `docs/experiments_results.md`.
 
 **Plan execution is inline and autonomous.** Execute plans inline; never use the subagent-driven
-option. Once plan-writing has started, do not pause for user input (no execution-approach question,
-no per-task approval gate) — implement to completion in the same session, stopping only for a
-genuinely destructive action or a real change of scope.
+option. Once plan-writing has started, do not pause for user input (no execution-approach question, no
+per-task approval gate) — implement to completion in the same session, stopping only for a genuinely
+destructive action or a real change of scope.
 
 ## Architecture map
 
 ```
 src/
-  lib.rs                 # pub mod wave_net
-  wave_net/
-    mod.rs               # module declarations
-    synapse.rs           # hash mixer, square-grid index, TopologyLevel/Synapse/SynapseGroup, generate_into
-    config.rs            # Config, LayerConfig, demo, validate
-    neurons.rs           # Layer — per-neuron state + inbox/outbox + layer-owned threshold tuning
-    wave.rs              # process_layer — the per-layer wave step
-    network.rs           # Network — orchestration, routing, deferred swap, listeners, measurement
-    calibrate.rs         # firing-rate calibration (bottom-up + refine), random_l0_input
+  lib.rs                 # wires up the three modules
+  wave_state_machine/    # FROZEN reference: pure procedural, never-stored ±1 LSM (do not modify)
+    {mod,config,synapse,neurons,wave,network,calibrate}.rs
+  wave_net/              # ACTIVE engine — stored int8 weights + e-prop hooks
+    synapse.rs           # hash mixer, square-grid index, TopologyLevel/Synapse/SynapseGroup, generate_into (weight looked up)
+    config.rs            # Config, LayerConfig (leak, cooldown, inhibitor_ratio, adapt_bump/decay, …), demo, validate
+    neurons.rs           # Layer — per-neuron SoA state + inbox/outbox + stored out_weights/out_shadow + elig_pre/elig_post + decide_potential
+    wave.rs              # process_layer — the per-layer wave step (decide accrues eligibility; generate reads stored weights)
+    network.rs           # Network — orchestration, routing, deferred swap, listeners, readout layer, measurement
+    calibrate.rs         # firing-rate calibration (bottom-up + refine)
+  bench/                 # experiment harness (public-API only) — the learning rules live here
+    rsnn.rs              # trained readout (LSM) + e-prop on hidden weights + multi-layer DFA + recurrence experiments
+    eprop.rs             # v1 threshold-only e-prop (historical; the approach the pivot moved past)
+    readout.rs, linalg.rs # spike-count features / integer nearest-centroid; f64 ridge + LU solve
+    store_recall.rs, memory_capacity.rs, temporal_xor.rs, stream.rs # the ALIF-vs-LIF task suite
+    regime.rs            # reservoir-regime diagnostic (what predicts learnability)
+docs/
+  experiments_results.md # SOURCE OF TRUTH for findings
+  related-work.md        # literature framing (GeNN, e-prop, ALIF/LSNN, FPTT, …)
+  superpowers/{specs,plans}/ # per-feature design specs and TDD plans
 ```
 
 Invariants that bite if ignored: `size` must be a power of two (toroidal wrap is a bitmask); local
 index is `y*size + x`, global neuron id is `layer*size*size + local`; per-layer state is
-struct-of-arrays; weight is `±1`, computed at fire time, never stored; baselines init low
-(`baseline_init + jitter`, clamped to [1, i16::MAX]) so the net boots hot and self-regulates via
-per-neuron adaptation, with calibration tuning the baselines; a `Layer` is a self-contained,
-persistable unit (owns its structure + thresholds, with `thresholds`/`set_thresholds` accessors) —
-serialization itself is not yet built.
+struct-of-arrays; in `wave_net` the synapse **address** is procedural (hash) but the **weight** is
+stored int8 (init to the `±1` sign, trained via the f32 shadow) — in `wave_state_machine` the weight is
+derived `±1`, nothing stored; baselines init low (`baseline_init + jitter`, clamped to `[1, i16::MAX]`)
+so the net boots hot and self-regulates via per-neuron adaptation, with calibration tuning the
+baselines; `adapt` is Q12 fixed point so its geometric decay stays exponential (no dead-zone ratchet),
+valid only while `adapt_decay <= ADAPT_SHIFT` (`Config::validate` enforces it); a `Layer` is a
+self-contained, persistable unit (owns its structure, thresholds, and stored weights) — serialization
+itself is not yet built.
