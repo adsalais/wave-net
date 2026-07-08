@@ -36,6 +36,8 @@ pub struct RsnnConfig {
     pub adapt_decay: u8,  // ALIF adaptation decay shift
     pub rec_init: i8,     // initial recurrent weight (0 = keep procedural ±1; >0 bootstraps self-excitation)
     pub multi_layer: bool, // train every feed-forward layer (DFA credit), not just the last
+    pub back_count: u32,   // level −1/−2 backward synapses per neuron (0 = feed-forward only)
+    pub back_radius: u32,  // backward recurrence radius
     pub calib: CalibrateParams,
     pub calib_fraction_q16: u32,
 }
@@ -68,6 +70,8 @@ impl RsnnConfig {
             adapt_decay: 6,
             rec_init: 0,
             multi_layer: false,
+            back_count: 0,
+            back_radius: 2,
             calib: CalibrateParams { warmup: 16, waves: 48, max_steps: 24, refine_passes: 3, ..CalibrateParams::default() },
             calib_fraction_q16: 20000,
         }
@@ -107,6 +111,27 @@ impl RsnnConfig {
         };
         let l1 = LayerConfig { topology: l1_topo, ..l0.clone() };
         Config { seed: self.seed, size: self.size, layers: vec![l0, l1] }
+    }
+
+    /// Multi-layer net with a uniform [+1, −1, −2] topology (backward levels only when back_count>0).
+    /// Off-stack targets (top's +1, L0's −1/−2) are dropped by the router — harmless.
+    fn engine_config_recurrent(&self) -> Config {
+        let mut topo = vec![TopologyLevel { level: 1, radius: self.up_radius, count: self.up_count }];
+        if self.back_count > 0 {
+            topo.push(TopologyLevel { level: -1, radius: self.back_radius, count: self.back_count });
+            topo.push(TopologyLevel { level: -2, radius: self.back_radius, count: self.back_count });
+        }
+        let layer = LayerConfig {
+            topology: topo,
+            leak: (3, 5),
+            cooldown_base: 2,
+            inhibitor_ratio: 0,
+            threshold_jitter: 32,
+            baseline_init: 6,
+            adapt_bump: self.adapt_bump,
+            adapt_decay: self.adapt_decay,
+        };
+        Config { seed: self.seed, size: self.size, layers: vec![layer; self.layers] }
     }
 }
 
@@ -188,6 +213,54 @@ pub fn train_readout(cfg: &RsnnConfig) -> u64 {
 
 /// Regenerate the procedural target of source neuron `src_local`'s level-`+1` slot `k` (matches
 /// `generate_into`), so the e-prop update can pair a stored weight with its postsynaptic neuron.
+/// The topology entries (level, count, radius) in the same order as `engine_config_recurrent`, so the
+/// training loop can walk out_weights slots and know each slot's level/target.
+fn topo_entries(cfg: &RsnnConfig) -> Vec<(i32, usize, u32)> {
+    let mut e = vec![(1i32, cfg.up_count as usize, cfg.up_radius)];
+    if cfg.back_count > 0 {
+        e.push((-1, cfg.back_count as usize, cfg.back_radius));
+        e.push((-2, cfg.back_count as usize, cfg.back_radius));
+    }
+    e
+}
+
+/// Temporal-XOR trial (reset → cue(a) → delay → cue(b) → read) on a multi-layer net. Records every
+/// computational layer's per-wave fired-set and returns (top-layer read-window spike counts, spikes[z][t]).
+fn xor_trial_layers(net: &mut Network, cfg: &RsnnConfig, a: usize, b: usize, trial: usize) -> (Vec<f32>, Vec<Vec<Vec<u32>>>) {
+    let l = net.layer_count();
+    let ls = (cfg.size * cfg.size) as usize;
+    let rec: Arc<Mutex<Vec<Vec<Vec<u32>>>>> = Arc::new(Mutex::new(vec![Vec::new(); l]));
+    for z in 1..l {
+        let r = rec.clone();
+        net.on_layer(z, Box::new(move |_w, fired: &[u32]| r.lock().unwrap()[z].push(fired.to_vec())));
+    }
+    net.reset_state();
+    let present = |net: &mut Network, class: usize, phase: usize| {
+        for w in 0..cfg.present_waves {
+            let sites = cue_realization(cfg.task_seed, cfg.size, class, trial * 2 + phase, w, cfg.base_q16, cfg.keep_q16, cfg.noise_q16);
+            net.wave(&sites);
+        }
+    };
+    present(net, a, 0);
+    for _ in 0..cfg.delay {
+        net.wave(&[]);
+    }
+    present(net, b, 1);
+    for _ in 0..cfg.read_waves {
+        net.wave(&[]);
+    }
+    net.clear_listeners();
+    let spikes = rec.lock().unwrap().clone();
+    let ttot = spikes[l - 1].len();
+    let mut act = vec![0f32; ls];
+    for wv in spikes[l - 1].iter().skip(ttot - cfg.read_waves) {
+        for &loc in wv {
+            act[loc as usize] += 1.0;
+        }
+    }
+    (act, spikes)
+}
+
 const P_DFA: u64 = 61; // fixed random Direct-Feedback-Alignment weights
 
 /// Fixed random ±1 DFA feedback weight for (target neuron `neuron_global`, output class `class`) —
@@ -416,6 +489,109 @@ pub fn train_xor(cfg: &RsnnConfig) -> u64 {
     (correct as u64 * 1000) / holdout as u64
 }
 
+/// Train (readout + all synapses via one temporal eligibility over every topology level) on temporal XOR,
+/// multi-layer net. `back_count = 0` is the feed-forward baseline. Returns held-out test accuracy permille.
+pub fn train_recurrent(cfg: &RsnnConfig) -> u64 {
+    let mut net = Network::new(cfg.engine_config_recurrent());
+    net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
+    let l = net.layer_count();
+    let ls = (cfg.size * cfg.size) as usize;
+    let top = l - 1;
+    let entries = topo_entries(cfg);
+    let total_slots: usize = entries.iter().map(|(_, c, _)| c).sum();
+    let mut w = vec![vec![0f32; ls]; 2];
+    let score = |w: &[Vec<f32>], a: &[f32]| -> Vec<f32> {
+        (0..2).map(|c| w[c].iter().zip(a).map(|(wi, ai)| wi * ai).sum()).collect()
+    };
+    let decay = 1.0 - 1.0 / cfg.rec_tau.max(1.0);
+    for t in 0..cfg.trials {
+        let (a, b) = pick_ab(cfg.task_seed, t);
+        let label = a ^ b;
+        let (act, spikes) = xor_trial_layers(&mut net, cfg, a, b, t);
+        let p = softmax(&score(&w, &act));
+        let err: Vec<f32> = (0..2).map(|c| p[c] - if c == label { 1.0 } else { 0.0 }).collect();
+        for c in 0..2 {
+            for j in 0..ls {
+                w[c][j] -= cfg.readout_lr * err[c] * act[j];
+            }
+        }
+        if cfg.hidden_lr == 0.0 {
+            continue;
+        }
+        let ttot = spikes[top].len();
+        let mut fired = vec![vec![vec![0f32; ls]; ttot]; l];
+        let mut pretr = vec![vec![vec![0f32; ls]; ttot]; l];
+        for z in 1..l {
+            for (tt, wv) in spikes[z].iter().enumerate() {
+                for &loc in wv {
+                    fired[z][tt][loc as usize] = 1.0;
+                }
+            }
+            for i in 0..ls {
+                let mut tr = 0.0;
+                for tt in 0..ttot {
+                    tr = tr * decay + fired[z][tt][i];
+                    pretr[z][tt][i] = tr;
+                }
+            }
+        }
+        let l_sig = |tz: usize, j: usize| -> f32 {
+            (0..2)
+                .map(|c| {
+                    let bb = if tz == top { w[c][j] } else { dfa_weight(cfg.seed, (tz * ls + j) as u32, c) };
+                    bb * err[c]
+                })
+                .sum()
+        };
+        for z in 0..l {
+            let mut updates: Vec<(usize, f32)> = Vec::new();
+            let mut slot = 0usize;
+            for &(level, count, radius) in &entries {
+                let tz_i = z as i32 + level;
+                if tz_i < 1 || tz_i >= l as i32 {
+                    slot += count; // off-stack or into-L0 target — untrainable
+                    continue;
+                }
+                let tz = tz_i as usize;
+                for i in 0..ls {
+                    let sg = (z * ls + i) as u32;
+                    for k in 0..count {
+                        let j = target_of(cfg.seed, sg, i as u32, level, k as u32, radius, cfg.size) as usize;
+                        let mut e = 0f32;
+                        for tt in 0..ttot {
+                            e += pretr[z][tt][i] * fired[tz][tt][j];
+                        }
+                        if e != 0.0 {
+                            updates.push((i * total_slots + slot + k, -cfg.hidden_lr * l_sig(tz, j) * e));
+                        }
+                    }
+                }
+                slot += count;
+            }
+            net.with_layer_mut(z, |lz| {
+                for (idx, d) in &updates {
+                    lz.out_shadow[*idx] += *d;
+                }
+                for (wq, s) in lz.out_weights.iter_mut().zip(&lz.out_shadow) {
+                    *wq = s.round().clamp(-127.0, 127.0) as i8;
+                }
+            });
+        }
+    }
+    let mut correct = 0usize;
+    let holdout = 400usize;
+    for t in cfg.trials..cfg.trials + holdout {
+        let (a, b) = pick_ab(cfg.task_seed, t);
+        let (act, _) = xor_trial_layers(&mut net, cfg, a, b, t);
+        let s = score(&w, &act);
+        let pred = if s[1] > s[0] { 1 } else { 0 };
+        if pred == (a ^ b) {
+            correct += 1;
+        }
+    }
+    (correct as u64 * 1000) / holdout as u64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -494,6 +670,49 @@ mod tests {
         eprintln!("worst single {worst_single}  worst multi {worst_multi}");
         assert!(worst_multi > 640, "multi-layer learns reliably at depth (worst {worst_multi})");
         assert!(worst_multi >= worst_single, "multi-layer is at least as good as single-layer at depth");
+    }
+
+    #[test]
+    #[ignore] // expensive (6 deep trainings) + a documented null; run manually in --release
+    fn backward_recurrence_vs_ff_on_temporal_xor() {
+        // Backward recurrence (level −1/−2) + width vs feed-forward on temporal XOR (LIF, delay 20).
+        // If +backward beats FF, recurrence earns its keep; if it nulls too, topology+capacity are
+        // controlled out and ψ (spike-time-only) is the implicated blocker.
+        let seeds = [0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF];
+        let mut best_ff = 0u64;
+        let mut best_bw = 0u64;
+        for &s in &seeds {
+            let mut ff = RsnnConfig::demo();
+            ff.seed = s;
+            ff.task_seed = s;
+            ff.size = 16;
+            ff.layers = 4;
+            ff.adapt_bump = 0; // LIF
+            ff.delay = 20;
+            ff.trials = 1500;
+            let mut bw = ff.clone();
+            bw.back_count = 8; // backward recurrence on
+            let ff_acc = train_recurrent(&ff);
+            let bw_acc = train_recurrent(&bw);
+            eprintln!("seed {s:#x}  FF {ff_acc}  +backward {bw_acc}");
+            best_ff = best_ff.max(ff_acc);
+            best_bw = best_bw.max(bw_acc);
+        }
+        eprintln!("best FF {best_ff}  best +backward {best_bw}");
+        assert!(best_bw >= 485, "sanity: accuracy in range (verdict is the printed comparison)");
+    }
+
+    #[test]
+    fn backward_recurrence_config_builds() {
+        let mut cfg = RsnnConfig::demo();
+        cfg.size = 16;
+        cfg.layers = 4;
+        cfg.back_count = 8;
+        let net = Network::new(cfg.engine_config_recurrent());
+        assert_eq!(net.layer_count(), 4);
+        let e = topo_entries(&cfg);
+        assert_eq!(e.iter().map(|(_, c, _)| c).sum::<usize>(), cfg.up_count as usize + 2 * 8);
+        assert_eq!(e.iter().map(|(lv, _, _)| *lv).collect::<Vec<_>>(), vec![1, -1, -2]);
     }
 
     #[test]
