@@ -198,6 +198,33 @@ ALIF held ~55% decoding at delay 24 — the adaptive-threshold memory is real an
   touching everything (much bigger than the floored-leak two-liner). Do it if/when the density
   requirement of floored-leak proves limiting; otherwise floored-leak suffices.
 
+## Bench findings: the two kinds of memory (store-recall vs MC), and what Spec 3 should train
+
+The Tier-0/1 bench (Specs 1–2) produced a clean complementary pair that reframes what "ALIF memory"
+*is* — and therefore what an e-prop-style training rule (Spec 3) should target.
+
+- **Store-recall / delayed match (Spec 1):** ALIF holds a cue across a silent delay that plain LIF
+  forgets (ALIF ~55% decode at delay 24 vs LIF at chance). This is **held / probed** memory: the cue
+  lives in the slow adaptation state, and a probe converts it into a readable spike pattern.
+- **Memory Capacity (Spec 2):** the *opposite* — plain **LIF has far higher MC than ALIF** (~1.57 vs
+  ~0.39). MC measures **delayed linear echo** (linearly reconstruct a specific past bit `u(t−k)`). LIF's
+  fading spike echo does this; adaptation is a slow low-pass integrator that **trades echo for
+  held/nonlinear memory** and cannot pinpoint one past bit. `adapt_bump = 0` is the max-MC point;
+  exposing the raw adaptation state to the readout did not help (low-pass, not echo).
+
+**So ALIF's memory is held / nonlinear-temporal, not linear echo — the two tasks bracket the two axes.**
+
+Implications for Spec 3 (e-prop-style threshold training):
+
+- **Train against a held-memory task**, not MC. Delayed-match / working-memory / nonlinear-temporal tasks
+  (store-recall, delayed-XOR, adding) reward what adaptation provides; MC is a *characterization* metric
+  (measure the echo/held tradeoff), not a training target.
+- **e-prop's eligibility trace on the per-neuron threshold** is precisely the machinery that assigns credit
+  to this slow held-state memory — the trainable variable and the memory it carries line up.
+- **Control for passive memory** when attributing memory to adaptation: recurrence carries memory on its
+  own (feed-forward isolates adaptation), and — before the floored-leak fix — frozen sub-threshold
+  potentials gave even LIF infinite memory. The bench harness already supports the feed-forward isolation.
+
 ## Sources
 
 Format: *Title* (tag) — Venue Year — link(s).
