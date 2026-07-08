@@ -18,17 +18,37 @@ optima — is tested directly with a 2D interaction grid (the OAT sweep can't se
 ## Metrics (on the calibrated, untrained reservoir)
 
 The computational reservoir (`comp_layer` × `layers`) is **shared** by V1 and V2b, so each metric is one
-number per config, correlated against both learners.
+number per config, correlated against both learners. Grouped by axis; all built on a shared `collect_states`
+primitive (per-trial flattened computational-layer spike counts + class label).
 
-1. **Separation ceiling** *(primary hypothesis)* — the reservoir's intrinsic class-separability. Collect
-   each trial's state (the per-neuron spike counts `trial_eligibility` returns, flattened over the
-   computational layers), fit a **held-out** `NearestCentroid` on `(state → class)`, report test accuracy
-   ‰. Hypothesis: this tracks learned accuracy, and dead configs sit at chance here.
-2. **Effective dimensionality** — participation ratio `PR = (tr C)² / tr(C²)` of the state covariance `C`
-   (trace-based; no eigensolver). Code richness: too sparse → low PR, saturated → low PR, good regime →
-   high.
-3. **Layer-gain profile** — mean firing fraction per computational layer (from the same states). Shows
-   whether activity dies before the top or saturates.
+**Separation (task-aligned):**
+1. **Separation ceiling** *(primary hypothesis)* — held-out `NearestCentroid` on `(state → class)`, test
+   accuracy ‰. Fit on the first half of trials, test on the second. Dead configs should sit at chance.
+2. **Fisher discriminant ratio** — continuous `S_B / S_W` = between-class scatter over within-class scatter
+   (trace form). Non-saturating companion to #1 (accuracy caps at 100%; Fisher keeps climbing → better
+   correlation dynamic range). Nearly free — reuses the collected states.
+3. **Forgetting curve** — the separation ceiling as `delay ∈ {0,2,4,8,16}`. Does class info *survive* the
+   hold? Explains the depth/adaptation brittleness of a held-category task.
+
+**Dimensionality / rank:**
+4. **Effective dimensionality** — participation ratio `PR = (tr C)² / tr(C²)` of the state covariance
+   (trace-based; no eigensolver). Code richness: sparse → low, saturated → low, good regime → high.
+5. **Kernel − generalization rank** *(Legenstein–Maass)* — PR of states across **distinct** inputs (signal
+   capacity) minus PR across **noisy copies of one** input (noise sensitivity). Captures the
+   separation/generalization tradeoff that *is* the density sweet spot (sparse loses kernel rank, dense
+   gains noise rank). PR is the soft/effective-rank proxy for the classic rank (no SVD) — documented.
+
+**Dynamical regime:**
+6. **Perturbation spread (σ / edge-of-chaos)** — flip one L0 injection site; per computational layer, the
+   Hamming divergence (neurons whose spike count differs) between base and perturbed states; `σ` = the
+   geometric growth of divergence layer-to-layer. `<1` ordered, `>1` chaotic, `≈1` critical. A distinct
+   axis from separation — tests whether the working pocket is literally criticality.
+7. **Layer-gain profile** — mean firing fraction per computational layer. Activity dies before the top, or
+   saturates.
+
+**Degeneracy (why a regime is bad):**
+8. **Dead / saturated fraction + synchrony** — fraction of neurons that never fire or fire every wave, and
+   mean pairwise spike-count correlation over a neuron-pair sample (lockstep → low-rank redundant code).
 
 ## Experiments (reported, `#[ignore]` reproducible runs)
 
@@ -42,28 +62,39 @@ number per config, correlated against both learners.
 
 ## Module & reuse
 
-New `src/bench/regime.rs`:
-- `separation_ceiling(cfg: &EpropConfig, trials: usize) -> u64` — build+calibrate (no training), collect
-  per-class states via `trial_eligibility`, fit `NearestCentroid` on the first half of trials, test on the
-  second half, return accuracy ‰.
-- `effective_dim(states: &[Vec<f64>]) -> f64` — participation ratio of the state covariance.
-- `layer_gain(cfg: &EpropConfig, trials: usize) -> Vec<f64>` — mean firing fraction per computational layer.
+New `src/bench/regime.rs`, built on one primitive:
+- `collect_states(cfg, trials) -> (Vec<Vec<u32>>, Vec<usize>)` — build+calibrate (no training), run `trials`
+  trials via `trial_eligibility`, return per-trial flattened computational-layer spike counts + class labels.
 
-Reuses `EpropConfig`/`comp_layer` (make the eligibility/state helpers `pub(crate)` as needed),
-`NearestCentroid` (`readout.rs`), and `bench::eprop::train` for the learned-accuracy column. No new linalg
-(PR is trace-based). No engine change.
+Then (each consumes states unless noted):
+- `separation_ceiling(cfg, trials) -> u64` — held-out `NearestCentroid`, accuracy ‰.
+- `fisher_ratio(states, labels, k) -> f64` — `S_B / S_W`.
+- `effective_dim(states) -> f64` — participation ratio.
+- `kernel_minus_gen_rank(cfg) -> f64` — PR over distinct-input states minus PR over noisy-same-input states
+  (its own two collection passes).
+- `perturbation_spread(cfg) -> f64` — per-layer Hamming divergence growth from a one-site input flip (a
+  paired base/perturbed collection).
+- `layer_gain(cfg, trials) -> Vec<f64>` — mean firing fraction per computational layer.
+- `degeneracy(states) -> (f64, f64, f64)` — dead fraction, saturated fraction, sampled pairwise synchrony.
+
+Reuses `EpropConfig`/`comp_layer`, `NearestCentroid` (`readout.rs`), `trial_eligibility` +
+`cue_realization`/`probe_pattern` (make `pub(crate)` as needed), and `bench::eprop::train` for the
+learned-accuracy columns. No new linalg (PR/Fisher are trace-based). **No engine change.**
 
 ## Success criterion
 
-- `separation_ceiling` **discriminates**: on the *known* working baseline it is clearly above chance, and on
-  a *known* dead config (e.g. `up_count = 8`) it is at/near chance — a unit test asserts working > dead and
-  working > chance.
+- `separation_ceiling` and `fisher_ratio` **discriminate**: on the *known* working baseline both are clearly
+  above the *known* dead config (e.g. `up_count = 8`), and the ceiling is above chance — unit tests assert
+  working > dead.
 - `effective_dim` matches hand-computed PR on synthetic matrices (rank-1 → ~1, isotropic `D`-dim → ~`D`).
-- The experiments run deterministically and produce the two tables for the findings doc.
+- `perturbation_spread` behaves at the extremes (a starved/subcritical config → `σ < 1`; a saturated config
+  → larger spread) — a monotonicity unit test, not an absolute value.
+- The experiments run deterministically and produce the metric-vs-learnability table + the topology grid.
 
-**Honesty gate:** if *no* metric cleanly predicts learnability (the split is muddy), that is the finding —
-report it; it means the regime is not captured by these three and the fix needs a different handle (e.g.
-a learnability proxy directly). Don't force a clean story.
+**Honesty gate:** with eight metrics, expect several to *not* predict learnability — report which do and
+which don't (that itself is informative: e.g. "criticality doesn't matter here but separation does"). If
+*none* cleanly splits learns-vs-collapses, report that too — the regime needs a different handle. Don't
+cherry-pick or force a clean story.
 
 ## Determinism & constraints
 
@@ -73,9 +104,13 @@ a learnability proxy directly). Don't force a clean story.
 ## Testing (inline `#[cfg(test)]`)
 
 - `separation_ceiling_discriminates_working_from_dead` — working baseline > chance+margin > dead config.
+- `fisher_ratio_discriminates_working_from_dead` — working > dead.
 - `effective_dim_matches_known_participation_ratio` — rank-1 ≈ 1, isotropic ≈ D (synthetic states).
+- `perturbation_spread_orders_regimes` — subcritical (starved) config `σ` < a denser config's.
+- `degeneracy_flags_dead_and_saturated` — synthetic states with known dead/saturated neurons.
 - `regime_metrics_are_deterministic`.
-- `_regime_vs_learnability` and `_topology_interaction_grid` — `#[ignore]` reporting runs.
+- `_regime_vs_learnability` and `_topology_interaction_grid` — `#[ignore]` reporting runs (all eight metrics
+  + V1/V2b learned accuracy).
 - Regression: whole suite stays green.
 
 ## Deliverable & next step
