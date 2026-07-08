@@ -346,23 +346,30 @@ the deep-net floor (680 vs 628). But every width plateaus by depth 4–5 — **w
 about one layer deeper, not arbitrarily.** So a deep network needs *proportionally wider* layers to keep
 separating, and even then depth eventually wins.
 
-**Calibration target rate — 10% is at the knee (and higher is unreachable without more drive).** Ceiling +
-learnability vs `calib.target_permille`:
+**Calibration target rate — and the confound it hid (firing rate is *not* the lever).** First pass looked
+tidy: ceiling collapses below 10% and is flat above, so "10% is the knee." But 10% is the value we chose, so
+we measured the *achieved* rate and varied the *drive* to check for circularity — and the tidy story broke:
 
-| target | ceiling | V1 | V2b |
-|---|---|---|---|
-| 2% | 525 | 556 | 494 |
-| 5% | 525 | 514 | 666 |
-| **10%** | 750 | 772 | 621 |
-| 20% | 750 | 772 | 621 |
-| 40% | 750 | 772 | 621 |
+- **Achieved task rate is decoupled from the target.** At `up_count=16`, targeting 5% / 10% / 20% / 40% all
+  produce the **same ~6.3%** task firing rate (the delay dilutes it and the drive pins it) — yet the ceiling
+  is 525 at target 5% but 750 at ≥10%. **Same rate, different separation** → the rate is not what changed;
+  the *threshold level* is (targeting ≥10% lands thresholds low enough, 5% leaves them too high → collapse).
+- **Denser drive fires faster but separates *worse*.** Raising `up_count` *does* lift the achievable rate
+  (16 → 6.3%, 32 → 13%, 48 → 19%), directly refuting "higher targets are unreachable" — but higher firing
+  **hurts**: ceiling 750 (up_count=16, 6.3%) → 525 (32, 13%) → 475 (48, 19%).
 
-Below ~10% the code is too sparse and separation **collapses to chance**. At ≥10% the results are
-**bit-identical** — the reservoir physically can't fire faster than ~10–15% at this drive, so calibration
-bottoms out at threshold = 1 and a higher target is a no-op. **10% sits right at the productive edge:**
-lower starves it, higher is unreachable *unless drive (density/leak) is increased first*. This ties the
-firing-rate target to the density lever — to exploit denser codes the fix must raise drive, not just the
-target.
+| up_count | achieved rate | ceiling |
+|---|---|---|
+| **16** | 6.3% | **750** |
+| 32 | 13.3% | 525 |
+| 48 | 18.7% | 475 |
+
+**Correction:** the earlier "10% is optimal / denser codes need more drive" was an **artifact of hand-tuning
+the drive to `up_count=16`**. The firing rate is an *epiphenomenon*, not a control knob — the real lever is
+**connectivity** (`up_count≈16` is the separation optimum; denser over-mixes toward saturation, sparser
+under-mixes). Calibration's only job here is to set thresholds *low enough* (any target ≥10% does that,
+after which the exact value is a no-op). **The fix should target separation via connectivity, not chase a
+firing-rate number.** (Credit: this correction came from *not* trusting a suspiciously convenient result.)
 
 ## Engine finding along the way — the floored leak
 
