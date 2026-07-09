@@ -906,6 +906,65 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // expensive; run manually in --release
+    fn rate_reg_depth_wall() {
+        // Does keeping every layer alive push the depth-20 wall (doc's ceiling ~485)? Worst-seed held-out,
+        // multi-layer, trial length scaled to depth, rate_reg off vs a c_reg sweep.
+        let seeds = [0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF];
+        let depth = 20usize;
+        for reg in [0.0f32, 0.1, 0.5, 2.0] {
+            let mut worst = 1000u64;
+            for &s in &seeds {
+                let mut c = RsnnConfig::demo();
+                c.seed = s;
+                c.task_seed = s;
+                c.size = 16;
+                c.layers = depth;
+                c.multi_layer = true;
+                c.trials = 1500;
+                c.present_waves = depth; // scale trial length to depth
+                c.read_waves = depth;
+                c.delay = 4;
+                c.rate_reg = reg;
+                c.rate_target_permille = 100;
+                let acc = train_eprop(&c);
+                eprintln!("depth {depth} rate_reg {reg} seed {s:#x}  {acc}");
+                worst = worst.min(acc);
+            }
+            eprintln!("depth {depth} rate_reg {reg}: WORST {worst}");
+        }
+    }
+
+    #[test]
+    #[ignore] // expensive; run manually in --release
+    fn rate_reg_revives_dead_layers() {
+        // Per-layer firing rate of a TRAINED deep net, rate_reg off vs on. Off: deep layers dead (~0).
+        // On: they should fire near the target through the full depth (liveness climbed the stack).
+        for reg in [0.0f32, 0.5] {
+            let mut c = RsnnConfig::demo();
+            c.seed = 0xE9_0B_0A17;
+            c.task_seed = 0xE9_0B_0A17;
+            c.size = 16;
+            c.layers = 16;
+            c.multi_layer = true;
+            c.trials = 800;
+            c.present_waves = 16;
+            c.read_waves = 16;
+            c.delay = 4;
+            c.rate_reg = reg;
+            c.rate_target_permille = 100;
+            let (mut net, _w) = train_eprop_inner(&c);
+            let rates = net.measure_layer_rates(
+                c.calib.warmup,
+                c.calib.waves,
+                &random_l0_input(c.seed ^ 0xE9, c.size, c.calib_fraction_q16),
+            );
+            let r2: Vec<f64> = rates.iter().map(|x| (x * 100.0).round() / 100.0).collect();
+            eprintln!("rate_reg {reg}: per-layer rates {r2:?}");
+        }
+    }
+
+    #[test]
     fn rate_reg_path_is_deterministic() {
         let mut cfg = RsnnConfig::demo();
         cfg.layers = 4;
