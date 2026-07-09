@@ -1267,6 +1267,29 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // diagnostic; fast (no training)
+    fn adapt_vs_propagation() {
+        // Does ALIF adaptation quench FORWARD propagation (starving deep layers → sub-critical)? Plain
+        // 4-layer feed-forward stack; present a cue and count per-layer spikes over the trial, for
+        // adapt_bump 0 (LIF), 20, 40. If deep-layer (L3) spikes fall as adaptation rises, adaptation is
+        // suppressing the gain — the "ALIF fights recurrence/propagation" hypothesis.
+        for ab in [0i16, 20, 40] {
+            let mut c = RsnnConfig::demo();
+            c.size = 16;
+            c.layers = 4;
+            c.up_count = 32;
+            c.back_count = 0; // plain forward stack
+            c.delay = 12;
+            c.adapt_bump = ab;
+            let mut net = Network::new(c.engine_config_recurrent());
+            net.calibrate(&c.calib, &random_l0_input(c.seed ^ 0xE9, c.size, c.calib_fraction_q16));
+            let (_, spikes, _) = xor_trial_layers(&mut net, &c, 1, 0, 0);
+            let per_layer: Vec<usize> = (1..spikes.len()).map(|z| spikes[z].iter().map(|w| w.len()).sum()).collect();
+            eprintln!("adapt_bump {ab}: L1..L3 total spikes over a cue trial {per_layer:?}");
+        }
+    }
+
+    #[test]
     fn train_l2l3loop_is_deterministic() {
         let mut cfg = RsnnConfig::demo();
         cfg.size = 8;
