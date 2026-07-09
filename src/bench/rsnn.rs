@@ -440,6 +440,45 @@ fn xor_trial(net: &mut Network, cfg: &RsnnConfig, a: usize, b: usize, trial: usi
     (act, waves)
 }
 
+/// reset → for each class in `classes`: (a `delay` gap before every cue except the first) present
+/// cue(class) for `present_waves` → `read_waves` silent. Records L1 per-wave fired-sets; returns
+/// (read-window L1 spike counts, per-wave fired-sets). Generalizes `xor_trial`: `classes = [a, b]` with the
+/// per-cue seed `trial·n + pos` reproduces `xor_trial(a, b)` exactly.
+fn sequence_trial(net: &mut Network, cfg: &RsnnConfig, classes: &[usize], trial: usize) -> (Vec<f32>, Vec<Vec<u32>>) {
+    let ls = (cfg.size * cfg.size) as usize;
+    let n = classes.len();
+    let rec: Arc<Mutex<Vec<Vec<u32>>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let r = rec.clone();
+        net.on_layer(1, Box::new(move |_w, fired: &[u32]| r.lock().unwrap().push(fired.to_vec())));
+    }
+    net.reset_state();
+    for (pos, &class) in classes.iter().enumerate() {
+        if pos > 0 {
+            for _ in 0..cfg.delay {
+                net.wave(&[]);
+            }
+        }
+        for w in 0..cfg.present_waves {
+            let sites = cue_realization(cfg.task_seed, cfg.size, class, trial * n + pos, w, cfg.base_q16, cfg.keep_q16, cfg.noise_q16);
+            net.wave(&sites);
+        }
+    }
+    let read_start = rec.lock().unwrap().len();
+    for _ in 0..cfg.read_waves {
+        net.wave(&[]);
+    }
+    net.clear_listeners();
+    let waves = rec.lock().unwrap().clone();
+    let mut act = vec![0f32; ls];
+    for wave in waves.iter().skip(read_start) {
+        for &loc in wave {
+            act[loc as usize] += 1.0;
+        }
+    }
+    (act, waves)
+}
+
 /// Temporal e-prop on the L1 level-0 recurrent weights. Builds a decaying presynaptic trace per neuron
 /// over the recorded waves, correlates it with postsynaptic spikes (`e_ij = Σ_t pre_trace_i(t)·fired_j(t)`),
 /// and updates the stored weights via the symmetric-feedback learning signal.
@@ -921,6 +960,25 @@ mod tests {
         cfg.rate_target_permille = 100;
         cfg.trials = 150;
         assert_eq!(train_recurrent(&cfg), train_recurrent(&cfg));
+    }
+
+    #[test]
+    fn sequence_trial_matches_xor_on_two_cues() {
+        // The 2-cue sequence must reproduce xor_trial exactly (same gap structure, same per-cue seed scheme).
+        let mut cfg = RsnnConfig::demo();
+        cfg.delay = 20;
+        cfg.rec_count = 0;
+        let build = || {
+            let mut net = Network::new(cfg.engine_config_xor());
+            net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
+            net
+        };
+        let mut n1 = build();
+        let mut n2 = build();
+        let (a1, w1) = xor_trial(&mut n1, &cfg, 1, 0, 3);
+        let (a2, w2) = sequence_trial(&mut n2, &cfg, &[1, 0], 3);
+        assert_eq!(a1, a2, "read-window activity matches xor_trial");
+        assert_eq!(w1, w2, "per-wave fired-sets match xor_trial");
     }
 
     #[test]
