@@ -9,9 +9,10 @@ pub struct TopologyLevel {
 pub struct Synapse {
     // neuron that will receive the input
     pub target: u32,
-    /// Signed integer weight delivered to `target`. Default build: `±1` (binary sign only). With
-    /// `--features random_weights`: `sign × magnitude`, magnitude hash-drawn from `1..=16` (a richer,
-    /// still-procedural projection — as in GeNN, where procedural weights follow a distribution).
+    /// Signed weight delivered to `target` — the source layer's stored plastic weight, looked up from
+    /// `out_weights` in `generate_into` (init `±1` sign from `inhibitor_ratio`, trained into the full
+    /// int8 range via the `f32` shadow). Carried on the `Synapse` because the *target* layer folds it
+    /// in at drain time, but the weight is owned by the *source* layer.
     pub weight: i16,
 }
 
@@ -24,10 +25,11 @@ pub struct SynapseGroup {
 }
 
 /// Hash purpose tags (keep stable — they seed distinct hash streams).
+/// (`wave_state_machine` also defines `P_WEIGHT` for its fire-time magnitude draw; `wave_net`
+/// stores weights instead of hashing them, so it has no `P_WEIGHT`.)
 pub const P_TARGET: u64 = 1;
 pub const P_THRESHOLD: u64 = 3;
 pub const P_INPUT: u64 = 5;
-pub const P_WEIGHT: u64 = 7;
 
 /// splitmix64 finalizer — the default integer mixer (dependency-free, deterministic).
 #[cfg(not(feature = "strong_hash"))]

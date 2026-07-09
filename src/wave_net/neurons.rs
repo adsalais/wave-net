@@ -36,7 +36,6 @@ pub struct Layer {
     pub leak: (u8, u8),
     pub cooldown_base: u8,
     pub topology: Vec<TopologyLevel>,
-    pub inhibitor_ratio: u32,
     pub adapt_bump: i16,   // added to adapt on each fire (0 = plain LIF)
     pub adapt_decay: u8,   // right-shift decay of adapt per wave
     pub readout: bool,     // non-spiking drain-only output layer: integrates input, never fires
@@ -86,7 +85,6 @@ impl Layer {
             leak: cfg.leak,
             cooldown_base: cfg.cooldown_base,
             topology: cfg.topology.clone(),
-            inhibitor_ratio: cfg.inhibitor_ratio,
             adapt_bump: cfg.adapt_bump,
             adapt_decay: cfg.adapt_decay,
             readout: false,
