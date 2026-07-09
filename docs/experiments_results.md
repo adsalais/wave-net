@@ -340,3 +340,38 @@ showing it earn its keep needs a task that genuinely demands recurrent computati
 direction is consistent across all three delays. The `rate_reg`-in-recurrence machinery
 (`recurrent_update` / `train_recurrent`) remains available as the field's light liveness term, not a memory
 mechanism.
+
+## Recurrence benchmark suite: trained recurrence doesn't earn its keep (and hurts parity)
+
+To avoid concluding from one task, built a suite of tasks that need recurrent *computation* — a monotone
+adaptation accumulator provably can't fake them — and ran **ALIF, FF vs +lateral-recurrence, 3 seeds**:
+**sequential parity** (N-bit, `label = ⊕ bits`), **delayed XOR with a distractor cue**, and a **set/reset
+flip-flop**. (`bench::rsnn`: `sequence_trial` / `train_sequence` / `task_parity` / `task_distractor` /
+`task_flipflop`.)
+
+**Parity (worst-seed over 3 seeds):**
+
+| N | FF (no recurrence) | + lateral recurrence |
+|---|---|---|
+| 2 | 967 | 825 |
+| 3 | 817 | 700 |
+| 4 | 670 | 522 |
+| 5 | 590 | 515 |
+
+- FF degrades with N (parity is non-monotone → harder) but stays **above chance even at N=5** — the ALIF
+  *feed-forward* reservoir + readout captures *partial* parity on its own.
+- **+rec is worse than FF at every N.** On the canonical recurrence task, trained lateral recurrence
+  consistently *degrades* performance.
+
+**Distractor-XOR:** FF wins 2/3 seeds (worst-seed FF 857 > rec 800); one seed showed a rec advantage
+(972 vs 857) but not reliably across seeds. **Flip-flop:** FF ≈ rec, both high (880–982) — **ALIF solves it
+as held memory; recurrence neither needed nor helpful** (flip-flop is memory, not computation).
+
+**Reading.** Robust across tasks *and* N: **trained lateral recurrence via the crude spike-timing e-prop
+never reliably helps — it hurts parity at every N, mostly loses distractor, and ties flip-flop.** Because the
+ALIF feed-forward reservoir captures *partial* parity while trained recurrence *degrades* it, the bottleneck
+is the **credit rule** (the temporal eligibility injects noise rather than useful recurrent computation), not
+substrate capacity. This is the same conclusion the depth wall (credit rule, not liveness) and the temporal-
+XOR check (adaptation holds; recurrence hurts) reached — now robust across a purpose-built task suite, not a
+single measurement. **The next lever for recurrence is proper temporal credit — surrogate-gradient BPTT — not
+more tuning of the eligibility, the operating point, or the topology.**
