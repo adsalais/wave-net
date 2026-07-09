@@ -826,6 +826,93 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // expensive; run manually in --release
+    fn lateral_gap_survival() {
+        // Does rate reg keep the level-0 recurrent loop (L1) alive through the 20-wave gap? Per-wave L1 spike
+        // counts on a TRAINED net, reg off vs on. Off: activity dies in ~6 waves. On: should persist. Trial
+        // phases (present 6, delay 20, present 6, read 6): present-A 0..6, GAP 6..26, present-B 26..32, read 32..38.
+        for reg in [0.0f32, 5.0] {
+            let mut c = RsnnConfig::demo();
+            c.seed = 0xE9_0B_0A17;
+            c.task_seed = 0xE9_0B_0A17;
+            c.adapt_bump = 0;
+            c.delay = 20;
+            c.rec_count = 24;
+            c.rec_radius = 2;
+            c.rec_tau = 20.0;
+            c.rec_init = 0;
+            c.trials = 800;
+            c.rate_reg = reg;
+            c.rate_target_permille = 100;
+            let (mut net, _w) = train_xor_inner(&c);
+            let (_, waves) = xor_trial(&mut net, &c, 1, 0, 0);
+            let per_wave: Vec<usize> = waves.iter().map(|wv| wv.len()).collect();
+            eprintln!("rate_reg {reg}: L1 spikes/wave {per_wave:?}");
+        }
+    }
+
+    #[test]
+    #[ignore] // expensive; run manually in --release
+    fn lateral_recurrence_vs_ff() {
+        // Level-0 lateral recurrence + rate reg vs feed-forward on temporal XOR (LIF, delay 20), multi-seed.
+        let seeds = [0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF];
+        let (mut best_ff, mut best_rec) = (0u64, 0u64);
+        for &s in &seeds {
+            let mut ff = RsnnConfig::demo();
+            ff.seed = s;
+            ff.task_seed = s;
+            ff.adapt_bump = 0;
+            ff.delay = 20;
+            ff.trials = 1500;
+            let mut rec = ff.clone();
+            rec.rec_count = 24;
+            rec.rec_radius = 2;
+            rec.rec_tau = 20.0;
+            rec.rec_init = 0;
+            rec.rate_reg = 5.0;
+            rec.rate_target_permille = 100;
+            let fa = train_xor(&ff);
+            let ra = train_xor(&rec);
+            eprintln!("lateral seed {s:#x}  FF {fa}  +rec+reg {ra}");
+            best_ff = best_ff.max(fa);
+            best_rec = best_rec.max(ra);
+        }
+        eprintln!("lateral: best FF {best_ff}  best +rec+reg {best_rec}");
+    }
+
+    #[test]
+    #[ignore] // expensive; run manually in --release
+    fn backward_recurrence_vs_ff() {
+        // Backward recurrence (level −1/−2) + rate reg vs feed-forward on temporal XOR (LIF, delay 20), on the
+        // alive-LIF deep config (size 16, depth 4, up_count 32). Multi-seed. Compare to the lateral result.
+        let seeds = [0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF];
+        let (mut best_ff, mut best_bw) = (0u64, 0u64);
+        for &s in &seeds {
+            let mut ff = RsnnConfig::demo();
+            ff.seed = s;
+            ff.task_seed = s;
+            ff.size = 16;
+            ff.layers = 4;
+            ff.adapt_bump = 0;
+            ff.delay = 20;
+            ff.trials = 1500;
+            ff.up_count = 32; // alive-LIF drive for the deep net
+            ff.present_waves = 12;
+            ff.base_q16 = 30000;
+            let mut bw = ff.clone();
+            bw.back_count = 8;
+            bw.rate_reg = 5.0;
+            bw.rate_target_permille = 100;
+            let fa = train_recurrent(&ff);
+            let ba = train_recurrent(&bw);
+            eprintln!("backward seed {s:#x}  FF {fa}  +back+reg {ba}");
+            best_ff = best_ff.max(fa);
+            best_bw = best_bw.max(ba);
+        }
+        eprintln!("backward: best FF {best_ff}  best +back+reg {best_bw}");
+    }
+
+    #[test]
     fn rate_reg_backward_is_deterministic() {
         let mut cfg = RsnnConfig::demo();
         cfg.size = 16;
