@@ -306,3 +306,37 @@ active. The regularizer adds *class-agnostic* activity, not class information. T
 long-suspected DFA ceiling and points the next lever at **symmetric feedback / surrogate-gradient BPTT**, not
 the dynamics. (Rate regularization stands as a working, field-standard liveness mechanism — `RsnnConfig.rate_reg`
 — now available for any deep config, just not the depth-20 bottleneck.)
+
+## Field-standard check: ALIF holds temporal XOR alone; recurrence doesn't extend it
+
+A literature review (see `related-work.md`, 2026-07-09) corrected the recurrence setup: in the e-prop/LSNN
+world **ALIF adaptation is the delay-memory mechanism**, rate regularization is a soft efficiency term (not a
+memory tool, and a *uniform* target erodes input coding), and threshold calibration is a one-time *sensible
+init* — not a rate that must transfer to the task (our `calibrate` measures ~10% on a *sparser random* drive
+than the denser task cue, so the task actually runs at 20–40%; that's fine as an init, it just isn't a
+target). Prior recurrence experiments had **stripped ALIF** ("to isolate recurrence"), removing the very
+mechanism the field relies on — so those LIF nulls were expected, not informative about recurrence's value.
+
+Re-ran the question the field's way — **ALIF-FF vs ALIF + lateral recurrence** on temporal XOR, delays
+bracketing ALIF's horizon (single seed, calibration as init, rate reg off, `rec_count 24`, `rec_tau = delay`):
+
+| delay | ALIF-FF | ALIF + lateral recurrence |
+|---|---|---|
+| 40 | 885 | 750 |
+| 80 | 947 | 652 |
+| 120 | 835 | 672 |
+
+- **ALIF alone solves it out to 120+ waves** — no horizon reached in range (835–947, well above chance 500).
+  Adaptation is a strong, *sufficient* delay memory; there is no gap for recurrence to fill.
+- **Recurrence hurts at every delay** (652–750 vs 835–947) — lateral recurrence + the crude spike-timing
+  e-prop adds interference to the adaptation-held representation rather than extending it. Consistent with the
+  earlier "recurrence hurts XOR" sweep, now confirmed on the *field-standard ALIF* setup.
+
+**Reading.** On the correct setup the result matches LSNN theory: **adaptation holds the memory; recurrence
+does not extend it** (and degrades it here). Temporal XOR is therefore the *wrong task* to demonstrate
+recurrence — ALIF dominates the whole delay range. Recurrence's potential value is *computation*, not memory;
+showing it earn its keep needs a task that genuinely demands recurrent computation beyond ALIF + feed-forward
+— an open problem on this substrate (the ALIF-vs-LIF sweeps have found no such task yet). Single-seed; the
+direction is consistent across all three delays. The `rate_reg`-in-recurrence machinery
+(`recurrent_update` / `train_recurrent`) remains available as the field's light liveness term, not a memory
+mechanism.
