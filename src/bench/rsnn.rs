@@ -1023,6 +1023,80 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // expensive; run manually in --release
+    fn parity_recurrence_sweep() {
+        // Sequential parity (non-monotone -> adaptation can't fake it). ALIF, FF vs +lateral-recurrence, over N.
+        // Expect FF to solve N=2 (that's XOR) and fail N>=3; does recurrence rescue it?
+        let seeds = [0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF];
+        for n in [2usize, 3, 4, 5] {
+            let (mut worst_ff, mut worst_rec) = (1000u64, 1000u64);
+            for &s in &seeds {
+                let mut ff = RsnnConfig::demo(); // ALIF on (adapt_bump 20), rate_reg off
+                ff.seed = s;
+                ff.task_seed = s;
+                ff.delay = 8;
+                ff.trials = 1500;
+                let mut rec = ff.clone();
+                rec.rec_count = 24;
+                rec.rec_radius = 2;
+                rec.rec_tau = 20.0;
+                rec.rec_init = 0;
+                let fa = train_sequence(&ff, |seed, t| task_parity(seed, t, n));
+                let ra = train_sequence(&rec, |seed, t| task_parity(seed, t, n));
+                eprintln!("parity N={n} seed {s:#x}  FF {fa}  +rec {ra}");
+                worst_ff = worst_ff.min(fa);
+                worst_rec = worst_rec.min(ra);
+            }
+            eprintln!("parity N={n}: WORST FF {worst_ff}  +rec {worst_rec}");
+        }
+    }
+
+    #[test]
+    #[ignore] // expensive; run manually in --release
+    fn distractor_xor_recurrence() {
+        // Delayed XOR with an irrelevant distractor cue between A and B. ALIF, FF vs +recurrence, multi-seed.
+        let seeds = [0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF];
+        for &s in &seeds {
+            let mut ff = RsnnConfig::demo();
+            ff.seed = s;
+            ff.task_seed = s;
+            ff.delay = 20;
+            ff.trials = 1500;
+            let mut rec = ff.clone();
+            rec.rec_count = 24;
+            rec.rec_radius = 2;
+            rec.rec_tau = 20.0;
+            rec.rec_init = 0;
+            let fa = train_sequence(&ff, task_distractor);
+            let ra = train_sequence(&rec, task_distractor);
+            eprintln!("distractor-XOR seed {s:#x}  FF {fa}  +rec {ra}");
+        }
+    }
+
+    #[test]
+    #[ignore] // expensive; run manually in --release
+    fn flipflop_recurrence() {
+        // Set/reset flip-flop, state held across the read gap. ALIF, FF vs +recurrence, multi-seed.
+        let seeds = [0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF];
+        for &s in &seeds {
+            let mut ff = RsnnConfig::demo();
+            ff.seed = s;
+            ff.task_seed = s;
+            ff.delay = 12;
+            ff.read_waves = 12; // read after a gap so the state must be held
+            ff.trials = 1500;
+            let mut rec = ff.clone();
+            rec.rec_count = 24;
+            rec.rec_radius = 2;
+            rec.rec_tau = 20.0;
+            rec.rec_init = 0;
+            let fa = train_sequence(&ff, |seed, t| task_flipflop(seed, t, 3));
+            let ra = train_sequence(&rec, |seed, t| task_flipflop(seed, t, 3));
+            eprintln!("flip-flop seed {s:#x}  FF {fa}  +rec {ra}");
+        }
+    }
+
+    #[test]
     fn train_sequence_is_deterministic() {
         let mut cfg = RsnnConfig::demo();
         cfg.delay = 8;
