@@ -613,13 +613,25 @@ pub fn train_recurrent(cfg: &RsnnConfig) -> u64 {
                 }
             }
         }
+        // per-(layer, neuron) firing rate for the rate regularizer (fraction of recorded waves j fired)
+        let rate: Vec<Vec<f32>> = (0..l)
+            .map(|z| {
+                (0..ls)
+                    .map(|j| (0..ttot).map(|tt| fired[z][tt][j]).sum::<f32>() / ttot.max(1) as f32)
+                    .collect()
+            })
+            .collect();
+        let r_target = cfg.rate_target_permille as f32 / 1000.0;
+        // Firing-rate regularization: keep every recurrent layer near r_target so the loop stays alive
+        // through the gap, carried by the same temporal eligibility. Guarded — rate_reg = 0 is byte-identical.
         let l_sig = |tz: usize, j: usize| -> f32 {
-            (0..2)
+            let task: f32 = (0..2)
                 .map(|c| {
                     let bb = if tz == top { w[c][j] } else { dfa_weight(cfg.seed, (tz * ls + j) as u32, c) };
                     bb * err[c]
                 })
-                .sum()
+                .sum();
+            task + if cfg.rate_reg != 0.0 { cfg.rate_reg * (rate[tz][j] - r_target) } else { 0.0 }
         };
         for z in 0..l {
             let mut updates: Vec<(usize, f32)> = Vec::new();
@@ -811,6 +823,20 @@ mod tests {
         for (tt, (sp, mv)) in act_per_wave.iter().enumerate() {
             println!("wave {tt:>3}  spikes(all) {sp:>4}  mean+v {mv:.2}");
         }
+    }
+
+    #[test]
+    fn rate_reg_backward_is_deterministic() {
+        let mut cfg = RsnnConfig::demo();
+        cfg.size = 16;
+        cfg.layers = 4;
+        cfg.back_count = 8;
+        cfg.adapt_bump = 0;
+        cfg.delay = 20;
+        cfg.rate_reg = 5.0;
+        cfg.rate_target_permille = 100;
+        cfg.trials = 150;
+        assert_eq!(train_recurrent(&cfg), train_recurrent(&cfg));
     }
 
     #[test]
