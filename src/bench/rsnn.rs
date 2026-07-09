@@ -41,6 +41,8 @@ pub struct RsnnConfig {
     pub subthreshold_psi: bool, // temporal-eligibility ψ from decide-time potential, not just spikes
     pub calib: CalibrateParams,
     pub calib_fraction_q16: u32,
+    pub rate_reg: f32,             // firing-rate regularization coefficient c_reg (0.0 = off)
+    pub rate_target_permille: u32, // target per-neuron firing rate r_target, permille (e.g. 100 = 10%)
 }
 
 impl RsnnConfig {
@@ -76,6 +78,8 @@ impl RsnnConfig {
             subthreshold_psi: false,
             calib: CalibrateParams { warmup: 16, waves: 48, max_steps: 24, refine_passes: 3, ..CalibrateParams::default() },
             calib_fraction_q16: 20000,
+            rate_reg: 0.0,
+            rate_target_permille: 100,
         }
     }
 
@@ -321,7 +325,7 @@ fn train_eprop_inner(cfg: &RsnnConfig) -> (Network, Vec<Vec<f32>>) {
                 let tgt = z + 1;
                 // learning signal L_j for each target-layer neuron j: symmetric readout feedback for the
                 // top layer, random DFA feedback for deeper layers. Eligibility is factored pre_i·psi_j.
-                let l_sig: Vec<f32> = (0..ls)
+                let mut l_sig: Vec<f32> = (0..ls)
                     .map(|j| {
                         (0..cfg.k)
                             .map(|c| {
@@ -331,6 +335,19 @@ fn train_eprop_inner(cfg: &RsnnConfig) -> (Network, Vec<Vec<f32>>) {
                             .sum()
                     })
                     .collect();
+                // Firing-rate regularization (LSNN-style): keep each target neuron near r_target by adding
+                // c_reg·(r_j − r_target) to its learning signal, carried by the SAME eligibility. A too-quiet
+                // neuron (r_j < r_target) gets a negative signal → its incoming weights rise → it fires more.
+                // Guarded, so rate_reg = 0 is byte-identical.
+                if cfg.rate_reg != 0.0 {
+                    let n_waves = (cfg.present_waves + cfg.delay + cfg.read_waves) as f32;
+                    let r_target = cfg.rate_target_permille as f32 / 1000.0;
+                    let post_pre = net.with_layer_mut(tgt, |x| x.elig_pre.clone());
+                    for j in 0..ls {
+                        let r_j = post_pre[j] as f32 / n_waves;
+                        l_sig[j] += cfg.rate_reg * (r_j - r_target);
+                    }
+                }
                 let pre = net.with_layer_mut(z, |x| x.elig_pre.clone());
                 let psi = net.with_layer_mut(tgt, |x| x.elig_post.clone());
                 net.with_layer_mut(z, |lz| {
@@ -885,6 +902,17 @@ mod tests {
         cfg.layers = 4;
         cfg.multi_layer = true;
         cfg.trials = 600;
+        assert_eq!(train_eprop(&cfg), train_eprop(&cfg));
+    }
+
+    #[test]
+    fn rate_reg_path_is_deterministic() {
+        let mut cfg = RsnnConfig::demo();
+        cfg.layers = 4;
+        cfg.multi_layer = true;
+        cfg.trials = 200;
+        cfg.rate_reg = 0.5;
+        cfg.rate_target_permille = 100;
         assert_eq!(train_eprop(&cfg), train_eprop(&cfg));
     }
 
