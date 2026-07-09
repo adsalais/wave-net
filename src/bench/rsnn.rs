@@ -43,6 +43,7 @@ pub struct RsnnConfig {
     pub calib_fraction_q16: u32,
     pub rate_reg: f32,             // firing-rate regularization coefficient c_reg (0.0 = off)
     pub rate_target_permille: u32, // target per-neuron firing rate r_target, permille (e.g. 100 = 10%)
+    pub xor_layers: usize,         // depth of the sequence-task stack: forward layers under a recurrent top (2 = the original L0→L1)
 }
 
 impl RsnnConfig {
@@ -80,6 +81,7 @@ impl RsnnConfig {
             calib_fraction_q16: 20000,
             rate_reg: 0.0,
             rate_target_permille: 100,
+            xor_layers: 2,
         }
     }
 
@@ -97,10 +99,11 @@ impl RsnnConfig {
         Config { seed: self.seed, size: self.size, layers: vec![layer; self.layers] }
     }
 
-    /// Temporal-XOR net: L0 input transducer → L1 recurrent hidden (level 0), readout reads L1.
-    /// `rec_count == 0` gives L1 an empty topology — the feed-forward baseline.
+    /// Sequence-task net: L0 input transducer → `xor_layers-2` forward layers → a **recurrent top layer**
+    /// (level 0, read by the readout). `rec_count == 0` gives the top an empty topology — the feed-forward
+    /// baseline. `xor_layers = 2` is the original L0→L1 (recurrent hidden = the only computational layer).
     fn engine_config_xor(&self) -> Config {
-        let l0 = LayerConfig {
+        let fwd = LayerConfig {
             topology: vec![TopologyLevel { level: 1, radius: self.up_radius, count: self.up_count }],
             leak: (3, 5),
             cooldown_base: 2,
@@ -110,13 +113,16 @@ impl RsnnConfig {
             adapt_bump: self.adapt_bump,
             adapt_decay: self.adapt_decay,
         };
-        let l1_topo = if self.rec_count > 0 {
+        let n = self.xor_layers.max(2);
+        // L0 transducer + forward layers all project +1; the top layer carries the level-0 recurrence.
+        let mut layers = vec![fwd.clone(); n - 1];
+        let top_topo = if self.rec_count > 0 {
             vec![TopologyLevel { level: 0, radius: self.rec_radius, count: self.rec_count }]
         } else {
             vec![]
         };
-        let l1 = LayerConfig { topology: l1_topo, ..l0.clone() };
-        Config { seed: self.seed, size: self.size, layers: vec![l0, l1] }
+        layers.push(LayerConfig { topology: top_topo, ..fwd });
+        Config { seed: self.seed, size: self.size, layers }
     }
 
     /// Multi-layer net with a uniform [+1, −1, −2] topology (backward levels only when back_count>0).
@@ -468,10 +474,11 @@ fn xor_trial(net: &mut Network, cfg: &RsnnConfig, a: usize, b: usize, trial: usi
 fn sequence_trial(net: &mut Network, cfg: &RsnnConfig, classes: &[usize], trial: usize) -> (Vec<f32>, Vec<Vec<u32>>) {
     let ls = (cfg.size * cfg.size) as usize;
     let n = classes.len();
+    let top = net.layer_count() - 1; // read (and, for the recurrent-top stack, train) the top computational layer
     let rec: Arc<Mutex<Vec<Vec<u32>>>> = Arc::new(Mutex::new(Vec::new()));
     {
         let r = rec.clone();
-        net.on_layer(1, Box::new(move |_w, fired: &[u32]| r.lock().unwrap().push(fired.to_vec())));
+        net.on_layer(top, Box::new(move |_w, fired: &[u32]| r.lock().unwrap().push(fired.to_vec())));
     }
     net.reset_state();
     for (pos, &class) in classes.iter().enumerate() {
@@ -503,7 +510,7 @@ fn sequence_trial(net: &mut Network, cfg: &RsnnConfig, classes: &[usize], trial:
 /// Temporal e-prop on the L1 level-0 recurrent weights. Builds a decaying presynaptic trace per neuron
 /// over the recorded waves, correlates it with postsynaptic spikes (`e_ij = Σ_t pre_trace_i(t)·fired_j(t)`),
 /// and updates the stored weights via the symmetric-feedback learning signal.
-fn recurrent_update(net: &mut Network, cfg: &RsnnConfig, w: &[Vec<f32>], err: &[f32], waves: &[Vec<u32>]) {
+fn recurrent_update(net: &mut Network, cfg: &RsnnConfig, w: &[Vec<f32>], err: &[f32], waves: &[Vec<u32>], rec_layer: usize) {
     let ls = (cfg.size * cfg.size) as usize;
     let up = cfg.rec_count as usize;
     let ttot = waves.len();
@@ -532,9 +539,9 @@ fn recurrent_update(net: &mut Network, cfg: &RsnnConfig, w: &[Vec<f32>], err: &[
             l_sig[j] += cfg.rate_reg * (r_j - r_target);
         }
     }
-    net.with_layer_mut(1, |l1| {
+    net.with_layer_mut(rec_layer, |l1| {
         for i in 0..ls {
-            let sg = (ls + i) as u32; // L1 global id = layer 1 * ls + i
+            let sg = (rec_layer * ls + i) as u32; // recurrent layer's global neuron id
             for kk in 0..up {
                 let j = target_of(cfg.seed, sg, i as u32, 0, kk as u32, cfg.rec_radius, cfg.size) as usize;
                 let mut e = 0f32;
@@ -583,7 +590,8 @@ fn train_xor_inner(cfg: &RsnnConfig) -> (Network, Vec<Vec<f32>>) {
             }
         }
         if cfg.rec_count > 0 {
-            recurrent_update(&mut net, cfg, &w, &err, &waves);
+            let rl = net.layer_count() - 1;
+            recurrent_update(&mut net, cfg, &w, &err, &waves, rl);
         }
     }
     (net, w)
@@ -632,7 +640,8 @@ pub fn train_sequence(cfg: &RsnnConfig, task: impl Fn(u64, usize) -> (Vec<usize>
             }
         }
         if cfg.rec_count > 0 {
-            recurrent_update(&mut net, cfg, &w, &err, &waves);
+            let rl = net.layer_count() - 1;
+            recurrent_update(&mut net, cfg, &w, &err, &waves, rl);
         }
     }
     let mut correct = 0usize;
