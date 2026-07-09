@@ -1094,6 +1094,38 @@ mod tests {
 
     #[test]
     #[ignore] // expensive; run manually in --release
+    fn parity_deep_hidden_recurrence() {
+        // The corrected "deeper + hidden recurrent layer" architecture: L0(input) → L1(forward) → L2(recurrent
+        // top, read), with MODEST recurrence (rec_count 24 — not the super-dense 96 that collapsed). Does a
+        // forward layer under a recurrent top layer help parity? Deep-FF vs deep-hidden-recurrent, size 16.
+        let seeds = [0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF];
+        for n in [3usize, 4] {
+            let (mut worst_ff, mut worst_rec) = (1000u64, 1000u64);
+            for &s in &seeds {
+                let mut ff = RsnnConfig::demo();
+                ff.seed = s;
+                ff.task_seed = s;
+                ff.size = 16;
+                ff.xor_layers = 3; // L0 input, L1 forward, L2 recurrent top
+                ff.delay = 8;
+                ff.trials = 1500;
+                let mut rec = ff.clone();
+                rec.rec_count = 24; // modest lateral density (9% of a 256-neuron layer) — off the super-critical cliff
+                rec.rec_radius = 4;
+                rec.rec_tau = 20.0;
+                rec.rec_init = 0;
+                let fa = train_sequence(&ff, |seed, t| task_parity(seed, t, n));
+                let ra = train_sequence(&rec, |seed, t| task_parity(seed, t, n));
+                eprintln!("parity-deep N={n} size16 3-layer seed {s:#x}  FF {fa}  +hidden-rec {ra}");
+                worst_ff = worst_ff.min(fa);
+                worst_rec = worst_rec.min(ra);
+            }
+            eprintln!("parity-deep N={n}: WORST FF {worst_ff}  +hidden-rec {worst_rec}");
+        }
+    }
+
+    #[test]
+    #[ignore] // expensive; run manually in --release
     fn distractor_xor_recurrence() {
         // Delayed XOR with an irrelevant distractor cue between A and B. ALIF, FF vs +recurrence, multi-seed.
         let seeds = [0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF];
