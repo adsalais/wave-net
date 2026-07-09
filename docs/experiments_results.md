@@ -405,3 +405,24 @@ never wired to a controller — the *analytic* `Σ|w|/θ` estimator was the inva
 real (fixed FF); dense recurrence is untested fairly until its gain is controlled.** The next honest test of
 recurrence is probe-gain-controlled (σ≈1) dense recurrence — not raw ±1 dense recurrence, and not the
 sparse under-powered version.
+
+**Deep hidden-recurrent architecture (forward layer under a recurrent top).** Testing the "go deeper + a
+real hidden recurrent layer" hypothesis: `L0 → L1(forward) → L2(recurrent top, read)`, size 16, *modest*
+recurrence (`rec_count 24`, off the super-critical cliff), parity worst-seed:
+
+| N | deep-FF | + hidden recurrence | (shallow-wide FF, 2-layer size 16) |
+|---|---|---|---|
+| 3 | 637 | 465 (chance) | 980 |
+| 4 | 677 | 502 (chance) | 900 |
+
+Both effects negative: **(1) depth hurt** — deep-FF (637/677) is far below shallow-wide FF (980/900) because
+the extra *fixed procedural* forward layer **erodes** the parity signal (documented depth-erosion of a fixed
+feed-forward stack); **(2) recurrence collapsed to chance** even at modest density. So the deeper
+hidden-recurrent net is *worse* than wide-shallow FF on both counts. **But this is still not the LSNN
+regime**: the forward layers here are **fixed/untrained**, whereas LSNN *trains* input→hidden — and our own
+multi-layer DFA result shows *training* every layer is exactly what makes depth usable (untrained depth just
+erodes). So the honest remaining gap is **trained forward layers**: `train_sequence` trains the recurrence +
+readout, not the feed-forward projection. A fair deep test would combine multi-layer DFA forward training
+(`train_eprop`) *with* recurrence. **Until that build: the substrate's best parity config remains wide,
+shallow, feed-forward + ALIF (980/900); depth and recurrence both hurt when the forward projection is
+untrained.**
