@@ -404,6 +404,27 @@ fn pick_ab(seed: u64, t: usize) -> (usize, usize) {
     (a, b)
 }
 
+/// `n` deterministic bits from `(seed, trial)`; label = their XOR (parity — non-monotone, needs recurrence).
+fn task_parity(seed: u64, trial: usize, n: usize) -> (Vec<usize>, usize) {
+    let bits: Vec<usize> = (0..n).map(|i| (mix(key(seed, trial as u32, 0, i as u32, 51)) & 1) as usize).collect();
+    let label = bits.iter().fold(0usize, |acc, &b| acc ^ b);
+    (bits, label)
+}
+
+/// `[a, distractor, b]` where the middle is a label-irrelevant cue (class 2); label = a XOR b (ignore D).
+fn task_distractor(seed: u64, trial: usize) -> (Vec<usize>, usize) {
+    let a = (mix(key(seed, trial as u32, 0, 0, 51)) & 1) as usize;
+    let b = (mix(key(seed, trial as u32, 0, 0, 53)) & 1) as usize;
+    (vec![a, 2, b], a ^ b)
+}
+
+/// `n_ops` set(class 0)/reset(class 1) ops; label = final state (set -> on 1, reset -> off 0).
+fn task_flipflop(seed: u64, trial: usize, n_ops: usize) -> (Vec<usize>, usize) {
+    let ops: Vec<usize> = (0..n_ops).map(|i| (mix(key(seed, trial as u32, 0, i as u32, 57)) & 1) as usize).collect();
+    let last = *ops.last().unwrap();
+    (ops, if last == 0 { 1 } else { 0 })
+}
+
 /// reset → present cue(a) → delay → present cue(b) → read (silent). Records L1 per-wave fired-sets and
 /// returns (read-window L1 spike counts, per-wave L1 fired-sets over the whole trial).
 fn xor_trial(net: &mut Network, cfg: &RsnnConfig, a: usize, b: usize, trial: usize) -> (Vec<f32>, Vec<Vec<u32>>) {
@@ -960,6 +981,27 @@ mod tests {
         cfg.rate_target_permille = 100;
         cfg.trials = 150;
         assert_eq!(train_recurrent(&cfg), train_recurrent(&cfg));
+    }
+
+    #[test]
+    fn task_labels_are_correct() {
+        for trial in 0..25 {
+            let (bits, label) = task_parity(42, trial, 4);
+            assert_eq!(bits.len(), 4);
+            assert!(bits.iter().all(|&b| b <= 1));
+            assert_eq!(label, bits.iter().fold(0, |a, &b| a ^ b), "parity label is the XOR of the bits");
+
+            let (classes, dlabel) = task_distractor(42, trial);
+            assert_eq!(classes.len(), 3);
+            assert_eq!(classes[1], 2, "middle cue is the label-irrelevant distractor class 2");
+            assert_eq!(dlabel, classes[0] ^ classes[2], "distractor label is a XOR b, ignoring D");
+
+            let (ops, flabel) = task_flipflop(42, trial, 3);
+            assert_eq!(ops.len(), 3);
+            assert!(ops.iter().all(|&o| o <= 1));
+            let last = *ops.last().unwrap();
+            assert_eq!(flabel, if last == 0 { 1 } else { 0 }, "state = set(0)->on(1), reset(1)->off(0)");
+        }
     }
 
     #[test]
