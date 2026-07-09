@@ -405,21 +405,21 @@ fn pick_ab(seed: u64, t: usize) -> (usize, usize) {
 }
 
 /// `n` deterministic bits from `(seed, trial)`; label = their XOR (parity — non-monotone, needs recurrence).
-fn task_parity(seed: u64, trial: usize, n: usize) -> (Vec<usize>, usize) {
+pub fn task_parity(seed: u64, trial: usize, n: usize) -> (Vec<usize>, usize) {
     let bits: Vec<usize> = (0..n).map(|i| (mix(key(seed, trial as u32, 0, i as u32, 51)) & 1) as usize).collect();
     let label = bits.iter().fold(0usize, |acc, &b| acc ^ b);
     (bits, label)
 }
 
 /// `[a, distractor, b]` where the middle is a label-irrelevant cue (class 2); label = a XOR b (ignore D).
-fn task_distractor(seed: u64, trial: usize) -> (Vec<usize>, usize) {
+pub fn task_distractor(seed: u64, trial: usize) -> (Vec<usize>, usize) {
     let a = (mix(key(seed, trial as u32, 0, 0, 51)) & 1) as usize;
     let b = (mix(key(seed, trial as u32, 0, 0, 53)) & 1) as usize;
     (vec![a, 2, b], a ^ b)
 }
 
 /// `n_ops` set(class 0)/reset(class 1) ops; label = final state (set -> on 1, reset -> off 0).
-fn task_flipflop(seed: u64, trial: usize, n_ops: usize) -> (Vec<usize>, usize) {
+pub fn task_flipflop(seed: u64, trial: usize, n_ops: usize) -> (Vec<usize>, usize) {
     let ops: Vec<usize> = (0..n_ops).map(|i| (mix(key(seed, trial as u32, 0, i as u32, 57)) & 1) as usize).collect();
     let last = *ops.last().unwrap();
     (ops, if last == 0 { 1 } else { 0 })
@@ -604,6 +604,45 @@ pub fn train_xor(cfg: &RsnnConfig) -> u64 {
         let s = score(&w, &act);
         let pred = if s[1] > s[0] { 1 } else { 0 };
         if pred == (a ^ b) {
+            correct += 1;
+        }
+    }
+    (correct as u64 * 1000) / holdout as u64
+}
+
+/// Train a readout (+ level-0 recurrent weights when `rec_count > 0`) on an arbitrary sequence task, given
+/// by a `task(task_seed, trial) -> (cue-class sequence, binary label)` closure. Returns held-out permille.
+/// Calibration is a one-time sensible init; ALIF and rate reg come from `cfg`.
+pub fn train_sequence(cfg: &RsnnConfig, task: impl Fn(u64, usize) -> (Vec<usize>, usize)) -> u64 {
+    let mut net = Network::new(cfg.engine_config_xor());
+    net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
+    let ls = (cfg.size * cfg.size) as usize;
+    let mut w = vec![vec![0f32; ls]; 2];
+    let score = |w: &[Vec<f32>], a: &[f32]| -> Vec<f32> {
+        (0..2).map(|c| w[c].iter().zip(a).map(|(wi, ai)| wi * ai).sum()).collect()
+    };
+    for t in 0..cfg.trials {
+        let (classes, label) = task(cfg.task_seed, t);
+        let (act, waves) = sequence_trial(&mut net, cfg, &classes, t);
+        let p = softmax(&score(&w, &act));
+        let err: Vec<f32> = (0..2).map(|c| p[c] - if c == label { 1.0 } else { 0.0 }).collect();
+        for c in 0..2 {
+            for j in 0..ls {
+                w[c][j] -= cfg.readout_lr * err[c] * act[j];
+            }
+        }
+        if cfg.rec_count > 0 {
+            recurrent_update(&mut net, cfg, &w, &err, &waves);
+        }
+    }
+    let mut correct = 0usize;
+    let holdout = 400usize;
+    for t in cfg.trials..cfg.trials + holdout {
+        let (classes, label) = task(cfg.task_seed, t);
+        let (act, _) = sequence_trial(&mut net, cfg, &classes, t);
+        let s = score(&w, &act);
+        let pred = if s[1] > s[0] { 1 } else { 0 };
+        if pred == label {
             correct += 1;
         }
     }
@@ -981,6 +1020,17 @@ mod tests {
         cfg.rate_target_permille = 100;
         cfg.trials = 150;
         assert_eq!(train_recurrent(&cfg), train_recurrent(&cfg));
+    }
+
+    #[test]
+    fn train_sequence_is_deterministic() {
+        let mut cfg = RsnnConfig::demo();
+        cfg.delay = 8;
+        cfg.rec_count = 8;
+        cfg.rec_init = 0;
+        cfg.trials = 120;
+        let run = || train_sequence(&cfg, |seed, t| task_parity(seed, t, 3));
+        assert_eq!(run(), run());
     }
 
     #[test]
