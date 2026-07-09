@@ -912,7 +912,8 @@ mod tests {
         // multi-layer, trial length scaled to depth, rate_reg off vs a c_reg sweep.
         let seeds = [0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF];
         let depth = 20usize;
-        for reg in [0.0f32, 0.1, 0.5, 2.0] {
+        // c_reg ~5 revives the deep layers (see rate_reg_revives_dead_layers); bracket that zone.
+        for reg in [0.0f32, 5.0, 20.0] {
             let mut worst = 1000u64;
             for &s in &seeds {
                 let mut c = RsnnConfig::demo();
@@ -940,7 +941,9 @@ mod tests {
     fn rate_reg_revives_dead_layers() {
         // Per-layer firing rate of a TRAINED deep net, rate_reg off vs on. Off: deep layers dead (~0).
         // On: they should fire near the target through the full depth (liveness climbed the stack).
-        for reg in [0.0f32, 0.5] {
+        // The reg term c_reg·(r_j−r_target) must be comparable to the task signal L_j^task ~ O(1), so
+        // c_reg ~ 10s (r_target = 0.1); a small c_reg is negligible.
+        for reg in [0.0f32, 5.0, 20.0, 50.0] {
             let mut c = RsnnConfig::demo();
             c.seed = 0xE9_0B_0A17;
             c.task_seed = 0xE9_0B_0A17;
