@@ -496,3 +496,25 @@ capacity / topology fixing rescues it.** The single remaining lever is proper te
 substrate learns; multi-layer DFA + width makes depth usable to ~16 layers; and `rate_reg` on the forward
 path reliably rescues liveness-starved depth (chance→980 on XOR). Recurrence is a documented dead end short
 of BPTT.
+
+**Final LIF check — removing adaptation *refutes* "ALIF fights the loop"; ALIF is load-bearing.** Re-ran the
+fair recurrence test with **LIF** (`adapt_bump = 0`), to test the hypothesis that ALIF's adaptation was
+quenching the recurrent gain (5 seeds, temporal XOR):
+
+| | LIF-FF | LIF+rec (`rate_reg`) | LIF+rec (`rec_stab`) |
+|---|---|---|---|
+| worst / mean | 472 / **489** | 472 / 486 | 472 / 486 |
+
+All at chance — and the *reason* is the finding. **The LIF-FF baseline is dead (489)**: `rate_reg` revived
+the *ALIF* deep-FF to 986 but **cannot** revive the *LIF* one (only difference: `adapt_bump`). So **ALIF's
+self-regulation is *necessary* for the deep-FF liveness that `rate_reg` fine-tunes** — LIF deep stacks starve
+on the floored leak with nothing to self-regulate them. Recurrence stays at chance either way, but that's
+*inconclusive here* (dead baseline, no headroom). **So the "ALIF quenches the loop, LIF would free it"
+hypothesis is refuted — removing adaptation didn't rescue recurrence, it killed the substrate.** ALIF is not
+an obstacle; it is load-bearing.
+
+**Combined verdict on recurrence:** it *crashes a working baseline with ALIF* (986→498, fair test) and there
+is *no working baseline without ALIF* to test it on (489). Recurrence has **no regime** on this substrate +
+crude e-prop where it earns its keep, ALIF is essential, and **surrogate-gradient BPTT (proper temporal
+credit) is the sole remaining lever** — every substrate/stabilizer/topology/neuron-model confound is now
+ruled out.
