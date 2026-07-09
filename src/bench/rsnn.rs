@@ -853,31 +853,28 @@ mod tests {
 
     #[test]
     #[ignore] // expensive; run manually in --release
-    fn lateral_recurrence_vs_ff() {
-        // Level-0 lateral recurrence + rate reg vs feed-forward on temporal XOR (LIF, delay 20), multi-seed.
-        let seeds = [0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF];
-        let (mut best_ff, mut best_rec) = (0u64, 0u64);
-        for &s in &seeds {
+    fn alif_recurrence_vs_ff() {
+        // Field-standard: ALIF holds the delay memory, recurrence + e-prop compute on top. Does lateral
+        // recurrence EXTEND ALIF's memory horizon on temporal XOR? ALIF-FF vs ALIF+recurrence at delays
+        // bracketing ALIF's ~64-wave horizon. Calibration is a one-time sensible init (not a rate target
+        // that must transfer); rate reg off (ALIF owns the operating point). Single seed to locate the
+        // horizon first; go multi-seed if recurrence shows a gain. (demo has ALIF on: adapt_bump 20.)
+        let s = 0xE9_0B_0A17u64;
+        for delay in [40usize, 80, 120] {
             let mut ff = RsnnConfig::demo();
             ff.seed = s;
             ff.task_seed = s;
-            ff.adapt_bump = 0;
-            ff.delay = 20;
+            ff.delay = delay;
             ff.trials = 1500;
             let mut rec = ff.clone();
             rec.rec_count = 24;
             rec.rec_radius = 2;
-            rec.rec_tau = 20.0;
+            rec.rec_tau = delay as f32; // eligibility trace spans the gap
             rec.rec_init = 0;
-            rec.rate_reg = 5.0;
-            rec.rate_target_permille = 100;
             let fa = train_xor(&ff);
             let ra = train_xor(&rec);
-            eprintln!("lateral seed {s:#x}  FF {fa}  +rec+reg {ra}");
-            best_ff = best_ff.max(fa);
-            best_rec = best_rec.max(ra);
+            eprintln!("delay {delay}  ALIF-FF {fa}  ALIF+rec {ra}");
         }
-        eprintln!("lateral: best FF {best_ff}  best +rec+reg {best_rec}");
     }
 
     #[test]
