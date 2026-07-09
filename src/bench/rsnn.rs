@@ -290,10 +290,10 @@ fn target_of(seed: u64, source_global: u32, src_local: u32, level: i32, k: u32, 
     local_of(wrap(sx, dx, size), wrap(sy, dy, size), size)
 }
 
-/// Train a TOP-layer readout AND (via e-prop) the last hidden layer's level+1 weights. Returns held-out
-/// test accuracy permille. With `hidden_lr = 0` this is the fixed-reservoir top-layer readout (the fragile
-/// baseline); with `hidden_lr > 0`, e-prop shapes the reservoir so the top layer becomes separable.
-pub fn train_eprop(cfg: &RsnnConfig) -> u64 {
+/// Build + calibrate + train (readout + hidden e-prop weights); return the trained net and the top-layer
+/// readout. Split out so callers can both evaluate held-out accuracy and probe the trained net's per-layer
+/// firing rates. `hidden_lr = 0` leaves the reservoir fixed (readout-only baseline).
+fn train_eprop_inner(cfg: &RsnnConfig) -> (Network, Vec<Vec<f32>>) {
     let mut net = Network::new(cfg.engine_config());
     net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
     let l = net.layer_count();
@@ -352,6 +352,19 @@ pub fn train_eprop(cfg: &RsnnConfig) -> u64 {
             }
         }
     }
+    (net, w)
+}
+
+/// Train a TOP-layer readout AND (via e-prop) the hidden layers' level+1 weights. Returns held-out test
+/// accuracy permille. With `hidden_lr = 0` this is the fixed-reservoir top-layer readout (the fragile
+/// baseline); with `hidden_lr > 0`, e-prop shapes the reservoir so the top layer becomes separable.
+pub fn train_eprop(cfg: &RsnnConfig) -> u64 {
+    let (mut net, w) = train_eprop_inner(cfg);
+    let l = net.layer_count();
+    let ls = (cfg.size * cfg.size) as usize;
+    let score = |w: &[Vec<f32>], a: &[f32]| -> Vec<f32> {
+        (0..w.len()).map(|c| w[c].iter().zip(a).map(|(wi, ai)| wi * ai).sum()).collect()
+    };
     let mut correct = 0usize;
     let holdout = 400usize;
     for t in cfg.trials..cfg.trials + holdout {
