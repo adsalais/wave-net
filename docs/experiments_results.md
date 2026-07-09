@@ -470,3 +470,29 @@ layers doesn't fix accuracy — the wall is credit." On **temporal XOR** the opp
 FF **does** fix accuracy (chance→980). So whether liveness or the credit rule is the wall depends on the
 task — on XOR, deep-FF liveness was the entire blocker, and the online `rate_reg` (the e-prop-literature
 mechanism) is the fix.
+
+## The fair recurrence test (every confound removed) — recurrence *destroys* a working baseline
+
+Assembled the fairest possible recurrence test and ran it (5 seeds, temporal XOR): a **working, live deep-FF
+baseline** (L0→L1→L2→L3, sparse drive + per-neuron `rate_reg` on the *forward* path → ~986) plus **level-0
+recurrence on L2**, stabilized by a **class-preserving per-layer stabilizer** (`rec_stab`, a uniform-bias
+rate control — *not* the per-neuron `rate_reg` that homogenizes the class signal away). This finally removes
+every confound that plagued earlier recurrence tests: dead baseline (now 986), wrong stabilizer (now
+class-preserving), too few neurons (256), wrong topology (clean hidden-recurrent, signal flows *through* L2).
+
+| | deep-FF | + hidden recurrence (stabilized) |
+|---|---|---|
+| worst / mean (5 seeds) | 970 / **986** | 475 / **498 (chance)** |
+
+**Adding recurrence didn't fail to help — it destroyed a working 986 baseline down to chance, all 5 seeds.**
+With every substrate/stabilizer confound eliminated, the only thing left is the **credit rule**: the crude
+spike-timing temporal eligibility can only train the recurrence to *scramble* the signal, never to compute
+with it. This is the airtight version of the session-long null: **on this substrate, trained recurrence via
+the crude e-prop is not merely useless but actively harmful, and no amount of liveness / gain-stabilizer /
+capacity / topology fixing rescues it.** The single remaining lever is proper temporal credit —
+**surrogate-gradient BPTT** — everything short of that has now been ruled out.
+
+**The session's net positives (the working regime):** wide + shallow + feed-forward + ALIF is where this
+substrate learns; multi-layer DFA + width makes depth usable to ~16 layers; and `rate_reg` on the forward
+path reliably rescues liveness-starved depth (chance→980 on XOR). Recurrence is a documented dead end short
+of BPTT.
