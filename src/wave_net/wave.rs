@@ -2,7 +2,7 @@
 //! generate outgoing synapses → leak, then decay adaptation. Touches only this layer; the
 //! Network routes the generated synapses into other layers' inboxes for the next wave. Firing
 //! uses the ALIF effective threshold `threshold + (adapt >> ADAPT_SHIFT)` (i32); a fire bumps
-//! `adapt` (Q8 fixed point, saturating at `ADAPT_MAX`) and every neuron's `adapt` decays
+//! `adapt` (Q12 fixed point, saturating at `ADAPT_MAX`) and every neuron's `adapt` decays
 //! geometrically each wave, like the leak.
 
 use crate::wave_net::neurons::{Layer, ADAPT_MAX, ADAPT_SHIFT};

@@ -25,7 +25,7 @@ pub struct Layer {
     // wave-mutable hot state
     pub potential: Vec<i16>,
     pub cooldown: Vec<u8>,
-    pub adapt: Vec<i32>,      // ALIF adaptation (Q8 fixed point): rest 0, >= 0; bumped on fire, decayed each wave
+    pub adapt: Vec<i32>,      // ALIF adaptation (Q12 fixed point): rest 0, >= 0; bumped on fire, decayed each wave
     pub inbox: Vec<Synapse>,  // drained THIS wave (filled last wave)
     pub outbox: Vec<Synapse>, // filled for NEXT wave; swapped with inbox at wave end
 

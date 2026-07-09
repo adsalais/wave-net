@@ -127,7 +127,7 @@ impl Network {
         self.layers[layer].lock().unwrap().potential[local]
     }
 
-    /// Raw Q8 fixed-point adaptation state (effective threshold contribution is `>> ADAPT_SHIFT`).
+    /// Raw Q12 fixed-point adaptation state (effective threshold contribution is `>> ADAPT_SHIFT`).
     pub fn adaptation(&self, layer: usize, local: usize) -> i32 {
         self.layers[layer].lock().unwrap().adapt[local]
     }
