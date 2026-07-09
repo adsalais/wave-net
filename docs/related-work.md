@@ -264,6 +264,46 @@ Implications for Spec 3 (e-prop-style threshold training):
   topology density. This is the natural way to span both memory axes; worth a bench experiment (a mixed
   config on store-recall *and* XOR) before or alongside Spec 3.
 
+## What e-prop actually does with firing rates — and where our approach diverged (2026-07-09)
+
+Checked the e-prop / LSNN literature against `wave_net`'s firing-rate machinery (calibration + the
+rate-regularization experiments). Three divergences, each now a correction:
+
+1. **Rate regularization is a soft *loss* term, co-trained — not a separate calibration.** e-prop/LSNN adds
+   an L1/L2 firing-rate penalty to the loss, minimized *jointly* with the task, pulling rates to a modest
+   biologically-plausible level (~16 Hz; tasks solved with no neuron above ~12 Hz) for **efficiency /
+   sparsity**. There is **no** pre-training threshold *calibration on a proxy drive*. `wave_net`'s
+   `calibrate` (tune thresholds to ~10% on `random_l0_input`) is *our* addition, and it introduces a
+   **drive mismatch**: it hits ~10% on the random drive (`calib_fraction_q16` ≈ 30% of L0) but the *denser
+   task cue* (`base_q16` ≈ 46% of L0) overshoots to **20–40%** on the actual task — so the calibrated rate
+   never transfers. The "10%" is measured on the wrong drive.
+2. **A fixed, uniform rate target is a documented liability, not a virtue.** The SNN regularization
+   literature warns it "forces neurons to have similar firing rates for different inputs instead of allowing
+   them to use different rates to represent different inputs" — i.e. it erodes input-specific coding. This is
+   exactly the **"class-agnostic activity, not information"** failure our depth- and recurrence-rate-reg
+   experiments hit (reviving / keeping-alive added activity but not class content). It also matches the
+   earlier homeostasis note (§ Design notes A: strict per-neuron rate homeostasis homogenizes rates → hurts
+   reservoir richness).
+3. **LSNN's delay-task memory is ALIF adaptation, not a self-sustaining recurrent loop.** LSNN = LIF +
+   adaptive-LIF; the "long short-term memory" *is* the slow adaptation variable, and recurrence + e-prop
+   *route/compute* on top. Stripping ALIF to "isolate recurrence" (our LIF temporal-XOR setup) removes the
+   field's actual memory mechanism — so the LIF-recurrence sustaining null is the expected outcome, not a
+   surprise: bare recurrence at a sub-critical operating point is not what holds the trace.
+
+**Correction to §2 (criticality).** Firing-rate calibration is a proxy for branching-ratio ≈ 1 — but on a
+proxy *drive* it doesn't even hit its own rate target on the task, so it is a proxy twice removed. For
+sustaining, the operating point that matters is recurrent **gain**, measured on the *task* drive (or by a
+gap-survival probe directly), not a rate on random input. (An earlier branch that tried an external "gain
+calibration" was abandoned because its analytic `Σ|w|/θ` estimator was blind to actual propagation — it read
+"branching 16" for layers that never fire; see `experiments_results.md`.)
+
+**What the field does — adopted here.** (a) Keep **ALIF** as the delay-memory mechanism (don't strip it);
+(b) rate reg only as a **light, co-trained liveness/efficiency term** (modest coefficient), never a memory
+mechanism and never a hard uniform target; (c) drop the separate proxy-drive calibration, or at least match
+its drive density to the task; (d) let recurrence + e-prop **compute** on top of adaptation-held memory. The
+real "does recurrence earn its keep" test is **ALIF + recurrence vs ALIF-alone** at a delay where adaptation
+alone is marginal — not bare-LIF recurrence vs FF.
+
 ## Sources
 
 Format: *Title* (tag) — Venue Year — link(s).
@@ -281,3 +321,5 @@ Format: *Title* (tag) — Venue Year — link(s).
 - *ETLP: event-based three-factor local plasticity for online learning with neuromorphic hardware* — Neuromorphic Computing and Engineering 2024
 - *Stochastic Equilibrium Propagation for Spiking Convergent Recurrent Neural Networks* (StochEP) — arXiv 2025 — [arxiv](https://arxiv.org/abs/2511.11320)
 - Bellec et al., *Long short-term memory and learning-to-learn in networks of spiking neurons* (LSNN / adaptive-LIF) — NeurIPS 2018 — [arxiv](https://arxiv.org/abs/1803.09574)
+- *Efficient connectivity and intrinsic noise separation in recurrent spiking neural networks trained with e-prop* (e-prop firing-rate figures, ~16 Hz / <12 Hz) — Neuromorphic Computing and Engineering 2025 — [iop](https://iopscience.iop.org/article/10.1088/2634-4386/ae0826)
+- *Sparse-firing regularization methods for spiking neural networks with time-to-first-spike coding* (fixed-uniform-rate-target pitfall) — Scientific Reports 2023 — [nature](https://www.nature.com/articles/s41598-023-50201-5)
