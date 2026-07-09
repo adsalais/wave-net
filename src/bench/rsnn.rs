@@ -1339,6 +1339,40 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // expensive; run manually in --release
+    fn deep_ff_ratereg_robustness() {
+        // Is the deep-FF + rate_reg XOR result (982) robust or a config fluke? PLAIN 4-layer feed-forward
+        // stack (no recurrence: back_count=0, rec_count=0), temporal XOR, ALIF, size 16. Sweep delay ×
+        // up_count, rate_reg OFF vs ON, over 5 seeds. The 982 was delay 20 / up_count 16 / rate_reg 5.
+        let seeds = [0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF, 0xA5A5_1111, 0x0F0F_2222];
+        for &delay in &[12usize, 20] {
+            for &upc in &[16u32, 32] {
+                for &rr in &[0.0f32, 5.0] {
+                    let mut accs = Vec::new();
+                    for &s in &seeds {
+                        let mut c = RsnnConfig::demo();
+                        c.seed = s;
+                        c.task_seed = s;
+                        c.size = 16;
+                        c.layers = 4;
+                        c.back_count = 0; // plain deep feed-forward
+                        c.rec_count = 0;
+                        c.delay = delay;
+                        c.up_count = upc;
+                        c.trials = 1500;
+                        c.rate_reg = rr;
+                        c.rate_target_permille = 100;
+                        accs.push(train_recurrent(&c));
+                    }
+                    let worst = *accs.iter().min().unwrap();
+                    let mean = accs.iter().sum::<u64>() / accs.len() as u64;
+                    eprintln!("deep-FF delay {delay} up_count {upc} rate_reg {rr}  seeds {accs:?}  worst {worst} mean {mean}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn rate_reg_backward_is_deterministic() {
         let mut cfg = RsnnConfig::demo();
         cfg.size = 16;
