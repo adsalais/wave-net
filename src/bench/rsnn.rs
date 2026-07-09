@@ -173,6 +173,34 @@ impl RsnnConfig {
         ];
         Config { seed: self.seed, size: self.size, layers }
     }
+
+    /// Cleaner variant (4 layers): L0(input)→L1→**L2** with the **L2↔L3 loop** — L1 feeds L2 forward (+1),
+    /// L2 self-recurses (0) and feeds L3 (+1), L3 feeds L2 back (−1). Read L3. The forward signal now flows
+    /// *through* L2 (no skip), so L3 is driven along the main path (no dead top layer).
+    fn engine_config_l2l3loop(&self) -> Config {
+        let mk = |topology| LayerConfig {
+            topology,
+            leak: (3, 5),
+            cooldown_base: 2,
+            inhibitor_ratio: 0,
+            threshold_jitter: 32,
+            baseline_init: 6,
+            adapt_bump: self.adapt_bump,
+            adapt_decay: self.adapt_decay,
+        };
+        let (uc, ur) = (self.up_count, self.up_radius);
+        let (n, r) = (self.rec_count, self.rec_radius);
+        let layers = vec![
+            mk(vec![TopologyLevel { level: 1, radius: ur, count: uc }]), // L0 → L1
+            mk(vec![TopologyLevel { level: 1, radius: ur, count: uc }]), // L1 → L2 (forward, no skip)
+            mk(vec![
+                TopologyLevel { level: 0, radius: r, count: n }, // L2 self-recurse
+                TopologyLevel { level: 1, radius: r, count: n }, // L2 → L3
+            ]),
+            mk(vec![TopologyLevel { level: -1, radius: r, count: n }]), // L3 → L2 (loop); L3 is read
+        ];
+        Config { seed: self.seed, size: self.size, layers }
+    }
 }
 
 /// Run one trial (reset → cue → delay → probe); return the FULL reservoir's per-neuron spike counts over
@@ -960,6 +988,22 @@ pub fn train_sidecar(cfg: &RsnnConfig) -> u64 {
     train_multilayer(cfg, net, &layer_entries)
 }
 
+/// Train the L0→L1→L2 stack with the L2↔L3 loop (see `engine_config_l2l3loop`) on temporal XOR; permille.
+pub fn train_l2l3loop(cfg: &RsnnConfig) -> u64 {
+    let mut net = Network::new(cfg.engine_config_l2l3loop());
+    net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
+    let (uc, ur) = (cfg.up_count as usize, cfg.up_radius);
+    let (n, r) = (cfg.rec_count as usize, cfg.rec_radius);
+    // per-layer entries, matching engine_config_l2l3loop's topology order exactly
+    let layer_entries = vec![
+        vec![(1i32, uc, ur)],             // L0: +1
+        vec![(1i32, uc, ur)],             // L1: +1 (forward into L2)
+        vec![(0i32, n, r), (1i32, n, r)], // L2: self + forward
+        vec![(-1i32, n, r)],              // L3: backward
+    ];
+    train_multilayer(cfg, net, &layer_entries)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1219,6 +1263,49 @@ mod tests {
             let ff_acc = train_recurrent(&ff);
             let sc_acc = train_sidecar(&sc);
             eprintln!("side-car seed {s:#x}  deep-FF(4) {ff_acc}  side-car {sc_acc}");
+        }
+    }
+
+    #[test]
+    fn train_l2l3loop_is_deterministic() {
+        let mut cfg = RsnnConfig::demo();
+        cfg.size = 8;
+        cfg.delay = 10;
+        cfg.rec_count = 8;
+        cfg.trials = 100;
+        assert_eq!(train_l2l3loop(&cfg), train_l2l3loop(&cfg));
+    }
+
+    #[test]
+    #[ignore] // expensive; run manually in --release
+    fn l2l3loop_recurrence() {
+        // L0→L1→L2 (recurrent hidden) with the L2↔L3 loop, read L3. First CONFIRM no dead layer (per-layer
+        // rates), then deep-FF(4) vs the loop on temporal XOR. ALIF + strong drive (up_count 32) for liveness.
+        let mut base = RsnnConfig::demo();
+        base.size = 16;
+        base.up_count = 32;
+        base.rec_count = 24;
+        base.rec_radius = 4;
+        base.delay = 12;
+        // liveness probe: does every layer (esp. the read top L3) fire?
+        let mut net = Network::new(base.engine_config_l2l3loop());
+        net.calibrate(&base.calib, &random_l0_input(base.seed ^ 0xE9, base.size, base.calib_fraction_q16));
+        let rates = net.measure_layer_rates(base.calib.warmup, base.calib.waves, &random_l0_input(base.seed ^ 0xE9, base.size, base.calib_fraction_q16));
+        eprintln!("l2l3loop per-layer rates L0..L3: {:?}", rates.iter().map(|x| (x * 1000.0).round() / 1000.0).collect::<Vec<_>>());
+
+        let seeds = [0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF];
+        for &s in &seeds {
+            let mut lp = base.clone();
+            lp.seed = s;
+            lp.task_seed = s;
+            lp.trials = 1500;
+            let mut ff = lp.clone();
+            ff.layers = 4;
+            ff.back_count = 0;
+            ff.rec_count = 0; // matched 4-layer trained deep FF
+            let ff_acc = train_recurrent(&ff);
+            let lp_acc = train_l2l3loop(&lp);
+            eprintln!("l2l3loop seed {s:#x}  deep-FF(4) {ff_acc}  L2<->L3-loop {lp_acc}");
         }
     }
 
