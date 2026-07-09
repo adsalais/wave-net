@@ -462,7 +462,16 @@ fn recurrent_update(net: &mut Network, cfg: &RsnnConfig, w: &[Vec<f32>], err: &[
             tr[t][i] = trace;
         }
     }
-    let l_sig: Vec<f32> = (0..ls).map(|j| (0..2).map(|c| w[c][j] * err[c]).sum()).collect();
+    let mut l_sig: Vec<f32> = (0..ls).map(|j| (0..2).map(|c| w[c][j] * err[c]).sum()).collect();
+    // Firing-rate regularization: keep the recurrent layer near r_target so the loop stays alive through
+    // the gap (carried by the same temporal eligibility). Guarded — rate_reg = 0 is byte-identical.
+    if cfg.rate_reg != 0.0 {
+        let r_target = cfg.rate_target_permille as f32 / 1000.0;
+        for j in 0..ls {
+            let r_j = (0..ttot).map(|t| fired[t][j]).sum::<f32>() / ttot.max(1) as f32;
+            l_sig[j] += cfg.rate_reg * (r_j - r_target);
+        }
+    }
     net.with_layer_mut(1, |l1| {
         for i in 0..ls {
             let sg = (ls + i) as u32; // L1 global id = layer 1 * ls + i
@@ -802,6 +811,19 @@ mod tests {
         for (tt, (sp, mv)) in act_per_wave.iter().enumerate() {
             println!("wave {tt:>3}  spikes(all) {sp:>4}  mean+v {mv:.2}");
         }
+    }
+
+    #[test]
+    fn rate_reg_lateral_is_deterministic() {
+        let mut cfg = RsnnConfig::demo();
+        cfg.adapt_bump = 0;
+        cfg.delay = 20;
+        cfg.rec_count = 8;
+        cfg.rec_init = 0;
+        cfg.rate_reg = 5.0;
+        cfg.rate_target_permille = 100;
+        cfg.trials = 150;
+        assert_eq!(train_xor(&cfg), train_xor(&cfg));
     }
 
     #[test]
