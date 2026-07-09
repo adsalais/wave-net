@@ -44,6 +44,7 @@ pub struct RsnnConfig {
     pub rate_reg: f32,             // firing-rate regularization coefficient c_reg (0.0 = off)
     pub rate_target_permille: u32, // target per-neuron firing rate r_target, permille (e.g. 100 = 10%)
     pub xor_layers: usize,         // depth of the sequence-task stack: forward layers under a recurrent top (2 = the original L0→L1)
+    pub rec_stab: f32,             // per-LAYER recurrent stabilizer (uniform bias toward r_target on recurrent levels; class-preserving, unlike per-neuron rate_reg). 0 = off
 }
 
 impl RsnnConfig {
@@ -82,6 +83,7 @@ impl RsnnConfig {
             rate_reg: 0.0,
             rate_target_permille: 100,
             xor_layers: 2,
+            rec_stab: 0.0,
         }
     }
 
@@ -198,6 +200,35 @@ impl RsnnConfig {
                 TopologyLevel { level: 1, radius: r, count: n }, // L2 → L3
             ]),
             mk(vec![TopologyLevel { level: -1, radius: r, count: n }]), // L3 → L2 (loop); L3 is read
+        ];
+        Config { seed: self.seed, size: self.size, layers }
+    }
+
+    /// Clean hidden recurrent layer (4 layers): L0→L1→L2→L3(read), with **level-0 recurrence on L2** when
+    /// `rec_count > 0`. The signal flows *through* L2's recurrence; L1/L3 are plain forward. For the fair
+    /// recurrence test — forward path revived by `rate_reg`, L2's loop stabilized by `rec_stab`.
+    fn engine_config_hidden_rec(&self) -> Config {
+        let mk = |topology| LayerConfig {
+            topology,
+            leak: (3, 5),
+            cooldown_base: 2,
+            inhibitor_ratio: 0,
+            threshold_jitter: 32,
+            baseline_init: 6,
+            adapt_bump: self.adapt_bump,
+            adapt_decay: self.adapt_decay,
+        };
+        let fwd = TopologyLevel { level: 1, radius: self.up_radius, count: self.up_count };
+        let l2 = if self.rec_count > 0 {
+            vec![fwd.clone(), TopologyLevel { level: 0, radius: self.rec_radius, count: self.rec_count }]
+        } else {
+            vec![fwd.clone()]
+        };
+        let layers = vec![
+            mk(vec![fwd.clone()]), // L0 → L1
+            mk(vec![fwd.clone()]), // L1 → L2
+            mk(l2),                // L2 → L3 (+ level-0 recurrence if rec_count>0)
+            mk(vec![]),            // L3 read (top)
         ];
         Config { seed: self.seed, size: self.size, layers }
     }
@@ -914,14 +945,15 @@ fn train_multilayer(cfg: &RsnnConfig, mut net: Network, layer_entries: &[Vec<(i3
             })
             .collect();
         let r_target = cfg.rate_target_permille as f32 / 1000.0;
-        let l_sig = |tz: usize, j: usize| -> f32 {
-            let task: f32 = (0..2)
+        // per-layer mean rate — used by the class-preserving recurrent stabilizer (uniform bias, not per-neuron)
+        let layer_mean: Vec<f32> = (0..l).map(|z| rate[z].iter().sum::<f32>() / ls as f32).collect();
+        let task_sig = |tz: usize, j: usize| -> f32 {
+            (0..2)
                 .map(|c| {
                     let bb = if tz == top { w[c][j] } else { dfa_weight(cfg.seed, (tz * ls + j) as u32, c) };
                     bb * err[c]
                 })
-                .sum();
-            task + if cfg.rate_reg != 0.0 { cfg.rate_reg * (rate[tz][j] - r_target) } else { 0.0 }
+                .sum()
         };
         for z in 0..l {
             let total_slots_z: usize = layer_entries[z].iter().map(|(_, c, _)| c).sum();
@@ -943,7 +975,14 @@ fn train_multilayer(cfg: &RsnnConfig, mut net: Network, layer_entries: &[Vec<(i3
                             e += pretr[z][tt][i] * post[tz][tt][j];
                         }
                         if e != 0.0 {
-                            updates.push((i * total_slots_z + slot + k, -cfg.hidden_lr * l_sig(tz, j) * e));
+                            // forward levels → per-neuron rate_reg (liveness); recurrent levels (0/−1/−2) →
+                            // per-LAYER rec_stab uniform bias (stabilize the loop without homogenizing).
+                            let reg = if level > 0 {
+                                cfg.rate_reg * (rate[tz][j] - r_target)
+                            } else {
+                                cfg.rec_stab * (layer_mean[tz] - r_target)
+                            };
+                            updates.push((i * total_slots_z + slot + k, -cfg.hidden_lr * (task_sig(tz, j) + reg) * e));
                         }
                     }
                 }
@@ -984,6 +1023,23 @@ pub fn train_sidecar(cfg: &RsnnConfig) -> u64 {
         vec![(2i32, uc, ur)],       // L1: +2 skip
         vec![(0i32, n, r), (1i32, n, r)], // L2: self + forward
         vec![(-1i32, n, r)],        // L3: backward
+    ];
+    train_multilayer(cfg, net, &layer_entries)
+}
+
+/// Train the clean hidden-recurrent stack (see `engine_config_hidden_rec`) on temporal XOR; permille.
+/// Forward weights get per-neuron `rate_reg` (liveness); L2's level-0 recurrence gets per-layer `rec_stab`.
+pub fn train_hidden_rec(cfg: &RsnnConfig) -> u64 {
+    let mut net = Network::new(cfg.engine_config_hidden_rec());
+    net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
+    let (uc, ur) = (cfg.up_count as usize, cfg.up_radius);
+    let (n, r) = (cfg.rec_count as usize, cfg.rec_radius);
+    let l2 = if n > 0 { vec![(1i32, uc, ur), (0i32, n, r)] } else { vec![(1i32, uc, ur)] };
+    let layer_entries = vec![
+        vec![(1i32, uc, ur)], // L0
+        vec![(1i32, uc, ur)], // L1
+        l2,                   // L2 (forward + level-0 recurrence)
+        vec![],               // L3 (read, no outgoing)
     ];
     train_multilayer(cfg, net, &layer_entries)
 }
@@ -1291,6 +1347,58 @@ mod tests {
             let per_layer: Vec<usize> = (1..spikes.len()).map(|z| spikes[z].iter().map(|w| w.len()).sum()).collect();
             eprintln!("adapt_bump {ab}: L1..L3 total spikes over a cue trial {per_layer:?}");
         }
+    }
+
+    #[test]
+    fn train_hidden_rec_is_deterministic() {
+        let mut cfg = RsnnConfig::demo();
+        cfg.size = 8;
+        cfg.delay = 10;
+        cfg.rec_count = 8;
+        cfg.rate_reg = 5.0;
+        cfg.rec_stab = 5.0;
+        cfg.trials = 100;
+        assert_eq!(train_hidden_rec(&cfg), train_hidden_rec(&cfg));
+    }
+
+    #[test]
+    #[ignore] // expensive; run manually in --release
+    fn fair_recurrence_test() {
+        // The genuinely fair recurrence test: a WORKING deep-FF baseline (sparse drive up16 + forward rate_reg
+        // → ~980 on XOR), with L2 recurrence stabilized by a CLASS-PRESERVING per-layer stabilizer (rec_stab),
+        // NOT per-neuron rate_reg (which homogenizes). Does recurrence add on a live, un-poisoned baseline?
+        let seeds = [0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF, 0xA5A5_1111, 0x0F0F_2222];
+        let (mut ffa, mut ra) = (Vec::new(), Vec::new());
+        for &s in &seeds {
+            let mut ff = RsnnConfig::demo();
+            ff.seed = s;
+            ff.task_seed = s;
+            ff.size = 16;
+            ff.up_count = 16; // sparse drive: deep FF is starved (dead) without rate_reg
+            ff.delay = 20;
+            ff.trials = 1500;
+            ff.rate_reg = 5.0; // revive the forward path (per-neuron liveness)
+            ff.rate_target_permille = 100;
+            ff.rec_count = 0; // FF baseline: L2 has no recurrence
+            let mut rec = ff.clone();
+            rec.rec_count = 24;
+            rec.rec_radius = 4;
+            rec.rec_tau = 20.0;
+            rec.rec_init = 0;
+            rec.rec_stab = 5.0; // class-preserving per-layer recurrent stabilizer (not per-neuron rate_reg)
+            let f = train_hidden_rec(&ff);
+            let r = train_hidden_rec(&rec);
+            eprintln!("fair-rec seed {s:#x}  deep-FF {f}  +hidden-rec(stab) {r}");
+            ffa.push(f);
+            ra.push(r);
+        }
+        eprintln!(
+            "fair-rec: FF worst {} mean {}   +rec worst {} mean {}",
+            ffa.iter().min().unwrap(),
+            ffa.iter().sum::<u64>() / 5,
+            ra.iter().min().unwrap(),
+            ra.iter().sum::<u64>() / 5
+        );
     }
 
     #[test]
