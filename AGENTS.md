@@ -18,6 +18,12 @@ and adds a learning layer on top. The central result so far — earned the hard 
 So the project moved from "pure procedural, train thresholds" to the **GeNN hybrid** (Knight & Nowotny
 2021): keep the procedural static structure, but **store and train the plastic weights**.
 
+**Current state:** that hybrid *works*. A **feed-forward + ALIF** network with e-prop / multi-layer-DFA
+credit is a **reliable learner** (held-out, multi-seed), usable to ~16 layers, and `rate_reg` reliably keeps
+deep stacks alive. **Recurrence is the one open problem** — an exhaustive campaign (see Learning below)
+showed trained recurrence never earns its keep and actively harms a working baseline, leaving
+surrogate-gradient BPTT as the only untried lever.
+
 ## The three modules (read this before touching code)
 
 The crate is `wave_state_machine` + `wave_net` + `bench` (`src/lib.rs` wires them up):
@@ -119,24 +125,38 @@ criticality) calibration is unsolved — see the recurrence null in `docs/experi
 ## Learning: what is built, and what it found
 
 The learning rules live in `bench/` (chiefly `bench::rsnn`), not in the engine. Treat
-`docs/experiments_results.md` as the **source of truth** for findings; the headline results:
+`docs/experiments_results.md` as the **source of truth** for findings. **Bottom line after an exhaustive
+campaign: the substrate's *working* learner is wide + shallow + feed-forward + ALIF; recurrence is an
+airtight null and remains the one open problem (short of BPTT).** Headline results:
 
-- **e-prop on stored weights learns reliably.** A factored per-neuron eligibility (`e = pre-trace ×
-  ψ`, both O(neurons) engine state) × a learning signal from a trained readout updates the stored
-  weights through the `f32` shadow. Held-out and multi-seed, it clears the bar threshold-only training
-  failed. A trained readout on the full reservoir (classic LSM) is also a reliable baseline.
-- **Multi-layer DFA credit makes depth usable.** Train *every* layer: the top gets symmetric readout
-  feedback, deeper layers get Direct Feedback Alignment (fixed random hash-derived feedback of the
-  output error). Reliable to ~16 layers (with width to match); the wall beyond is DFA feedback noise,
-  not the substrate.
-- **Recurrence is an honest null.** Trainable `level 0` (lateral) and `level −1/−2` (backward) weights
-  do **not** beat feed-forward: the blocker is **sustaining dynamics** — the floored leak plus weak
-  `±1` recurrent init don't self-sustain a trace across a silent gap, so no pseudo-derivative (spike or
-  sub-threshold ψ) has anything to credit. (An earlier "ψ is the blocker" reading was a bug — a dead,
-  sub-critical readout layer; corrected in the doc.)
-- **ALIF adaptation is a strong working memory** (~64-wave held-category store-recall) but does **not**
-  help linear echo (MC) or nonlinear temporal computation (XOR) — LIF wins those. Adaptation buys
-  *held-across-a-delay* memory, nothing else.
+- **The working learner — e-prop on stored weights + trained readout, feed-forward + ALIF (the good
+  result).** A factored per-neuron eligibility (`e = pre-trace × ψ`, both O(neurons) engine state) × a
+  learning signal from a trained readout updates the stored weights through the `f32` shadow. Held-out and
+  multi-seed, it clears the bar threshold-only training failed. A trained readout on the full reservoir
+  (classic LSM) is also a reliable baseline.
+- **Multi-layer DFA credit makes depth usable to ~16 layers.** Train *every* layer: the top gets symmetric
+  readout feedback, deeper layers get Direct Feedback Alignment (fixed random hash-derived feedback of the
+  output error), with width to match. The wall beyond ~16 is DFA feedback noise, not the substrate.
+- **`rate_reg` is a *conclusive* liveness rescue for feed-forward depth.** A soft per-neuron term
+  `c_reg·(rate − target)` folded into the e-prop learning signal — the LSNN/e-prop mechanism,
+  `RsnnConfig.rate_reg` — reliably revives a *liveness-starved* deep FF stack: chance → ~980 on temporal
+  XOR, 5-seed robust. Two hard rules: it **requires ALIF** (a LIF deep stack cannot be revived — adaptation
+  is load-bearing), and it belongs on the **forward path only** — on recurrent weights the same term
+  homogenizes the class signal and *hurts* (use the per-layer, class-preserving `rec_stab` there instead).
+- **ALIF adaptation is both a working memory *and* load-bearing for liveness.** It is a strong ~64-wave
+  held-category memory (store-recall); it does **not** help linear echo (MC) or nonlinear temporal
+  computation (XOR) feed-forward — LIF wins those short tasks — **but it is *necessary* for deep-FF
+  propagation** (removing it kills the deep stack; `rate_reg` can't revive LIF). Calibration = a one-time
+  sensible init; ALIF owns the operating point during a run.
+- **Recurrence is an airtight null — the sole open problem, and only BPTT is left to try.** Across an
+  exhaustive matrix — lateral (`level 0`), backward (`level −1/−2`), skip/side-car and hidden-recurrent
+  topologies, sparse and dense, shallow and deep, ALIF and LIF, XOR/parity/distractor/flip-flop, with and
+  without `rate_reg`, and with a class-preserving per-layer stabilizer (`rec_stab`) — trained recurrence via
+  the crude spike-timing e-prop **never earns its keep, and on a *working* baseline it actively destroys the
+  signal** (986 → chance). Every substrate / stabilizer / topology / neuron-model confound is ruled out, so
+  the blocker is the **credit rule**; the sole remaining lever is **surrogate-gradient BPTT** (proper
+  temporal credit), a heavy un-built option. (Earlier "sustaining dynamics" / "ψ is the blocker" readings
+  are superseded — see the doc.)
 
 ## Reading & training: the multi-wave rule
 
@@ -205,7 +225,9 @@ src/
     network.rs           # Network — orchestration, routing, deferred swap, listeners, readout layer, measurement
     calibrate.rs         # firing-rate calibration (bottom-up + refine)
   bench/                 # experiment harness (public-API only) — the learning rules live here
-    rsnn.rs              # trained readout (LSM) + e-prop on hidden weights + multi-layer DFA + recurrence experiments
+    rsnn.rs              # trained readout (LSM) + feed-forward e-prop + multi-layer DFA (train_recurrent/train_multilayer)
+                         #   + rate_reg (FF liveness rescue) + rec_stab (per-layer recurrent stabilizer) + sequence tasks
+                         #   (train_sequence: parity/distractor/flip-flop) + the exhaustive recurrence-null benchmark suite
     eprop.rs             # v1 threshold-only e-prop (historical; the approach the pivot moved past)
     readout.rs, linalg.rs # spike-count features / integer nearest-centroid; f64 ridge + LU solve
     store_recall.rs, memory_capacity.rs, temporal_xor.rs, stream.rs # the ALIF-vs-LIF task suite
@@ -226,3 +248,6 @@ baselines; `adapt` is Q12 fixed point so its geometric decay stays exponential (
 valid only while `adapt_decay <= ADAPT_SHIFT` (`Config::validate` enforces it); a `Layer` is a
 self-contained, persistable unit (owns its structure, thresholds, and stored weights) — serialization
 itself is not yet built.
+
+
+trained forward-projection + recurrence
