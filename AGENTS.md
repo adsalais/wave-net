@@ -102,10 +102,19 @@ target. Calibration is **layer-owned**: each `Layer` tunes its own thresholds (`
 `calibrate_step`); the `Network` only measures rates (`measure_layer_rates`, which saves/restores the
 caller's listeners) and delegates. Deterministic.
 
-**Known limitation:** calibration targets a *sustained random* drive at one operating point; it does
-**not** guarantee a *transient, sparse, task-specific* cue propagates through a deep stack (a
-sub-critical net lets the cue die with depth). A principled generic (per-layer gain / criticality)
-calibration is unsolved — see the recurrence null in `docs/experiments_results.md`.
+**Calibration is a *sensible initialization*, not a runtime target.** It runs **once**, before training, to
+boot the net into a live, propagating regime — the literature's "initialize sensibly" — and is then left
+alone; **training + adaptation own the operating point from there.** The calibrated *rate does not need to
+transfer to the task*: `calibrate` measures ~10% on a *sparse random* drive, but a denser task cue runs the
+net at 20–40%, and that is fine (more propagation, ALIF-quenched). So **do not read the calibrated rate as
+the task operating point, and do not re-calibrate to chase a rate during a run.** (e-prop/LSNN uses a soft
+firing-rate *regularizer* in the loss, never a separate proxy-drive calibration — see `docs/related-work.md`,
+2026-07-09.)
+
+**Known limitation:** because it is only an init, calibration targets a *sustained random* drive at one
+operating point; it does **not** guarantee a *transient, sparse, task-specific* cue propagates through a
+deep stack (a sub-critical net lets the cue die with depth). A principled generic (per-layer gain /
+criticality) calibration is unsolved — see the recurrence null in `docs/experiments_results.md`.
 
 ## Learning: what is built, and what it found
 
