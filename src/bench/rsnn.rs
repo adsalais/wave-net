@@ -481,9 +481,9 @@ fn recurrent_update(net: &mut Network, cfg: &RsnnConfig, w: &[Vec<f32>], err: &[
     });
 }
 
-/// Train a readout on L1's read-window activity for temporal XOR; with `rec_count > 0` also trains the L1
-/// level-0 recurrent weights. Returns held-out test accuracy permille.
-pub fn train_xor(cfg: &RsnnConfig) -> u64 {
+/// Build + calibrate + train (readout + level-0 recurrent weights) for temporal XOR; return the trained net
+/// and the L1 readout. Split out so callers can probe the trained net's per-wave recurrent activity.
+fn train_xor_inner(cfg: &RsnnConfig) -> (Network, Vec<Vec<f32>>) {
     let mut net = Network::new(cfg.engine_config_xor());
     net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
     if cfg.rec_count > 0 && cfg.rec_init != 0 {
@@ -517,6 +517,16 @@ pub fn train_xor(cfg: &RsnnConfig) -> u64 {
             recurrent_update(&mut net, cfg, &w, &err, &waves);
         }
     }
+    (net, w)
+}
+
+/// Train a readout on L1's read-window activity for temporal XOR; with `rec_count > 0` also trains the L1
+/// level-0 recurrent weights. Returns held-out test accuracy permille.
+pub fn train_xor(cfg: &RsnnConfig) -> u64 {
+    let (mut net, w) = train_xor_inner(cfg);
+    let score = |w: &[Vec<f32>], a: &[f32]| -> Vec<f32> {
+        (0..2).map(|c| w[c].iter().zip(a).map(|(wi, ai)| wi * ai).sum()).collect()
+    };
     let mut correct = 0usize;
     let holdout = 400usize;
     for t in cfg.trials..cfg.trials + holdout {
