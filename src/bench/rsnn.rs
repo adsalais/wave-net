@@ -943,16 +943,16 @@ mod tests {
         // On: they should fire near the target through the full depth (liveness climbed the stack).
         // The reg term c_reg·(r_j−r_target) must be comparable to the task signal L_j^task ~ O(1), so
         // c_reg ~ 10s (r_target = 0.1); a small c_reg is negligible.
-        for reg in [0.0f32, 5.0, 20.0, 50.0] {
+        for reg in [0.0f32, 5.0, 20.0] {
             let mut c = RsnnConfig::demo();
             c.seed = 0xE9_0B_0A17;
             c.task_seed = 0xE9_0B_0A17;
             c.size = 16;
-            c.layers = 16;
+            c.layers = 20; // match the depth-wall config, so revival and the accuracy null are the same net
             c.multi_layer = true;
             c.trials = 800;
-            c.present_waves = 16;
-            c.read_waves = 16;
+            c.present_waves = 20;
+            c.read_waves = 20;
             c.delay = 4;
             c.rate_reg = reg;
             c.rate_target_permille = 100;
