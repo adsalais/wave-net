@@ -975,12 +975,15 @@ fn train_multilayer(cfg: &RsnnConfig, mut net: Network, layer_entries: &[Vec<(i3
                             e += pretr[z][tt][i] * post[tz][tt][j];
                         }
                         if e != 0.0 {
-                            // forward levels → per-neuron rate_reg (liveness); recurrent levels (0/−1/−2) →
-                            // per-LAYER rec_stab uniform bias (stabilize the loop without homogenizing).
+                            // forward levels → per-neuron rate_reg (liveness). Recurrent levels (0/−1/−2) →
+                            // per-LAYER rec_stab uniform bias (class-preserving) when set, else fall back to
+                            // standard per-neuron rate_reg (the homogenizing one) for comparison.
                             let reg = if level > 0 {
                                 cfg.rate_reg * (rate[tz][j] - r_target)
-                            } else {
+                            } else if cfg.rec_stab != 0.0 {
                                 cfg.rec_stab * (layer_mean[tz] - r_target)
+                            } else {
+                                cfg.rate_reg * (rate[tz][j] - r_target)
                             };
                             updates.push((i * total_slots_z + slot + k, -cfg.hidden_lr * (task_sig(tz, j) + reg) * e));
                         }
@@ -1399,6 +1402,51 @@ mod tests {
             ra.iter().min().unwrap(),
             ra.iter().sum::<u64>() / 5
         );
+    }
+
+    #[test]
+    #[ignore] // expensive; run manually in --release
+    fn fair_recurrence_lif() {
+        // Final fair test with STANDARD LIF neurons (adapt_bump 0 — no ALIF adaptation quenching the
+        // recurrent gain). Hidden-rec architecture, sparse drive + forward rate_reg. FF baseline, then
+        // recurrence with (a) standard per-neuron rate_reg (rec_stab 0) vs (b) class-preserving per-layer
+        // rec_stab. Does removing adaptation let recurrence survive with either stabilizer?
+        let seeds = [0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF, 0xA5A5_1111, 0x0F0F_2222];
+        let mk = |s: u64| {
+            let mut c = RsnnConfig::demo();
+            c.seed = s;
+            c.task_seed = s;
+            c.size = 16;
+            c.up_count = 16;
+            c.delay = 20;
+            c.trials = 1500;
+            c.adapt_bump = 0; // LIF: no adaptation
+            c.rate_reg = 5.0;
+            c.rate_target_permille = 100;
+            c.rec_count = 24;
+            c.rec_radius = 4;
+            c.rec_tau = 20.0;
+            c.rec_init = 0;
+            c
+        };
+        let (mut ff, mut rr, mut rs) = (Vec::new(), Vec::new(), Vec::new());
+        for &s in &seeds {
+            let mut base = mk(s);
+            base.rec_count = 0; // FF baseline (LIF, no recurrence)
+            ff.push(train_hidden_rec(&base));
+            let mut a = mk(s);
+            a.rec_stab = 0.0; // (a) recurrence + standard per-neuron rate_reg
+            rr.push(train_hidden_rec(&a));
+            let mut b = mk(s);
+            b.rec_stab = 5.0; // (b) recurrence + class-preserving per-layer rec_stab
+            rs.push(train_hidden_rec(&b));
+        }
+        let m = |v: &Vec<u64>| (*v.iter().min().unwrap(), v.iter().sum::<u64>() / 5);
+        for (i, &s) in seeds.iter().enumerate() {
+            eprintln!("LIF seed {s:#x}  FF {}  +rec(std rate_reg) {}  +rec(rec_stab) {}", ff[i], rr[i], rs[i]);
+        }
+        let (m1, m2, m3) = (m(&ff), m(&rr), m(&rs));
+        eprintln!("LIF fair-rec: FF worst/mean {m1:?}  +rec(rate_reg) {m2:?}  +rec(rec_stab) {m3:?}");
     }
 
     #[test]
