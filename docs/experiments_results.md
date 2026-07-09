@@ -385,3 +385,23 @@ earn its keep" holds *in this small, sparse, thin-recurrence regime* — it does
 limit, and "BPTT is the lever" is only one hypothesis among four (**capacity, recurrence density, task
 difficulty, credit rule**). A fair test needs the LSNN regime: 100s of neurons, dense/full recurrence *as the
 main substrate*, harder tasks, and proper temporal credit. Until then the null is provisional.
+
+**Fair-regime data point (size 16 = 256 neurons, dense recurrence).** Testing the capacity + density
+hypotheses on parity (worst-seed over 3 seeds):
+
+| N | FF (size 16) | + dense recurrence (`rec_count 96`, full radius) | (under-powered: size 8, `rec_count 24`) |
+|---|---|---|---|
+| 3 | **980** | **465 (chance)** | FF 817 / rec 700 |
+| 4 | **900** | **487 (chance)** | FF 670 / rec 522 |
+
+Two findings, and neither matches the naive hypothesis: **(1) capacity was a real gap — but it rescues the
+*feed-forward* reservoir**, not recurrence (scaling to 256 neurons lifted FF parity 817/670 → 980/900; the
+task is FF-solvable with enough neurons). **(2) Dense ±1 recurrence *collapses to chance*** — 96 recurrent
+synapses/neuron at ±1 init is strongly **super-critical** (runaway), drowning the class signal, so densifying
+made recurrence *catastrophically worse*, not better. Dense recurrence is a **gain liability**, not a free
+win: it needs the recurrent gain controlled to **σ ≈ 1** to be stable — which **re-surfaces the abandoned
+criticality thread, now with the valid estimator**: the *perturbation probe* (`probe_avalanche`, built but
+never wired to a controller — the *analytic* `Σ|w|/θ` estimator was the invalid one). **Net: capacity was
+real (fixed FF); dense recurrence is untested fairly until its gain is controlled.** The next honest test of
+recurrence is probe-gain-controlled (σ≈1) dense recurrence — not raw ±1 dense recurrence, and not the
+sparse under-powered version.
