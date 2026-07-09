@@ -145,6 +145,34 @@ impl RsnnConfig {
         };
         Config { seed: self.seed, size: self.size, layers: vec![layer; self.layers] }
     }
+
+    /// The user's backward-fed recurrent side-car (4 layers): L0(input)→L1; L1 **skips** to L3 (+2);
+    /// L2 is a recurrent scratchpad (0 self + +1 to L3); L3 feeds L2 back (−1) and is read. `rec_count`
+    /// sizes the side-car's synapses per level; `up_count`/`up_radius` the forward/skip path.
+    fn engine_config_sidecar(&self) -> Config {
+        let mk = |topology| LayerConfig {
+            topology,
+            leak: (3, 5),
+            cooldown_base: 2,
+            inhibitor_ratio: 0,
+            threshold_jitter: 32,
+            baseline_init: 6,
+            adapt_bump: self.adapt_bump,
+            adapt_decay: self.adapt_decay,
+        };
+        let (uc, ur) = (self.up_count, self.up_radius);
+        let (n, r) = (self.rec_count, self.rec_radius);
+        let layers = vec![
+            mk(vec![TopologyLevel { level: 1, radius: ur, count: uc }]), // L0 input transducer → L1
+            mk(vec![TopologyLevel { level: 2, radius: ur, count: uc }]), // L1 → L3 (skip L2)
+            mk(vec![
+                TopologyLevel { level: 0, radius: r, count: n }, // L2 self-recurse
+                TopologyLevel { level: 1, radius: r, count: n }, // L2 → L3 (forward from side-car)
+            ]),
+            mk(vec![TopologyLevel { level: -1, radius: r, count: n }]), // L3 → L2 (backward); L3 is read
+        ];
+        Config { seed: self.seed, size: self.size, layers }
+    }
 }
 
 /// Run one trial (reset → cue → delay → probe); return the FULL reservoir's per-neuron spike counts over
@@ -790,6 +818,148 @@ pub fn train_recurrent(cfg: &RsnnConfig) -> u64 {
     (correct as u64 * 1000) / holdout as u64
 }
 
+/// Multi-layer temporal e-prop on temporal XOR for an arbitrary **per-layer** topology. `layer_entries[z]`
+/// lists layer z's `(level, count, radius)` in the SAME order as its built topology, so slot indices align
+/// with `out_weights`. Trains every trainable weight (forward, backward, lateral, skip) via the factored
+/// temporal eligibility × (symmetric-top / DFA-deep) signal. Returns held-out permille. Used for custom
+/// topologies like the side-car; `train_recurrent` keeps its own uniform loop.
+fn train_multilayer(cfg: &RsnnConfig, mut net: Network, layer_entries: &[Vec<(i32, usize, u32)>]) -> u64 {
+    let l = net.layer_count();
+    let ls = (cfg.size * cfg.size) as usize;
+    let top = l - 1;
+    let mut w = vec![vec![0f32; ls]; 2];
+    let score = |w: &[Vec<f32>], a: &[f32]| -> Vec<f32> {
+        (0..2).map(|c| w[c].iter().zip(a).map(|(wi, ai)| wi * ai).sum()).collect()
+    };
+    let decay = 1.0 - 1.0 / cfg.rec_tau.max(1.0);
+    let theta: Vec<Vec<f32>> = (0..l)
+        .map(|z| net.layer_thresholds(z.max(1)).iter().map(|&t| (t as f32).max(1.0)).collect())
+        .collect();
+    for t in 0..cfg.trials {
+        let (a, b) = pick_ab(cfg.task_seed, t);
+        let label = a ^ b;
+        let (act, spikes, pots) = xor_trial_layers(&mut net, cfg, a, b, t);
+        let p = softmax(&score(&w, &act));
+        let err: Vec<f32> = (0..2).map(|c| p[c] - if c == label { 1.0 } else { 0.0 }).collect();
+        for c in 0..2 {
+            for j in 0..ls {
+                w[c][j] -= cfg.readout_lr * err[c] * act[j];
+            }
+        }
+        if cfg.hidden_lr == 0.0 {
+            continue;
+        }
+        let ttot = spikes[top].len();
+        let mut fired = vec![vec![vec![0f32; ls]; ttot]; l];
+        let mut pretr = vec![vec![vec![0f32; ls]; ttot]; l];
+        for z in 1..l {
+            for (tt, wv) in spikes[z].iter().enumerate() {
+                for &loc in wv {
+                    fired[z][tt][loc as usize] = 1.0;
+                }
+            }
+            for i in 0..ls {
+                let mut tr = 0.0;
+                for tt in 0..ttot {
+                    tr = tr * decay + fired[z][tt][i];
+                    pretr[z][tt][i] = tr;
+                }
+            }
+        }
+        let mut post = vec![vec![vec![0f32; ls]; ttot]; l];
+        for z in 1..l {
+            for tt in 0..ttot {
+                for j in 0..ls {
+                    post[z][tt][j] = if cfg.subthreshold_psi {
+                        (pots[z][tt][j] as f32 / theta[z][j]).clamp(0.0, 1.0)
+                    } else {
+                        fired[z][tt][j]
+                    };
+                }
+            }
+        }
+        let rate: Vec<Vec<f32>> = (0..l)
+            .map(|z| {
+                (0..ls)
+                    .map(|j| (0..ttot).map(|tt| fired[z][tt][j]).sum::<f32>() / ttot.max(1) as f32)
+                    .collect()
+            })
+            .collect();
+        let r_target = cfg.rate_target_permille as f32 / 1000.0;
+        let l_sig = |tz: usize, j: usize| -> f32 {
+            let task: f32 = (0..2)
+                .map(|c| {
+                    let bb = if tz == top { w[c][j] } else { dfa_weight(cfg.seed, (tz * ls + j) as u32, c) };
+                    bb * err[c]
+                })
+                .sum();
+            task + if cfg.rate_reg != 0.0 { cfg.rate_reg * (rate[tz][j] - r_target) } else { 0.0 }
+        };
+        for z in 0..l {
+            let total_slots_z: usize = layer_entries[z].iter().map(|(_, c, _)| c).sum();
+            let mut updates: Vec<(usize, f32)> = Vec::new();
+            let mut slot = 0usize;
+            for &(level, count, radius) in &layer_entries[z] {
+                let tz_i = z as i32 + level;
+                if tz_i < 1 || tz_i >= l as i32 {
+                    slot += count;
+                    continue;
+                }
+                let tz = tz_i as usize;
+                for i in 0..ls {
+                    let sg = (z * ls + i) as u32;
+                    for k in 0..count {
+                        let j = target_of(cfg.seed, sg, i as u32, level, k as u32, radius, cfg.size) as usize;
+                        let mut e = 0f32;
+                        for tt in 0..ttot {
+                            e += pretr[z][tt][i] * post[tz][tt][j];
+                        }
+                        if e != 0.0 {
+                            updates.push((i * total_slots_z + slot + k, -cfg.hidden_lr * l_sig(tz, j) * e));
+                        }
+                    }
+                }
+                slot += count;
+            }
+            net.with_layer_mut(z, |lz| {
+                for (idx, d) in &updates {
+                    lz.out_shadow[*idx] += *d;
+                }
+                for (wq, s) in lz.out_weights.iter_mut().zip(&lz.out_shadow) {
+                    *wq = s.round().clamp(-127.0, 127.0) as i8;
+                }
+            });
+        }
+    }
+    let mut correct = 0usize;
+    let holdout = 400usize;
+    for t in cfg.trials..cfg.trials + holdout {
+        let (a, b) = pick_ab(cfg.task_seed, t);
+        let (act, _, _) = xor_trial_layers(&mut net, cfg, a, b, t);
+        let s = score(&w, &act);
+        if (if s[1] > s[0] { 1 } else { 0 }) == (a ^ b) {
+            correct += 1;
+        }
+    }
+    (correct as u64 * 1000) / holdout as u64
+}
+
+/// Train the backward-fed recurrent side-car (see `engine_config_sidecar`) on temporal XOR; held-out permille.
+pub fn train_sidecar(cfg: &RsnnConfig) -> u64 {
+    let mut net = Network::new(cfg.engine_config_sidecar());
+    net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
+    let (uc, ur) = (cfg.up_count as usize, cfg.up_radius);
+    let (n, r) = (cfg.rec_count as usize, cfg.rec_radius);
+    // per-layer entries, matching engine_config_sidecar's topology order exactly
+    let layer_entries = vec![
+        vec![(1i32, uc, ur)],       // L0: +1
+        vec![(2i32, uc, ur)],       // L1: +2 skip
+        vec![(0i32, n, r), (1i32, n, r)], // L2: self + forward
+        vec![(-1i32, n, r)],        // L3: backward
+    ];
+    train_multilayer(cfg, net, &layer_entries)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1015,6 +1185,41 @@ mod tests {
             best_bw = best_bw.max(ba);
         }
         eprintln!("backward: best FF {best_ff}  best +back+reg {best_bw}");
+    }
+
+    #[test]
+    fn train_sidecar_is_deterministic() {
+        let mut cfg = RsnnConfig::demo();
+        cfg.size = 8;
+        cfg.delay = 10;
+        cfg.rec_count = 8;
+        cfg.trials = 100;
+        assert_eq!(train_sidecar(&cfg), train_sidecar(&cfg));
+    }
+
+    #[test]
+    #[ignore] // expensive; run manually in --release
+    fn sidecar_recurrence() {
+        // The user's backward-fed recurrent side-car (L1 skips to L3 via +2; L3↔L2 loop; read L3) on temporal
+        // XOR, ALIF, size 16, delay 20, modest side-car (rec_count 24). vs a matched trained deep FF (4 layers).
+        let seeds = [0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF];
+        for &s in &seeds {
+            let mut sc = RsnnConfig::demo();
+            sc.seed = s;
+            sc.task_seed = s;
+            sc.size = 16;
+            sc.delay = 20;
+            sc.trials = 1500;
+            sc.rec_count = 24;
+            sc.rec_radius = 4;
+            let mut ff = sc.clone();
+            ff.layers = 4;
+            ff.back_count = 0;
+            ff.rec_count = 0; // matched 4-layer trained deep FF baseline (uniform +1)
+            let ff_acc = train_recurrent(&ff);
+            let sc_acc = train_sidecar(&sc);
+            eprintln!("side-car seed {s:#x}  deep-FF(4) {ff_acc}  side-car {sc_acc}");
+        }
     }
 
     #[test]
