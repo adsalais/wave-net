@@ -426,3 +426,24 @@ readout, not the feed-forward projection. A fair deep test would combine multi-l
 (`train_eprop`) *with* recurrence. **Until that build: the substrate's best parity config remains wide,
 shallow, feed-forward + ALIF (980/900); depth and recurrence both hurt when the forward projection is
 untrained.**
+
+## `rate_reg` is a feed-forward liveness tool — it revives deep FF but *hurts* recurrence
+
+Turned `rate_reg = 5.0` on across **all** recurrence benchmarks (both variants) and re-ran. The result splits
+cleanly by *where* the regularizer's class-agnostic term lands:
+
+- **On recurrent weights → hurts, everywhere.** Every `+rec` variant got worse vs `rate_reg = 0`, most
+  crashing toward chance: parity N=3 700→**562**; distractor-XOR (worst) 800→**475**; flip-flop (worst)
+  880→**485**; ALIF+rec (delay 40/80) 750/652→**475/475**. `rate_reg` adds `c_reg·(rate−target)` to the
+  signal that trains the *recurrent* weights, so at `c_reg=5` it overrides the task signal — the recurrence
+  learns to hit a *rate*, not carry the *class* → class-agnostic reverberation → worse.
+- **On forward weights → can dramatically revive deep FF.** The side-car's matched **deep-FF(4)** baseline
+  jumped from **chance to near-perfect** on temporal XOR: 480/497/492 → **982/987/997**. Here `rate_reg` on the
+  forward (DFA) weights revived the dead deep layers, the cue reached L3, and XOR got solved — the depth-wall
+  mechanism finally moving *accuracy*, not just liveness. (Config-sensitive: the l2l3loop deep-FF, denser
+  drive / shorter delay, stayed at chance.)
+
+**Lesson:** `rate_reg` belongs on the **feed-forward** path (revive dead depth — sometimes a huge accuracy
+win), **not** on recurrent weights (destroys the class signal). It does not rescue recurrence; it confirms
+harder that recurrence + crude e-prop fails. The one keeper is the FF revival (deep-FF 480→982) — evidence
+that, for feed-forward depth, liveness genuinely *can* be the blocker.
