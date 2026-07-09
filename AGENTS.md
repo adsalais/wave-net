@@ -18,9 +18,6 @@ and adds a learning layer on top. The central result so far — earned the hard 
 So the project moved from "pure procedural, train thresholds" to the **GeNN hybrid** (Knight & Nowotny
 2021): keep the procedural static structure, but **store and train the plastic weights**.
 
-Rust, edition 2024. **Standard library only by default** — the one optional dependency (`blake3`) is
-behind a test-only feature. This is a **library crate** (no binary); experiments are `#[ignore]`d tests.
-
 ## The three modules (read this before touching code)
 
 The crate is `wave_state_machine` + `wave_net` + `bench` (`src/lib.rs` wires them up):
@@ -159,6 +156,8 @@ so `cargo test` stays fast and the experiments are reproducible on demand.
 
 ## Conventions (required)
 
+- Rust, edition 2024. **Standard library only by default** — the one optional dependency (`blake3`) is
+behind a test-only feature. This is a **library crate** (no binary); experiments are `#[ignore]`d tests.
 - **Standard library only** in `src/` (the sole optional dep, `blake3`, is a test-only feature);
   **no `unsafe`**; **warning-free build**.
 - **Determinism is a hard requirement** — results are a pure function of `(seed, config, input)`.
