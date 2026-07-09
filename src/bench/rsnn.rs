@@ -1188,6 +1188,8 @@ mod tests {
             ff.task_seed = s;
             ff.delay = delay;
             ff.trials = 1500;
+            ff.rate_reg = 5.0;
+            ff.rate_target_permille = 100;
             let mut rec = ff.clone();
             rec.rec_count = 24;
             rec.rec_radius = 2;
@@ -1256,6 +1258,8 @@ mod tests {
             sc.trials = 1500;
             sc.rec_count = 24;
             sc.rec_radius = 4;
+            sc.rate_reg = 5.0;
+            sc.rate_target_permille = 100;
             let mut ff = sc.clone();
             ff.layers = 4;
             ff.back_count = 0;
@@ -1310,6 +1314,8 @@ mod tests {
         base.rec_count = 24;
         base.rec_radius = 4;
         base.delay = 12;
+        base.rate_reg = 5.0;
+        base.rate_target_permille = 100;
         // liveness probe: does every layer (esp. the read top L3) fire?
         let mut net = Network::new(base.engine_config_l2l3loop());
         net.calibrate(&base.calib, &random_l0_input(base.seed ^ 0xE9, base.size, base.calib_fraction_q16));
@@ -1360,6 +1366,8 @@ mod tests {
                 ff.task_seed = s;
                 ff.delay = 8;
                 ff.trials = 1500;
+                ff.rate_reg = 5.0;
+                ff.rate_target_permille = 100;
                 let mut rec = ff.clone();
                 rec.rec_count = 24;
                 rec.rec_radius = 2;
@@ -1392,6 +1400,8 @@ mod tests {
                 ff.size = 16;
                 ff.delay = 8;
                 ff.trials = 1500;
+                ff.rate_reg = 5.0;
+                ff.rate_target_permille = 100;
                 let mut rec = ff.clone();
                 rec.rec_count = 96;
                 rec.rec_radius = 8; // full-layer coverage on the 16×16 torus
@@ -1424,6 +1434,8 @@ mod tests {
                 ff.xor_layers = 3; // L0 input, L1 forward, L2 recurrent top
                 ff.delay = 8;
                 ff.trials = 1500;
+                ff.rate_reg = 5.0;
+                ff.rate_target_permille = 100;
                 let mut rec = ff.clone();
                 rec.rec_count = 24; // modest lateral density (9% of a 256-neuron layer) — off the super-critical cliff
                 rec.rec_radius = 4;
@@ -1450,6 +1462,8 @@ mod tests {
             ff.task_seed = s;
             ff.delay = 20;
             ff.trials = 1500;
+            ff.rate_reg = 5.0;
+            ff.rate_target_permille = 100;
             let mut rec = ff.clone();
             rec.rec_count = 24;
             rec.rec_radius = 2;
@@ -1473,6 +1487,8 @@ mod tests {
             ff.delay = 12;
             ff.read_waves = 12; // read after a gap so the state must be held
             ff.trials = 1500;
+            ff.rate_reg = 5.0;
+            ff.rate_target_permille = 100;
             let mut rec = ff.clone();
             rec.rec_count = 24;
             rec.rec_radius = 2;
