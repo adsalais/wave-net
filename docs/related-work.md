@@ -323,3 +323,6 @@ Format: *Title* (tag) — Venue Year — link(s).
 - Bellec et al., *Long short-term memory and learning-to-learn in networks of spiking neurons* (LSNN / adaptive-LIF) — NeurIPS 2018 — [arxiv](https://arxiv.org/abs/1803.09574)
 - *Efficient connectivity and intrinsic noise separation in recurrent spiking neural networks trained with e-prop* (e-prop firing-rate figures, ~16 Hz / <12 Hz) — Neuromorphic Computing and Engineering 2025 — [iop](https://iopscience.iop.org/article/10.1088/2634-4386/ae0826)
 - *Sparse-firing regularization methods for spiking neural networks with time-to-first-spike coding* (fixed-uniform-rate-target pitfall) — Scientific Reports 2023 — [nature](https://www.nature.com/articles/s41598-023-50201-5)
+- *Long Short-Term Memory Spiking Networks and Their Applications* (LSNN net sizes: TIMIT 400, N-MNIST 120+84) — arXiv 2020 — [arxiv](https://arxiv.org/pdf/2007.04779)
+- *Effective and Efficient Computation with Multiple-timescale Spiking Recurrent Neural Networks* (fully-recurrent hidden layer, temporal-task sizes) — arXiv 2020 — [arxiv](https://arxiv.org/pdf/2005.11633)
+- *Can Biologically Plausible Temporal Credit Assignment Rules Match BPTT? E-prop as an Example* (e-prop only approaches BPTT — open question) — ICML 2025 — [arxiv](https://arxiv.org/abs/2506.06904)

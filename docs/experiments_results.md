@@ -373,5 +373,15 @@ ALIF feed-forward reservoir captures *partial* parity while trained recurrence *
 is the **credit rule** (the temporal eligibility injects noise rather than useful recurrent computation), not
 substrate capacity. This is the same conclusion the depth wall (credit rule, not liveness) and the temporal-
 XOR check (adaptation holds; recurrence hurts) reached — now robust across a purpose-built task suite, not a
-single measurement. **The next lever for recurrence is proper temporal credit — surrogate-gradient BPTT — not
-more tuning of the eligibility, the operating point, or the topology.**
+single measurement.
+
+**Caveat — this is an under-powered regime, not a fair test vs the literature.** An LSNN/e-prop literature
+check shows our recurrence setup is below the field's norms on *every* axis: **64 neurons** (size 8) vs
+**100–400** (TIMIT 400; sMNIST ~100–200; N-MNIST 120+84); **sparse lateral** recurrence (`rec_count 24`) bolted
+onto a *fixed procedural* feed-forward projection vs a **fully/densely recurrent hidden layer where recurrence
+IS the computation**; **toy tasks** (parity/XOR) vs sMNIST/TIMIT; and a **crude spike-timing eligibility** vs
+proper e-prop (itself only *approaching* BPTT — an open question, ICML 2025). So "trained recurrence doesn't
+earn its keep" holds *in this small, sparse, thin-recurrence regime* — it does **not** establish a substrate
+limit, and "BPTT is the lever" is only one hypothesis among four (**capacity, recurrence density, task
+difficulty, credit rule**). A fair test needs the LSNN regime: 100s of neurons, dense/full recurrence *as the
+main substrate*, harder tasks, and proper temporal credit. Until then the null is provisional.
