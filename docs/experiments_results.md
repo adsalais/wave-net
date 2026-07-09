@@ -447,3 +447,26 @@ cleanly by *where* the regularizer's class-agnostic term lands:
 win), **not** on recurrent weights (destroys the class signal). It does not rescue recurrence; it confirms
 harder that recurrence + crude e-prop fails. The one keeper is the FF revival (deep-FF 480→982) — evidence
 that, for feed-forward depth, liveness genuinely *can* be the blocker.
+
+**Robustness (5 seeds) — the FF revival is real, and `rate_reg` is a *targeted liveness rescue*.** Swept the
+plain 4-layer deep FF (no recurrence) on temporal XOR, `delay × up_count × rate_reg`, 5 seeds (mean):
+
+| drive `up_count` | `rate_reg` | delay 12 | delay 20 |
+|---|---|---|---|
+| 16 (sparse) | 0 | 498 (chance) | 498 (chance) |
+| 16 (sparse) | 5 | **957** | **986** |
+| 32 (dense) | 0 | 615 | 890 |
+| 32 (dense) | 5 | 504 (hurt) | 801 (hurt) |
+
+The config-sensitivity resolves cleanly: it's whether the deep FF is **liveness-starved**. Sparse drive →
+the deep stack is **dead**, and `rate_reg` **reliably revives it** (475→957/986 across all 5 seeds, both
+delays — the 982 reproduced). Dense drive → the stack is **already alive** (615–890 with no reg), and there
+`rate_reg` **hurts** (890→801, class-agnostic noise). So `rate_reg` rescues a *starved* deep FF and degrades
+an *alive* one — a targeted tool, not a universal one. (This also explains the l2l3loop deep-FF "failure" at
+507: it was the `up32 + reg` alive-and-hurt cell.)
+
+**And liveness-vs-credit is task-dependent.** The earlier depth-wall finding (parity) was "reviving deep
+layers doesn't fix accuracy — the wall is credit." On **temporal XOR** the opposite holds: reviving the deep
+FF **does** fix accuracy (chance→980). So whether liveness or the credit rule is the wall depends on the
+task — on XOR, deep-FF liveness was the entire blocker, and the online `rate_reg` (the e-prop-literature
+mechanism) is the fix.
