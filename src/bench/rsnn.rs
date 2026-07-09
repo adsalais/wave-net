@@ -1053,6 +1053,38 @@ mod tests {
 
     #[test]
     #[ignore] // expensive; run manually in --release
+    fn parity_fair_regime() {
+        // Fair test vs LSNN: scale up (size 16 = 256 neurons, in the field's 100-400 range) and DENSIFY the
+        // recurrence (rec_count 96 ≈ 37% of the layer, full-layer radius) so recurrence is a real substrate,
+        // not a thin sparse add-on. Does recurrence help parity now? (Input projection is still fixed
+        // procedural — the remaining gap if density alone doesn't move it.)
+        let seeds = [0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF];
+        for n in [3usize, 4] {
+            let (mut worst_ff, mut worst_rec) = (1000u64, 1000u64);
+            for &s in &seeds {
+                let mut ff = RsnnConfig::demo();
+                ff.seed = s;
+                ff.task_seed = s;
+                ff.size = 16;
+                ff.delay = 8;
+                ff.trials = 1500;
+                let mut rec = ff.clone();
+                rec.rec_count = 96;
+                rec.rec_radius = 8; // full-layer coverage on the 16×16 torus
+                rec.rec_tau = 20.0;
+                rec.rec_init = 0;
+                let fa = train_sequence(&ff, |seed, t| task_parity(seed, t, n));
+                let ra = train_sequence(&rec, |seed, t| task_parity(seed, t, n));
+                eprintln!("parity-fair N={n} size16 dense-rec seed {s:#x}  FF {fa}  +rec {ra}");
+                worst_ff = worst_ff.min(fa);
+                worst_rec = worst_rec.min(ra);
+            }
+            eprintln!("parity-fair N={n}: WORST FF {worst_ff}  +rec {worst_rec}");
+        }
+    }
+
+    #[test]
+    #[ignore] // expensive; run manually in --release
     fn distractor_xor_recurrence() {
         // Delayed XOR with an irrelevant distractor cue between A and B. ALIF, FF vs +recurrence, multi-seed.
         let seeds = [0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF];
