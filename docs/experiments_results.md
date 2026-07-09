@@ -263,3 +263,46 @@ recurrent weights at gain ≈ 1 — a criticality/attractor regime the ±1 init 
 slower/finer recurrent-layer leak so the trace outlasts the gap (risking the passive-memory that the floored
 leak fixed); or surrogate-gradient BPTT. Note ALIF adaptation *already* provides a working ~64-wave memory —
 recurrence has to beat that, which is a high bar on this substrate.
+
+## The depth wall is the credit rule, not liveness — firing-rate regularization isolates it
+
+The multi-layer DFA ceiling (reliable to ~16 layers; at **depth 20** the worst seed is **485 = chance**, even
+with trial length scaled to depth) has two candidate blockers: (a) the deep layers go **dead** (the
+sub-critical net's transient cue dies with depth), or (b) the **credit rule** (DFA feedback too noisy to
+train very deep layers). This isolates them.
+
+**Abandoned first attempt — external "criticality gain calibration."** We tried to fix (a) with a
+per-(layer, level) gain `β` *outside* weight storage, tuned by a branching estimator toward gain ≈ 1. It was
+discarded, with two findings that carry forward:
+- The **analytic branching estimator (`Σ|w|·β / θ`) is invalid** — a *static* weight/threshold ratio, blind
+  to whether spikes propagate. It read branching **16** (super-critical) for layers that *never fire* (rate
+  0.00, because calibration floors their thresholds to ~1). Driving a controller with it **cut** forward gain
+  16× and killed the reservoir → uniform chance across all depths/targets.
+- A **separate measure-and-invert gain calibration is a non-standard bolt-on.** The field does not calibrate
+  a trained RSNN to criticality as a phase; it folds a **firing-rate regularization** into the loss,
+  co-trained by the same rule (LSNN, Bellec et al. 2018/2020). Memory comes from **adaptation** (ALIF) or
+  learned structure (BPTT), not from sitting at σ = 1.
+
+**The field-standard fix — rate regularization in the e-prop learning signal.** Add `c_reg·(r_j − r_target)`
+to each target neuron's learning signal, carried by the *same* eligibility `e_ij = pre_i·ψ_j`
+(`r_j = elig_pre_j / n_waves`, `r_target` = the calibration rate). A too-quiet neuron pulls its incoming
+weights up. Bench-side only, **no engine change**; guarded so `rate_reg = 0` is byte-identical.
+
+- **Mechanism (works).** At depth 20 (size 16, multi-layer), `rate_reg = 0` leaves layers 8–15 **dead**
+  (rate 0.00); `c_reg ≈ 5` brings **every layer alive** (0.04–0.19, reaching/exceeding the 0.1 target in the
+  deep layers). Liveness climbs the stack bottom-up (the eligibility gates each layer's revival on its
+  feeder's spikes, and L1 is always driven by the L0 transducer). This is the propagation the invalid static
+  estimator could not see. `c_reg` must be ~10s (comparable to `L_j^task ~ O(1)`); a small coefficient is
+  negligible, a large one (≥ 20) over-suppresses.
+
+- **Depth wall (null).** Held-out accuracy at depth 20 is **byte-identical** across `c_reg ∈ {0, 5, 20}`
+  (per-seed 535 / 500 / 485; worst **485 = chance**). Reviving all 20 layers moves the accuracy **not at
+  all**.
+
+**Reading.** Liveness is **necessary but not sufficient**. With the dead-layer confound *definitively*
+removed (every layer firing near target), the depth-20 wall stands — so it is the **credit rule**: DFA's
+random feedback is too noisy to train 20 deep layers to carry the *class* signal, even when they are all
+active. The regularizer adds *class-agnostic* activity, not class information. This confirms the
+long-suspected DFA ceiling and points the next lever at **symmetric feedback / surrogate-gradient BPTT**, not
+the dynamics. (Rate regularization stands as a working, field-standard liveness mechanism — `RsnnConfig.rate_reg`
+— now available for any deep config, just not the depth-20 bottleneck.)
