@@ -51,43 +51,49 @@ through depth 6, and (with trial length scaled to depth so the cue reaches the t
 Beyond that, DFA's random feedback is too noisy. **Wide + multi-layer = reliable deep learning; either alone
 fails.**
 
-## Recurrence — trainable in the deep + wide + sub-critical regime
+## Recurrence — the side-car topology robustly beats feed-forward
 
-Trained recurrence earns its keep **only** in a specific regime, reached by completing e-prop's ALIF credit
-rule. Every earlier recurrence test used the **crude spike-timing** eligibility (only the fast membrane term
-`e = Σ_t ψ_j·εᵛ_i`). Textbook e-prop for ALIF neurons (Bellec 2020, Eq. 24–25) adds a **slow** adaptation
-eligibility `εᵃ`, recursed at the adaptation rate `ρ`: `e = ψ·(εᵛ − β·εᵃ)`. That term carries credit over the
-~64-wave adaptation horizon (the substrate's delay memory) and was never implemented. It is now built and
-verified against the paper + reference implementation (`RsnnConfig.elig_beta` / `elig_bump_psi`; a decide-time
-`eff` snapshot `Layer.decide_eff`; a fixed-width bump ψ, half-width `elig_psi_width`). Two ψ bugs fixed on the
-way: `eff` must be read at the decide step (before the fire-bump), and the bump needs a fixed absolute band
-(the θ≈1 baseline collapses ψ to ~0, since integer ±1 drive overshoots `eff` by O(2–26)).
+Trained recurrence earns its keep once two things are in place: **the completed ALIF credit rule** and **a
+topology that isolates the recurrent layer from the forward path**. The winning architecture is the
+backward-fed **side-car** (`train_sidecar_task`, `engine_config_sidecar`): the forward signal **skips past**
+the recurrent layer (L1 → L3 via a +2 skip) while a separate **recurrent scratchpad** (L2: self-loop + a
+L2→L3 forward, with L3 feeding L2 back) holds state alongside — so the loop computes *without* injecting its
+reverberation into the clean forward projection.
 
-**Three levers, all necessary** (deep 4-layer hidden-recurrent stack `train_hidden_rec_task`: recurrence on
-the second-from-top layer, *every* forward layer trained via DFA + `rate_reg` liveness; temporal XOR, delay
-20, worst-seed / 3 seeds):
+**Result (size 32, worst-seed / 3 seeds) — a strict improvement over feed-forward on every benchmark:**
 
-- **Depth + trained forward layers** — a shallow recurrent-top net, or untrained forward layers, don't get there.
-- **Width** — rec_count 8, FF vs trained recurrence: **990 / 725** (size 16) → **1000 / 982** (size 32).
-- **Sub-critical recurrence density** — sharp collapse cliff at **rec_count ≈ 12** (size 16); above it the
-  ±1 loop is super-critical and drowns the read layer to chance regardless of the credit rule:
+| task | FF | **side-car** |
+|---|---|---|
+| temporal XOR (delay 20) | 990 | **1000** |
+| flip-flop (delay 12) | 985 | **1000** |
+| distractor-XOR (delay 20) | 700 | **995** |
+| parity N=4 (delay 8) | 587 | **837** |
 
-  | rec_count (size 16) | crude ψ | completed εᵃ |
-  |---|---|---|
-  | 4 | 707 | **855** |
-  | 8 | 672 | **725** |
-  | ≥ 12 | 475 | 475 (collapse) |
+Where FF **saturates** (XOR, flip-flop) the side-car ties at ceiling — no cost. Where FF **struggles** it wins
+big: parity N=4 587 → 837, and distractor-XOR 700 → 995 (the task hides A behind an irrelevant middle cue; the
+recurrent scratchpad holds A across it where a pure forward stack can't). Verified across seeds *and* tasks —
+the first robust, general result where trained recurrence beats feed-forward here.
 
-The **completed eligibility consistently beats the crude rule** where recurrence is trainable, most where
-credit is hardest (light density / small width): rc4 855 vs 707, size 32 982 vs 975.
+**The credit rule that trains it.** Earlier recurrence tests used the **crude spike-timing** eligibility (only
+the fast membrane term `e = Σ_t ψ_j·εᵛ_i`). Textbook e-prop for ALIF neurons (Bellec 2020, Eq. 24–25) adds a
+**slow** adaptation eligibility `εᵃ`, recursed at the adaptation rate `ρ`: `e = ψ·(εᵛ − β·εᵃ)` — carrying
+credit over the ~64-wave adaptation horizon. It is now built and verified against the paper + reference
+implementation (`RsnnConfig.elig_beta` / `elig_bump_psi` / `elig_psi_width`; a decide-time `eff` snapshot
+`Layer.decide_eff`; a fixed-width bump ψ). Two ψ bugs fixed on the way: `eff` must be read at the decide step
+(before the fire-bump), and the bump needs a fixed absolute band (the θ≈1 baseline collapses ψ to ~0, since
+±1 drive overshoots `eff` by O(2–26)).
 
-**It beats feed-forward where the task has headroom.** Temporal XOR is FF-saturated (ALIF-FF ≈ 1000) so
-recurrence can only tie. On **parity N=4** (non-monotone, FF ≈ 620) trained recurrence + completed eligibility
-(size 32, depth 4, rec_count 8) **beats FF on 2 of 3 seeds** (687 vs 680, 642 vs 637; worst-seed 560 vs 620,
-held by the hardest seed) and beats crude on all three — the first substrate result where trained recurrence
-out-performs feed-forward.
+**What the sweeps found (hidden-recurrent stack, the route to the side-car):**
 
-**Levers to push it to a robust win (open):** more depth (a 2nd recurrent layer), more width + rec_count, the
-backward side-car topology, and β·`elig_psi_width` tuning — the hardest seed is the remaining gap. Tools:
-`train_hidden_rec_task` / `sequence_trial_layers` (task-parameterized deep trainer, configurable
-`hidden_rec_depth`), `elig_beta` / `elig_bump_psi` / `elig_psi_width`, `train_sidecar_task`.
+- **Width sets the ceiling** — rec_count 8, FF/rec: 990/725 (size 16) → 1000/982 (size 32).
+- **Recurrence density must stay sub-critical** — sharp collapse cliff at rec_count ≈ 12 (size 16); above it
+  the ±1 loop is super-critical and drowns the read layer to chance regardless of the credit rule.
+- **Completed eligibility ≥ crude wherever it's trainable**, its edge largest where credit is hardest (light
+  density / small width). But β·`elig_psi_width` tuning that helped the hidden-rec stack *hurt* the side-car
+  (**topology >> hyperparameter tuning**) — the plain side-car (β 0.4, W 16) is best.
+
+**Open:** generality to larger sizes; and *why* the side-car structure (forward skip + isolated recurrent
+scratchpad + backward loop) is what unlocks it — working hypothesis: isolating the loop from the forward path
+keeps the class projection clean while the scratchpad holds temporal state (a hypothesis to check against the
+LSNN/e-prop literature). Tools: `train_sidecar_task` / `train_hidden_rec_task` / `sequence_trial_layers`,
+`elig_beta` / `elig_bump_psi` / `elig_psi_width`, `hidden_rec_depth`.

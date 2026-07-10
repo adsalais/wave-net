@@ -20,10 +20,11 @@ So the project moved from "pure procedural, train thresholds" to the **GeNN hybr
 
 **Current state:** that hybrid *works*. A **feed-forward + ALIF** network with e-prop / multi-layer-DFA
 credit is a **reliable learner** (held-out, multi-seed), usable to ~16 layers, and `rate_reg` reliably keeps
-deep stacks alive. **Trained recurrence now also works** — once e-prop's ALIF adaptation eligibility is
-completed — in the deep + wide + sub-critical-density regime, where it beats feed-forward on a headroom task
-(parity N=4). Pushing it to a *robust* multi-seed win is the open problem (see Learning below). **BPTT is out
-of scope — permanently; do not propose it.**
+deep stacks alive. **Trained recurrence now robustly beats feed-forward** — with the completed ALIF
+eligibility on the backward-fed **side-car** topology (recurrent layer isolated from the forward path): a
+strict improvement over FF across every benchmark and seed (XOR/flip-flop tie at ceiling; distractor-XOR
+700→995, parity N=4 587→837). The open questions are generality to larger sizes and *why* the topology works.
+**BPTT is out of scope — permanently; do not propose it.**
 
 ## The three modules (read this before touching code)
 
@@ -127,9 +128,9 @@ criticality) calibration is unsolved — see the recurrence null in `docs/experi
 
 The learning rules live in `bench/` (chiefly `bench::rsnn`), not in the engine. Treat
 `docs/experiments_results.md` as the **source of truth** for findings. **Bottom line: wide + deep +
-feed-forward + ALIF with multi-layer-DFA credit is the reliable learner; trained recurrence works too — with
-the completed ALIF eligibility, in the deep + wide + sub-critical-density regime — and beats feed-forward on
-a headroom task (robust multi-seed superiority is the open problem).** Headline results:
+feed-forward + ALIF with multi-layer-DFA credit is the reliable learner; and trained recurrence — with the
+completed ALIF eligibility on the isolated-recurrent **side-car** topology — robustly beats feed-forward
+across every benchmark and seed (a strict improvement, no downside).** Headline results:
 
 - **The working learner — e-prop on stored weights + trained readout, feed-forward + ALIF (the good
   result).** A factored per-neuron eligibility (`e = pre-trace × ψ`, both O(neurons) engine state) × a
@@ -150,19 +151,20 @@ a headroom task (robust multi-seed superiority is the open problem).** Headline 
   computation (XOR) feed-forward — LIF wins those short tasks — **but it is *necessary* for deep-FF
   propagation** (removing it kills the deep stack; `rate_reg` can't revive LIF). Calibration = a one-time
   sensible init; ALIF owns the operating point during a run.
-- **Recurrence works — in the deep + wide + sub-critical-density regime, once e-prop's ALIF credit rule is
-  completed.** The earlier "airtight null" was measured with the **crude spike-timing** eligibility, missing
-  e-prop's **ALIF adaptation term** `εᵃ` (`e = ψ·(εᵛ − β·εᵃ)`, Bellec 2020). That term is now built and
-  verified (`RsnnConfig.elig_beta`/`elig_bump_psi`; decide-time `eff` snapshot `Layer.decide_eff`;
-  fixed-width bump ψ of half-width `PSI_WIDTH`; two ψ bugs found and fixed). Three levers, all necessary:
-  **depth** (4-layer hidden-rec, *all* forward layers trained via multi-layer DFA — `train_hidden_rec_task`),
-  **width** (temporal XOR rec_count 8: FF/rec = 990/725 at size 16 → 1000/**982** at size 32), and
-  **sub-critical recurrence density** (sharp collapse cliff at rec_count ≈ 12 — keep it below). The completed
-  eligibility **consistently beats the crude rule** where recurrence is trainable (edge largest at light
-  density / small width), and on a **headroom task — parity N=4 (FF ≈ 620, not saturated) — trained
-  recurrence beats FF on 2/3 seeds** (687 vs 680, 642 vs 637). First time recurrence out-performs
-  feed-forward here. **Open:** robustness on the hardest seed — more depth / a 2nd recurrent layer / side-car
-  topology / more width+rec_count / β·`elig_psi_width` tuning. See `docs/experiments_results.md`.
+- **Recurrence robustly beats feed-forward — with the completed ALIF credit rule AND a topology that isolates
+  the recurrent layer from the forward path.** The winner is the backward-fed **side-car**
+  (`train_sidecar_task`, `engine_config_sidecar`): the forward signal *skips past* the recurrent layer
+  (L1→L3, +2) while a separate **recurrent scratchpad** (L2 self-loop + L2→L3, L3→L2 back) holds state — the
+  loop computes without polluting the clean forward projection. Size 32, worst-seed / 3 seeds, it is a
+  **strict improvement over FF on every benchmark**: temporal XOR 990→**1000**, flip-flop 985→**1000**,
+  distractor-XOR 700→**995**, parity N=4 587→**837** (ties where FF saturates, wins big where FF struggles).
+  The credit rule that trains it is the completed **ALIF adaptation eligibility** `εᵃ`
+  (`e = ψ·(εᵛ − β·εᵃ)`, Bellec 2020; missing from the earlier crude spike-timing rule) — now built + verified
+  (`RsnnConfig.elig_beta`/`elig_bump_psi`/`elig_psi_width`; decide-time `eff` snapshot `Layer.decide_eff`;
+  fixed-width bump ψ; two ψ bugs fixed). Levers that matter: **topology (isolation) ≫ hyperparameter tuning**
+  (β·W tuning that helped the hidden-rec stack *hurt* the side-car), **width** (sets the ceiling), and
+  **sub-critical recurrence density** (collapse cliff at rec_count ≈ 12 — keep it below). **Open:** generality
+  to larger sizes, and *why* the skip+scratchpad+loop structure works. See `docs/experiments_results.md`.
 
 ## Reading & training: the multi-wave rule
 
