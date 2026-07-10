@@ -343,7 +343,7 @@ fn xor_trial_layers(net: &mut Network, cfg: &RsnnConfig, a: usize, b: usize, tri
     let record = |net: &Network, pots: &mut Vec<Vec<Vec<i16>>>, effs: &mut Vec<Vec<Vec<i32>>>| {
         for z in 1..l {
             pots[z].push(net.layer_decide_potential(z));
-            effs[z].push(net.layer_effective_threshold(z));
+            effs[z].push(net.layer_decide_effective_threshold(z));
         }
     };
     for (class, phase) in [(a, 0usize), (b, 1)] {
@@ -384,8 +384,14 @@ fn dfa_weight(seed: u64, neuron_global: u32, class: usize) -> f32 {
     if mix(key(seed, neuron_global, class as i32, 0, P_DFA)) & 1 == 1 { 1.0 } else { -1.0 }
 }
 
-/// Dampening (γ) for the normalized bump pseudo-derivative ψ = γ·max(0, 1−|v−eff|/θ). LSNN uses 0.3.
+/// Dampening (γ) for the bump pseudo-derivative ψ = γ·max(0, 1−|v−eff|/W). LSNN uses 0.3.
 const PSI_GAMMA: f32 = 0.3;
+/// Half-width W (in i16 potential units) of the bump pseudo-derivative, centered at the decide-time
+/// effective threshold. LSNN normalizes by v_th, but this substrate's calibration floors baseline θ to ~1
+/// while integer ±1 drive makes potentials overshoot eff by O(2–26) at a spike — so a θ-normalized bump
+/// collapses to ~0. A fixed band matched to the potential-fluctuation scale (the engine's own working
+/// `elig_post` uses PSI_BAND=8; deeper layers overshoot more) keeps ψ non-degenerate near threshold.
+const PSI_WIDTH: f32 = 16.0;
 
 /// Σ_t of the ALIF eligibility trace `e_ij(t) = ψ_j(t)·(εᵛ_i(t) − β·εᵃ_ij(t))`, with the adaptation
 /// eligibility εᵃ recursed at the slow rate ρ: `εᵃ(t+1) = ψ(t)·εᵛ(t) + (ρ − β·ψ(t))·εᵃ(t)`. β = 0 reduces
@@ -563,21 +569,21 @@ fn xor_trial(net: &mut Network, cfg: &RsnnConfig, a: usize, b: usize, trial: usi
             let sites = cue_realization(cfg.task_seed, cfg.size, class, trial * 2 + phase, w, cfg.base_q16, cfg.keep_q16, cfg.noise_q16);
             net.wave(&sites);
             pots.push(net.layer_decide_potential(1));
-            effs.push(net.layer_effective_threshold(1));
+            effs.push(net.layer_decide_effective_threshold(1));
         }
     };
     present(net, a, 0, &mut pots_top, &mut eff_top);
     for _ in 0..cfg.delay {
         net.wave(&[]);
         pots_top.push(net.layer_decide_potential(1));
-        eff_top.push(net.layer_effective_threshold(1));
+        eff_top.push(net.layer_decide_effective_threshold(1));
     }
     present(net, b, 1, &mut pots_top, &mut eff_top);
     let read_start = rec.lock().unwrap().len();
     for _ in 0..cfg.read_waves {
         net.wave(&[]);
         pots_top.push(net.layer_decide_potential(1));
-        eff_top.push(net.layer_effective_threshold(1));
+        eff_top.push(net.layer_decide_effective_threshold(1));
     }
     net.clear_listeners();
     let waves = rec.lock().unwrap().clone();
@@ -612,21 +618,21 @@ fn sequence_trial(net: &mut Network, cfg: &RsnnConfig, classes: &[usize], trial:
             for _ in 0..cfg.delay {
                 net.wave(&[]);
                 pots_top.push(net.layer_decide_potential(top));
-                eff_top.push(net.layer_effective_threshold(top));
+                eff_top.push(net.layer_decide_effective_threshold(top));
             }
         }
         for w in 0..cfg.present_waves {
             let sites = cue_realization(cfg.task_seed, cfg.size, class, trial * n + pos, w, cfg.base_q16, cfg.keep_q16, cfg.noise_q16);
             net.wave(&sites);
             pots_top.push(net.layer_decide_potential(top));
-            eff_top.push(net.layer_effective_threshold(top));
+            eff_top.push(net.layer_decide_effective_threshold(top));
         }
     }
     let read_start = rec.lock().unwrap().len();
     for _ in 0..cfg.read_waves {
         net.wave(&[]);
         pots_top.push(net.layer_decide_potential(top));
-        eff_top.push(net.layer_effective_threshold(top));
+        eff_top.push(net.layer_decide_effective_threshold(top));
     }
     net.clear_listeners();
     let waves = rec.lock().unwrap().clone();
@@ -676,11 +682,10 @@ fn recurrent_update(net: &mut Network, cfg: &RsnnConfig, w: &[Vec<f32>], err: &[
     let use_adapt = beta != 0.0;
     let use_bump = cfg.elig_bump_psi || use_adapt;
     let rho = 1.0 - (2.0f32).powi(-(cfg.adapt_decay as i32));
-    let theta: Vec<f32> = net.layer_thresholds(rec_layer).iter().map(|&t| (t as f32).max(1.0)).collect();
-    // ψ_j(t): normalized bump centered at the ADAPTIVE firing threshold, else the raw spike (old behavior)
+    // ψ_j(t): fixed-width bump centered at the decide-time ADAPTIVE firing threshold, else the raw spike.
     let psi = |t: usize, j: usize| -> f32 {
         if use_bump {
-            (PSI_GAMMA * (1.0 - (pots_top[t][j] as f32 - eff_top[t][j] as f32).abs() / theta[j])).max(0.0)
+            (PSI_GAMMA * (1.0 - (pots_top[t][j] as f32 - eff_top[t][j] as f32).abs() / PSI_WIDTH)).max(0.0)
         } else {
             fired[t][j]
         }
@@ -870,7 +875,7 @@ pub fn train_recurrent(cfg: &RsnnConfig) -> u64 {
             for tt in 0..ttot {
                 for j in 0..ls {
                     post[z][tt][j] = if use_bump {
-                        (PSI_GAMMA * (1.0 - (pots[z][tt][j] as f32 - effs[z][tt][j] as f32).abs() / theta[z][j])).max(0.0)
+                        (PSI_GAMMA * (1.0 - (pots[z][tt][j] as f32 - effs[z][tt][j] as f32).abs() / PSI_WIDTH)).max(0.0)
                     } else if cfg.subthreshold_psi {
                         (pots[z][tt][j] as f32 / theta[z][j]).clamp(0.0, 1.0)
                     } else {
@@ -1013,7 +1018,7 @@ fn train_multilayer(cfg: &RsnnConfig, mut net: Network, layer_entries: &[Vec<(i3
                     post[z][tt][j] = if use_bump {
                         // normalized bump pseudo-derivative ψ = γ·max(0, 1−|v−eff|/θ), centered at the
                         // ADAPTIVE firing threshold eff (so it stays alive when adaptation raises the bar)
-                        (PSI_GAMMA * (1.0 - (pots[z][tt][j] as f32 - effs[z][tt][j] as f32).abs() / theta[z][j])).max(0.0)
+                        (PSI_GAMMA * (1.0 - (pots[z][tt][j] as f32 - effs[z][tt][j] as f32).abs() / PSI_WIDTH)).max(0.0)
                     } else if cfg.subthreshold_psi {
                         (pots[z][tt][j] as f32 / theta[z][j]).clamp(0.0, 1.0)
                     } else {

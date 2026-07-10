@@ -45,6 +45,8 @@ pub struct Layer {
     pub elig_pre: Vec<i32>,   // e-prop presynaptic trace: this neuron's spike count this trial
     pub elig_post: Vec<i32>,  // e-prop postsynaptic pseudo-derivative accumulated this trial
     pub decide_potential: Vec<i16>, // potential at the decide step (pre fire-reset/leak); per-wave snapshot
+    pub decide_eff: Vec<i32>, // effective threshold `baseline + (adapt >> ADAPT_SHIFT)` at the decide step
+                              // (captured BEFORE the fire-bump mutates adapt); per-wave snapshot, pairs with decide_potential
 }
 
 impl Layer {
@@ -94,6 +96,7 @@ impl Layer {
             elig_pre: vec![0; ls],
             elig_post: vec![0; ls],
             decide_potential: vec![0; ls],
+            decide_eff: vec![0; ls],
         }
     }
 

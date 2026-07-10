@@ -62,6 +62,7 @@ pub fn process_layer(
     for i in 0..ls {
         layer.decide_potential[i] = layer.potential[i]; // snapshot pre fire-reset/leak
         let eff = layer.threshold[i] as i32 + (layer.adapt[i] >> ADAPT_SHIFT);
+        layer.decide_eff[i] = eff; // snapshot the decide-time effective threshold (before the fire-bump below)
         if ((layer.potential[i] as i32) - eff).abs() <= PSI_BAND {
             layer.elig_post[i] += 1;
         }
@@ -153,6 +154,29 @@ mod tests {
         assert_eq!(l.decide_potential[0], 8, "fired neuron's decide_potential is the pre-reset value");
         assert_eq!(l.potential[0], 0, "fired neuron's potential reset post-wave");
         assert_eq!(l.decide_potential[1], 3, "sub-threshold neuron's decide_potential is its charge");
+    }
+
+    #[test]
+    fn decide_eff_is_pre_bump_threshold() {
+        // decide_eff must be the effective threshold used AT the decide step — i.e. before this wave's
+        // fire-bump raises adapt. A firing neuron's decide_eff must equal baseline + (pre-bump adapt>>SHIFT),
+        // NOT the post-bump effective threshold (which is what a post-wave read of adapt would give).
+        let mut l = low_layer(4, 5, 2, vec![TopologyLevel { level: 1, radius: 0, count: 1 }]);
+        l.adapt_bump = 40;
+        l.adapt_decay = 6;
+        l.adapt[0] = 3 << ADAPT_SHIFT; // pre-existing adaptation contributes 3 -> decide eff = 5 + 3 = 8
+        for c in l.cooldown.iter_mut() {
+            *c = 0;
+        }
+        l.potential[0] = 10; // >= eff (8) -> fires, which then bumps adapt by 40
+        let mut acc = vec![0i32; 16];
+        let mut out = groups_for(&l);
+        let mut fired = Vec::new();
+        process_layer(&mut l, 0, 0, 4, &[], &mut acc, &mut out, &mut fired);
+        assert_eq!(fired, vec![0]);
+        assert_eq!(l.decide_eff[0], 8, "decide_eff is the PRE-bump effective threshold (5 + 3)");
+        // post-wave adapt is bumped (~40) and decayed once, so the current eff is far higher — the bug we fixed
+        assert!(5 + (l.adapt[0] >> ADAPT_SHIFT) > 8, "post-wave eff is inflated by the fire-bump");
     }
 
     #[test]

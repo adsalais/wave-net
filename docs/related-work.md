@@ -304,6 +304,8 @@ its drive density to the task; (d) let recurrence + e-prop **compute** on top of
 real "does recurrence earn its keep" test is **ALIF + recurrence vs ALIF-alone** at a delay where adaptation
 alone is marginal — not bare-LIF recurrence vs FF.
 
+https://github.com/AdaptiveAILab/brf-neurons — the source repository for Higuchi et al. (2024), MIT-licensed
+
 ## Sources
 
 Format: *Title* (tag) — Venue Year — link(s).

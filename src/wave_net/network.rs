@@ -160,8 +160,10 @@ impl Network {
         self.layers[z].lock().unwrap().decide_potential.clone()
     }
 
-    /// Per-neuron effective ALIF firing threshold `baseline + (adapt >> ADAPT_SHIFT)` — the value the
-    /// decide step compares potential against. Read-only snapshot; no dynamics change.
+    /// Per-neuron effective ALIF firing threshold `baseline + (adapt >> ADAPT_SHIFT)` from the CURRENT
+    /// adaptation state. Read-only; no dynamics change. (For a decide-time-aligned value that pairs with
+    /// `layer_decide_potential`, use `layer_decide_effective_threshold` — the current adapt has already
+    /// been fire-bumped and decayed by the time a wave returns.)
     pub fn layer_effective_threshold(&self, z: usize) -> Vec<i32> {
         let l = self.layers[z].lock().unwrap();
         l.threshold
@@ -169,6 +171,13 @@ impl Network {
             .zip(l.adapt.iter())
             .map(|(&t, &a)| t as i32 + (a >> ADAPT_SHIFT))
             .collect()
+    }
+
+    /// Per-neuron effective firing threshold captured at the last decide step (before that wave's fire-bump
+    /// mutated adapt) — the value actually compared against `layer_decide_potential`. This is the correct
+    /// reference for a pseudo-derivative ψ = f(decide_potential − decide_eff).
+    pub fn layer_decide_effective_threshold(&self, z: usize) -> Vec<i32> {
+        self.layers[z].lock().unwrap().decide_eff.clone()
     }
 
     /// Reset, run `warmup` waves (discarded), then `waves` counted; per-layer firing rate =
