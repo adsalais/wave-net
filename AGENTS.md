@@ -148,20 +148,19 @@ airtight null and remains the one open problem (short of BPTT).** Headline resul
   computation (XOR) feed-forward — LIF wins those short tasks — **but it is *necessary* for deep-FF
   propagation** (removing it kills the deep stack; `rate_reg` can't revive LIF). Calibration = a one-time
   sensible init; ALIF owns the operating point during a run.
-- **Recurrence: the blocker is not the credit rule (now completed) — it is that *training* the loop is
-  destructive; the *fixed* random recurrence already works.** e-prop's **ALIF adaptation eligibility** `εᵃ`
-  (`e = ψ·(εᵛ − β·εᵃ)`, Bellec 2020) — missing from the earlier crude spike-timing rule — is now built and
+- **Recurrence works — in the deep + wide + sub-critical-density regime, once e-prop's ALIF credit rule is
+  completed.** The earlier "airtight null" was measured with the **crude spike-timing** eligibility, missing
+  e-prop's **ALIF adaptation term** `εᵃ` (`e = ψ·(εᵛ − β·εᵃ)`, Bellec 2020). That term is now built and
   verified (`RsnnConfig.elig_beta`/`elig_bump_psi`; decide-time `eff` snapshot `Layer.decide_eff`;
-  fixed-width bump ψ; two ψ bugs found and fixed, see the doc). Completing it **does not rescue recurrence**.
-  The clean size-16 parity result (worst-seed): **FF 980, fixed-rec 950 (±1 recurrence, readout only —
-  untrained!), crude-trained 542, completed-trained 617** (N=3; N=4: 900 / 817 / 487 / 472). So fixed random
-  recurrence is a *strong* reservoir, and e-prop **training** of the recurrent weights craters it — crude and
-  completed alike (they tie; the εᵃ term verifiably *engages*, `Σ|e|` differs, it just doesn't help). The
-  hidden-rec "fair" test stays byte-identical across β because that config is inert to *all* hidden training
-  (`hidden_lr 0` == `hidden_lr 0.02` == 475 — reservoir collapse, orthogonal to the credit rule). **Two
-  separated open levers:** (a) don't train the loop (fixed reservoir works) or use exact temporal credit
-  (**surrogate-gradient BPTT**) instead of e-prop's approximation; (b) recurrent-gain control (σ≈1) to stop
-  the deep hidden-rec collapse. See `docs/experiments_results.md`.
+  fixed-width bump ψ of half-width `PSI_WIDTH`; two ψ bugs found and fixed). Three levers, all necessary:
+  **depth** (4-layer hidden-rec, *all* forward layers trained via multi-layer DFA — `train_hidden_rec_task`),
+  **width** (temporal XOR rec_count 8: FF/rec = 990/725 at size 16 → 1000/**982** at size 32), and
+  **sub-critical recurrence density** (sharp collapse cliff at rec_count ≈ 12 — keep it below). The completed
+  eligibility **consistently beats the crude rule** where recurrence is trainable (edge largest at light
+  density / small width), and on a **headroom task — parity N=4 (FF ≈ 620, not saturated) — trained
+  recurrence beats FF on 2/3 seeds** (687 vs 680, 642 vs 637). First time recurrence out-performs
+  feed-forward here. **Open:** robustness on the hardest seed; more depth / a 2nd recurrent layer / side-car
+  topology / β·`PSI_WIDTH` tuning; BPTT. See `docs/experiments_results.md`.
 
 ## Reading & training: the multi-wave rule
 
