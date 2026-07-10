@@ -828,10 +828,15 @@ pub fn train_recurrent(cfg: &RsnnConfig) -> u64 {
     let theta: Vec<Vec<f32>> = (0..l)
         .map(|z| net.layer_thresholds(z.max(1)).iter().map(|&t| (t as f32).max(1.0)).collect())
         .collect();
+    // ALIF adaptation eligibility (guarded): β active only with adaptation; bump ψ implied when β>0.
+    let beta = if cfg.adapt_bump > 0 { cfg.elig_beta } else { 0.0 };
+    let use_adapt = beta != 0.0;
+    let use_bump = cfg.elig_bump_psi || use_adapt;
+    let rho = 1.0 - (2.0f32).powi(-(cfg.adapt_decay as i32));
     for t in 0..cfg.trials {
         let (a, b) = pick_ab(cfg.task_seed, t);
         let label = a ^ b;
-        let (act, spikes, pots, _effs) = xor_trial_layers(&mut net, cfg, a, b, t);
+        let (act, spikes, pots, effs) = xor_trial_layers(&mut net, cfg, a, b, t);
         let p = softmax(&score(&w, &act));
         let err: Vec<f32> = (0..2).map(|c| p[c] - if c == label { 1.0 } else { 0.0 }).collect();
         for c in 0..2 {
@@ -859,12 +864,14 @@ pub fn train_recurrent(cfg: &RsnnConfig) -> u64 {
                 }
             }
         }
-        // postsynaptic factor ψ: spike-time (fired) or sub-threshold ramp clamp(decide_potential/θ, 0, 1)
+        // postsynaptic factor ψ: normalized bump (centered at eff), sub-threshold ramp, or spike-time (fired)
         let mut post = vec![vec![vec![0f32; ls]; ttot]; l];
         for z in 1..l {
             for tt in 0..ttot {
                 for j in 0..ls {
-                    post[z][tt][j] = if cfg.subthreshold_psi {
+                    post[z][tt][j] = if use_bump {
+                        (PSI_GAMMA * (1.0 - (pots[z][tt][j] as f32 - effs[z][tt][j] as f32).abs() / theta[z][j])).max(0.0)
+                    } else if cfg.subthreshold_psi {
                         (pots[z][tt][j] as f32 / theta[z][j]).clamp(0.0, 1.0)
                     } else {
                         fired[z][tt][j]
@@ -906,10 +913,15 @@ pub fn train_recurrent(cfg: &RsnnConfig) -> u64 {
                     let sg = (z * ls + i) as u32;
                     for k in 0..count {
                         let j = target_of(cfg.seed, sg, i as u32, level, k as u32, radius, cfg.size) as usize;
-                        let mut e = 0f32;
-                        for tt in 0..ttot {
-                            e += pretr[z][tt][i] * post[tz][tt][j];
-                        }
+                        let e = if use_adapt {
+                            elig_adapt_sum(ttot, beta, rho, |tt| post[tz][tt][j], |tt| pretr[z][tt][i])
+                        } else {
+                            let mut s = 0f32;
+                            for tt in 0..ttot {
+                                s += pretr[z][tt][i] * post[tz][tt][j];
+                            }
+                            s
+                        };
                         if e != 0.0 {
                             updates.push((i * total_slots + slot + k, -cfg.hidden_lr * l_sig(tz, j) * e));
                         }
@@ -1646,6 +1658,18 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn train_recurrent_elig_on_is_deterministic() {
+        let mut cfg = RsnnConfig::demo();
+        cfg.size = 16;
+        cfg.layers = 4;
+        cfg.back_count = 8;
+        cfg.delay = 20;
+        cfg.trials = 150;
+        cfg.elig_beta = 0.2;
+        assert_eq!(train_recurrent(&cfg), train_recurrent(&cfg));
     }
 
     #[test]
