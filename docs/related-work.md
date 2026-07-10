@@ -325,4 +325,5 @@ Format: *Title* (tag) — Venue Year — link(s).
 - *Sparse-firing regularization methods for spiking neural networks with time-to-first-spike coding* (fixed-uniform-rate-target pitfall) — Scientific Reports 2023 — [nature](https://www.nature.com/articles/s41598-023-50201-5)
 - *Long Short-Term Memory Spiking Networks and Their Applications* (LSNN net sizes: TIMIT 400, N-MNIST 120+84) — arXiv 2020 — [arxiv](https://arxiv.org/pdf/2007.04779)
 - *Effective and Efficient Computation with Multiple-timescale Spiking Recurrent Neural Networks* (fully-recurrent hidden layer, temporal-task sizes) — arXiv 2020 — [arxiv](https://arxiv.org/pdf/2005.11633)
+- Higuchi et al., *Balanced Resonate-and-Fire Neurons* (BRF — memory in the neuron's oscillatory dynamics, not the trained loop) — 2024 — [code](https://github.com/AdaptiveAILab/brf-neurons) (MIT)
 - *Can Biologically Plausible Temporal Credit Assignment Rules Match BPTT? E-prop as an Example* (e-prop only approaches BPTT — open question) — ICML 2025 — [arxiv](https://arxiv.org/abs/2506.06904)

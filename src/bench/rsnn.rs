@@ -45,6 +45,10 @@ pub struct RsnnConfig {
     pub rate_target_permille: u32, // target per-neuron firing rate r_target, permille (e.g. 100 = 10%)
     pub xor_layers: usize,         // depth of the sequence-task stack: forward layers under a recurrent top (2 = the original L0→L1)
     pub rec_stab: f32,             // per-LAYER recurrent stabilizer (uniform bias toward r_target on recurrent levels; class-preserving, unlike per-neuron rate_reg). 0 = off
+    pub elig_beta: f32,      // ALIF adaptation-eligibility coupling β (0.0 = off → membrane-only, byte-identical). Active only when adapt_bump > 0.
+    pub elig_bump_psi: bool, // use normalized bump pseudo-derivative ψ instead of spike/ramp post-factor (ablation: bump-ψ without the εᵃ term)
+    pub elig_psi_width: f32, // half-width W of the bump pseudo-derivative ψ = γ·max(0, 1−|v−eff|/W) (default 16; θ≈1 baseline is too narrow)
+    pub hidden_rec_depth: usize, // depth of the hidden-recurrent stack in engine_config_hidden_rec (default 4: L0→L1→L2→L3, recurrence on the second-from-top layer)
 }
 
 impl RsnnConfig {
@@ -84,6 +88,10 @@ impl RsnnConfig {
             rate_target_permille: 100,
             xor_layers: 2,
             rec_stab: 0.0,
+            elig_beta: 0.0,
+            elig_bump_psi: false,
+            elig_psi_width: PSI_WIDTH,
+            hidden_rec_depth: 4,
         }
     }
 
@@ -204,9 +212,11 @@ impl RsnnConfig {
         Config { seed: self.seed, size: self.size, layers }
     }
 
-    /// Clean hidden recurrent layer (4 layers): L0→L1→L2→L3(read), with **level-0 recurrence on L2** when
-    /// `rec_count > 0`. The signal flows *through* L2's recurrence; L1/L3 are plain forward. For the fair
-    /// recurrence test — forward path revived by `rate_reg`, L2's loop stabilized by `rec_stab`.
+    /// Clean hidden recurrent stack of `hidden_rec_depth` layers (default 4: L0→L1→L2→L3(read)), with
+    /// **level-0 recurrence on the second-from-top layer** when `rec_count > 0`. The signal flows *through*
+    /// that layer's recurrence; the other computational layers are plain forward. Forward path revived by
+    /// `rate_reg`, the loop stabilized by `rec_stab`. (`hidden_rec_depth = 4` is byte-identical to the
+    /// original L0→L1→L2→L3.)
     fn engine_config_hidden_rec(&self) -> Config {
         let mk = |topology| LayerConfig {
             topology,
@@ -219,17 +229,24 @@ impl RsnnConfig {
             adapt_decay: self.adapt_decay,
         };
         let fwd = TopologyLevel { level: 1, radius: self.up_radius, count: self.up_count };
-        let l2 = if self.rec_count > 0 {
+        let rec = if self.rec_count > 0 {
             vec![fwd.clone(), TopologyLevel { level: 0, radius: self.rec_radius, count: self.rec_count }]
         } else {
             vec![fwd.clone()]
         };
-        let layers = vec![
-            mk(vec![fwd.clone()]), // L0 → L1
-            mk(vec![fwd.clone()]), // L1 → L2
-            mk(l2),                // L2 → L3 (+ level-0 recurrence if rec_count>0)
-            mk(vec![]),            // L3 read (top)
-        ];
+        let d = self.hidden_rec_depth.max(3);
+        // layers 0..d-2 are plain forward (+1); layer d-2 carries the recurrence; layer d-1 is the read top.
+        let layers: Vec<LayerConfig> = (0..d)
+            .map(|z| {
+                if z == d - 1 {
+                    mk(vec![]) // read top (no outgoing)
+                } else if z == d - 2 {
+                    mk(rec.clone()) // forward + level-0 recurrence
+                } else {
+                    mk(vec![fwd.clone()]) // plain forward
+                }
+            })
+            .collect();
         Config { seed: self.seed, size: self.size, layers }
     }
 }
@@ -325,7 +342,7 @@ fn topo_entries(cfg: &RsnnConfig) -> Vec<(i32, usize, u32)> {
 
 /// Temporal-XOR trial (reset → cue(a) → delay → cue(b) → read) on a multi-layer net. Records every
 /// computational layer's per-wave fired-set and returns (top-layer read-window spike counts, spikes[z][t]).
-fn xor_trial_layers(net: &mut Network, cfg: &RsnnConfig, a: usize, b: usize, trial: usize) -> (Vec<f32>, Vec<Vec<Vec<u32>>>, Vec<Vec<Vec<i16>>>) {
+fn xor_trial_layers(net: &mut Network, cfg: &RsnnConfig, a: usize, b: usize, trial: usize) -> (Vec<f32>, Vec<Vec<Vec<u32>>>, Vec<Vec<Vec<i16>>>, Vec<Vec<Vec<i32>>>) {
     let l = net.layer_count();
     let ls = (cfg.size * cfg.size) as usize;
     let rec: Arc<Mutex<Vec<Vec<Vec<u32>>>>> = Arc::new(Mutex::new(vec![Vec::new(); l]));
@@ -335,9 +352,11 @@ fn xor_trial_layers(net: &mut Network, cfg: &RsnnConfig, a: usize, b: usize, tri
     }
     net.reset_state();
     let mut pots: Vec<Vec<Vec<i16>>> = vec![Vec::new(); l];
-    let record = |net: &Network, pots: &mut Vec<Vec<Vec<i16>>>| {
+    let mut effs: Vec<Vec<Vec<i32>>> = vec![Vec::new(); l];
+    let record = |net: &Network, pots: &mut Vec<Vec<Vec<i16>>>, effs: &mut Vec<Vec<Vec<i32>>>| {
         for z in 1..l {
             pots[z].push(net.layer_decide_potential(z));
+            effs[z].push(net.layer_decide_effective_threshold(z));
         }
     };
     for (class, phase) in [(a, 0usize), (b, 1)] {
@@ -345,18 +364,18 @@ fn xor_trial_layers(net: &mut Network, cfg: &RsnnConfig, a: usize, b: usize, tri
         if phase == 1 {
             for _ in 0..cfg.delay {
                 net.wave(&[]);
-                record(net, &mut pots);
+                record(net, &mut pots, &mut effs);
             }
         }
         for w in 0..cfg.present_waves {
             let sites = cue_realization(cfg.task_seed, cfg.size, class, trial * 2 + phase, w, cfg.base_q16, cfg.keep_q16, cfg.noise_q16);
             net.wave(&sites);
-            record(net, &mut pots);
+            record(net, &mut pots, &mut effs);
         }
     }
     for _ in 0..cfg.read_waves {
         net.wave(&[]);
-        record(net, &mut pots);
+        record(net, &mut pots, &mut effs);
     }
     net.clear_listeners();
     let spikes = rec.lock().unwrap().clone();
@@ -367,7 +386,59 @@ fn xor_trial_layers(net: &mut Network, cfg: &RsnnConfig, a: usize, b: usize, tri
             act[loc as usize] += 1.0;
         }
     }
-    (act, spikes, pots)
+    (act, spikes, pots, effs)
+}
+
+/// Like `xor_trial_layers` but for an arbitrary cue sequence `classes` (a `delay` gap before every cue
+/// except the first), recording *every* computational layer's per-wave fired-set, decide-potential, and
+/// decide-time effective threshold. For `classes = [a, b]` (per-cue seed `trial·n + pos`) it is byte-identical
+/// to `xor_trial_layers(a, b, trial)` — see `sequence_trial_layers_matches_xor`. Lets the deep multi-layer
+/// trainer run any binary-labelled sequence task (parity, distractor, flip-flop), not just temporal XOR.
+fn sequence_trial_layers(net: &mut Network, cfg: &RsnnConfig, classes: &[usize], trial: usize) -> (Vec<f32>, Vec<Vec<Vec<u32>>>, Vec<Vec<Vec<i16>>>, Vec<Vec<Vec<i32>>>) {
+    let l = net.layer_count();
+    let ls = (cfg.size * cfg.size) as usize;
+    let n = classes.len();
+    let rec: Arc<Mutex<Vec<Vec<Vec<u32>>>>> = Arc::new(Mutex::new(vec![Vec::new(); l]));
+    for z in 1..l {
+        let r = rec.clone();
+        net.on_layer(z, Box::new(move |_w, fired: &[u32]| r.lock().unwrap()[z].push(fired.to_vec())));
+    }
+    net.reset_state();
+    let mut pots: Vec<Vec<Vec<i16>>> = vec![Vec::new(); l];
+    let mut effs: Vec<Vec<Vec<i32>>> = vec![Vec::new(); l];
+    let record = |net: &Network, pots: &mut Vec<Vec<Vec<i16>>>, effs: &mut Vec<Vec<Vec<i32>>>| {
+        for z in 1..l {
+            pots[z].push(net.layer_decide_potential(z));
+            effs[z].push(net.layer_decide_effective_threshold(z));
+        }
+    };
+    for (pos, &class) in classes.iter().enumerate() {
+        if pos > 0 {
+            for _ in 0..cfg.delay {
+                net.wave(&[]);
+                record(net, &mut pots, &mut effs);
+            }
+        }
+        for w in 0..cfg.present_waves {
+            let sites = cue_realization(cfg.task_seed, cfg.size, class, trial * n + pos, w, cfg.base_q16, cfg.keep_q16, cfg.noise_q16);
+            net.wave(&sites);
+            record(net, &mut pots, &mut effs);
+        }
+    }
+    for _ in 0..cfg.read_waves {
+        net.wave(&[]);
+        record(net, &mut pots, &mut effs);
+    }
+    net.clear_listeners();
+    let spikes = rec.lock().unwrap().clone();
+    let ttot = spikes[l - 1].len();
+    let mut act = vec![0f32; ls];
+    for wv in spikes[l - 1].iter().skip(ttot - cfg.read_waves) {
+        for &loc in wv {
+            act[loc as usize] += 1.0;
+        }
+    }
+    (act, spikes, pots, effs)
 }
 
 const P_DFA: u64 = 61; // fixed random Direct-Feedback-Alignment weights
@@ -376,6 +447,32 @@ const P_DFA: u64 = 61; // fixed random Direct-Feedback-Alignment weights
 /// deterministic, hash-derived, stored-free. Broadcasts the output error to a deep layer.
 fn dfa_weight(seed: u64, neuron_global: u32, class: usize) -> f32 {
     if mix(key(seed, neuron_global, class as i32, 0, P_DFA)) & 1 == 1 { 1.0 } else { -1.0 }
+}
+
+/// Dampening (γ) for the bump pseudo-derivative ψ = γ·max(0, 1−|v−eff|/W). LSNN uses 0.3.
+const PSI_GAMMA: f32 = 0.3;
+/// Half-width W (in i16 potential units) of the bump pseudo-derivative, centered at the decide-time
+/// effective threshold. LSNN normalizes by v_th, but this substrate's calibration floors baseline θ to ~1
+/// while integer ±1 drive makes potentials overshoot eff by O(2–26) at a spike — so a θ-normalized bump
+/// collapses to ~0. A fixed band matched to the potential-fluctuation scale (the engine's own working
+/// `elig_post` uses PSI_BAND=8; deeper layers overshoot more) keeps ψ non-degenerate near threshold.
+const PSI_WIDTH: f32 = 16.0;
+
+/// Σ_t of the ALIF eligibility trace `e_ij(t) = ψ_j(t)·(εᵛ_i(t) − β·εᵃ_ij(t))`, with the adaptation
+/// eligibility εᵃ recursed at the slow rate ρ: `εᵃ(t+1) = ψ(t)·εᵛ(t) + (ρ − β·ψ(t))·εᵃ(t)`. β = 0 reduces
+/// to the plain membrane trace `Σ_t ψ_j·εᵛ_i` (what the code did before). `psi(tt)` is ψ_j(tt), `ev(tt)`
+/// is εᵛ_i(tt) (the presynaptic trace). Bellec et al. 2020, Eq. 24–25 (verified against the official
+/// autodiff implementation: ψ multiplies both the membrane and the −β·εᵃ term).
+fn elig_adapt_sum(ttot: usize, beta: f32, rho: f32, psi: impl Fn(usize) -> f32, ev: impl Fn(usize) -> f32) -> f32 {
+    let mut eps_a = 0.0f32;
+    let mut e = 0.0f32;
+    for tt in 0..ttot {
+        let p = psi(tt);
+        let v = ev(tt);
+        e += p * (v - beta * eps_a);
+        eps_a = p * v + (rho - beta * p) * eps_a;
+    }
+    e
 }
 
 fn target_of(seed: u64, source_global: u32, src_local: u32, level: i32, k: u32, radius: u32, size: u32) -> u32 {
@@ -491,6 +588,13 @@ pub fn train_eprop(cfg: &RsnnConfig) -> u64 {
 }
 
 /// Two independent input bits for trial `t` (deterministic).
+/// The temporal-XOR task as a sequence task: two independent cue bits (a, b), label = a XOR b. Passing this
+/// to the task-parameterized deep trainer reproduces the original temporal-XOR training exactly.
+fn xor_task(seed: u64, t: usize) -> (Vec<usize>, usize) {
+    let (a, b) = pick_ab(seed, t);
+    (vec![a, b], a ^ b)
+}
+
 fn pick_ab(seed: u64, t: usize) -> (usize, usize) {
     let a = (mix(key(seed, t as u32, 0, 0, 51)) & 1) as usize;
     let b = (mix(key(seed, t as u32, 0, 0, 53)) & 1) as usize;
@@ -520,7 +624,7 @@ pub fn task_flipflop(seed: u64, trial: usize, n_ops: usize) -> (Vec<usize>, usiz
 
 /// reset → present cue(a) → delay → present cue(b) → read (silent). Records L1 per-wave fired-sets and
 /// returns (read-window L1 spike counts, per-wave L1 fired-sets over the whole trial).
-fn xor_trial(net: &mut Network, cfg: &RsnnConfig, a: usize, b: usize, trial: usize) -> (Vec<f32>, Vec<Vec<u32>>) {
+fn xor_trial(net: &mut Network, cfg: &RsnnConfig, a: usize, b: usize, trial: usize) -> (Vec<f32>, Vec<Vec<u32>>, Vec<Vec<i16>>, Vec<Vec<i32>>) {
     let ls = (cfg.size * cfg.size) as usize;
     let rec: Arc<Mutex<Vec<Vec<u32>>>> = Arc::new(Mutex::new(Vec::new()));
     {
@@ -528,20 +632,30 @@ fn xor_trial(net: &mut Network, cfg: &RsnnConfig, a: usize, b: usize, trial: usi
         net.on_layer(1, Box::new(move |_w, fired: &[u32]| r.lock().unwrap().push(fired.to_vec())));
     }
     net.reset_state();
-    let present = |net: &mut Network, class: usize, phase: usize| {
+    // per-wave decide potential + effective threshold of the recorded/recurrent layer (layer 1 = top here),
+    // aligned one-per-wave with `waves`, so recurrent_update can build the bump ψ centered at eff.
+    let mut pots_top: Vec<Vec<i16>> = Vec::new();
+    let mut eff_top: Vec<Vec<i32>> = Vec::new();
+    let present = |net: &mut Network, class: usize, phase: usize, pots: &mut Vec<Vec<i16>>, effs: &mut Vec<Vec<i32>>| {
         for w in 0..cfg.present_waves {
             let sites = cue_realization(cfg.task_seed, cfg.size, class, trial * 2 + phase, w, cfg.base_q16, cfg.keep_q16, cfg.noise_q16);
             net.wave(&sites);
+            pots.push(net.layer_decide_potential(1));
+            effs.push(net.layer_decide_effective_threshold(1));
         }
     };
-    present(net, a, 0);
+    present(net, a, 0, &mut pots_top, &mut eff_top);
     for _ in 0..cfg.delay {
         net.wave(&[]);
+        pots_top.push(net.layer_decide_potential(1));
+        eff_top.push(net.layer_decide_effective_threshold(1));
     }
-    present(net, b, 1);
+    present(net, b, 1, &mut pots_top, &mut eff_top);
     let read_start = rec.lock().unwrap().len();
     for _ in 0..cfg.read_waves {
         net.wave(&[]);
+        pots_top.push(net.layer_decide_potential(1));
+        eff_top.push(net.layer_decide_effective_threshold(1));
     }
     net.clear_listeners();
     let waves = rec.lock().unwrap().clone();
@@ -551,14 +665,14 @@ fn xor_trial(net: &mut Network, cfg: &RsnnConfig, a: usize, b: usize, trial: usi
             act[loc as usize] += 1.0;
         }
     }
-    (act, waves)
+    (act, waves, pots_top, eff_top)
 }
 
 /// reset → for each class in `classes`: (a `delay` gap before every cue except the first) present
 /// cue(class) for `present_waves` → `read_waves` silent. Records L1 per-wave fired-sets; returns
 /// (read-window L1 spike counts, per-wave fired-sets). Generalizes `xor_trial`: `classes = [a, b]` with the
 /// per-cue seed `trial·n + pos` reproduces `xor_trial(a, b)` exactly.
-fn sequence_trial(net: &mut Network, cfg: &RsnnConfig, classes: &[usize], trial: usize) -> (Vec<f32>, Vec<Vec<u32>>) {
+fn sequence_trial(net: &mut Network, cfg: &RsnnConfig, classes: &[usize], trial: usize) -> (Vec<f32>, Vec<Vec<u32>>, Vec<Vec<i16>>, Vec<Vec<i32>>) {
     let ls = (cfg.size * cfg.size) as usize;
     let n = classes.len();
     let top = net.layer_count() - 1; // read (and, for the recurrent-top stack, train) the top computational layer
@@ -568,20 +682,29 @@ fn sequence_trial(net: &mut Network, cfg: &RsnnConfig, classes: &[usize], trial:
         net.on_layer(top, Box::new(move |_w, fired: &[u32]| r.lock().unwrap().push(fired.to_vec())));
     }
     net.reset_state();
+    // per-wave decide potential + effective threshold of the recurrent (top) layer, aligned with `waves`.
+    let mut pots_top: Vec<Vec<i16>> = Vec::new();
+    let mut eff_top: Vec<Vec<i32>> = Vec::new();
     for (pos, &class) in classes.iter().enumerate() {
         if pos > 0 {
             for _ in 0..cfg.delay {
                 net.wave(&[]);
+                pots_top.push(net.layer_decide_potential(top));
+                eff_top.push(net.layer_decide_effective_threshold(top));
             }
         }
         for w in 0..cfg.present_waves {
             let sites = cue_realization(cfg.task_seed, cfg.size, class, trial * n + pos, w, cfg.base_q16, cfg.keep_q16, cfg.noise_q16);
             net.wave(&sites);
+            pots_top.push(net.layer_decide_potential(top));
+            eff_top.push(net.layer_decide_effective_threshold(top));
         }
     }
     let read_start = rec.lock().unwrap().len();
     for _ in 0..cfg.read_waves {
         net.wave(&[]);
+        pots_top.push(net.layer_decide_potential(top));
+        eff_top.push(net.layer_decide_effective_threshold(top));
     }
     net.clear_listeners();
     let waves = rec.lock().unwrap().clone();
@@ -591,13 +714,13 @@ fn sequence_trial(net: &mut Network, cfg: &RsnnConfig, classes: &[usize], trial:
             act[loc as usize] += 1.0;
         }
     }
-    (act, waves)
+    (act, waves, pots_top, eff_top)
 }
 
 /// Temporal e-prop on the L1 level-0 recurrent weights. Builds a decaying presynaptic trace per neuron
 /// over the recorded waves, correlates it with postsynaptic spikes (`e_ij = Σ_t pre_trace_i(t)·fired_j(t)`),
 /// and updates the stored weights via the symmetric-feedback learning signal.
-fn recurrent_update(net: &mut Network, cfg: &RsnnConfig, w: &[Vec<f32>], err: &[f32], waves: &[Vec<u32>], rec_layer: usize) {
+fn recurrent_update(net: &mut Network, cfg: &RsnnConfig, w: &[Vec<f32>], err: &[f32], waves: &[Vec<u32>], pots_top: &[Vec<i16>], eff_top: &[Vec<i32>], rec_layer: usize) {
     let ls = (cfg.size * cfg.size) as usize;
     let up = cfg.rec_count as usize;
     let ttot = waves.len();
@@ -626,15 +749,33 @@ fn recurrent_update(net: &mut Network, cfg: &RsnnConfig, w: &[Vec<f32>], err: &[
             l_sig[j] += cfg.rate_reg * (r_j - r_target);
         }
     }
+    // ALIF adaptation eligibility (guarded): β active only with adaptation; bump ψ implied when β>0.
+    let beta = if cfg.adapt_bump > 0 { cfg.elig_beta } else { 0.0 };
+    let use_adapt = beta != 0.0;
+    let use_bump = cfg.elig_bump_psi || use_adapt;
+    let rho = 1.0 - (2.0f32).powi(-(cfg.adapt_decay as i32));
+    // ψ_j(t): fixed-width bump centered at the decide-time ADAPTIVE firing threshold, else the raw spike.
+    let psi = |t: usize, j: usize| -> f32 {
+        if use_bump {
+            (PSI_GAMMA * (1.0 - (pots_top[t][j] as f32 - eff_top[t][j] as f32).abs() / cfg.elig_psi_width.max(1.0))).max(0.0)
+        } else {
+            fired[t][j]
+        }
+    };
     net.with_layer_mut(rec_layer, |l1| {
         for i in 0..ls {
             let sg = (rec_layer * ls + i) as u32; // recurrent layer's global neuron id
             for kk in 0..up {
                 let j = target_of(cfg.seed, sg, i as u32, 0, kk as u32, cfg.rec_radius, cfg.size) as usize;
-                let mut e = 0f32;
-                for t in 0..ttot {
-                    e += tr[t][i] * fired[t][j];
-                }
+                let e = if use_adapt {
+                    elig_adapt_sum(ttot, beta, rho, |t| psi(t, j), |t| tr[t][i])
+                } else {
+                    let mut s = 0f32;
+                    for t in 0..ttot {
+                        s += tr[t][i] * fired[t][j];
+                    }
+                    s
+                };
                 l1.out_shadow[i * up + kk] += -cfg.hidden_lr * l_sig[j] * e;
             }
         }
@@ -668,7 +809,7 @@ fn train_xor_inner(cfg: &RsnnConfig) -> (Network, Vec<Vec<f32>>) {
     for t in 0..cfg.trials {
         let (a, b) = pick_ab(cfg.task_seed, t);
         let label = a ^ b;
-        let (act, waves) = xor_trial(&mut net, cfg, a, b, t);
+        let (act, waves, pots_top, eff_top) = xor_trial(&mut net, cfg, a, b, t);
         let p = softmax(&score(&w, &act));
         let err: Vec<f32> = (0..2).map(|c| p[c] - if c == label { 1.0 } else { 0.0 }).collect();
         for c in 0..2 {
@@ -678,7 +819,7 @@ fn train_xor_inner(cfg: &RsnnConfig) -> (Network, Vec<Vec<f32>>) {
         }
         if cfg.rec_count > 0 {
             let rl = net.layer_count() - 1;
-            recurrent_update(&mut net, cfg, &w, &err, &waves, rl);
+            recurrent_update(&mut net, cfg, &w, &err, &waves, &pots_top, &eff_top, rl);
         }
     }
     (net, w)
@@ -695,7 +836,7 @@ pub fn train_xor(cfg: &RsnnConfig) -> u64 {
     let holdout = 400usize;
     for t in cfg.trials..cfg.trials + holdout {
         let (a, b) = pick_ab(cfg.task_seed, t);
-        let (act, _) = xor_trial(&mut net, cfg, a, b, t);
+        let (act, _, _, _) = xor_trial(&mut net, cfg, a, b, t);
         let s = score(&w, &act);
         let pred = if s[1] > s[0] { 1 } else { 0 };
         if pred == (a ^ b) {
@@ -718,7 +859,7 @@ pub fn train_sequence(cfg: &RsnnConfig, task: impl Fn(u64, usize) -> (Vec<usize>
     };
     for t in 0..cfg.trials {
         let (classes, label) = task(cfg.task_seed, t);
-        let (act, waves) = sequence_trial(&mut net, cfg, &classes, t);
+        let (act, waves, pots_top, eff_top) = sequence_trial(&mut net, cfg, &classes, t);
         let p = softmax(&score(&w, &act));
         let err: Vec<f32> = (0..2).map(|c| p[c] - if c == label { 1.0 } else { 0.0 }).collect();
         for c in 0..2 {
@@ -728,14 +869,14 @@ pub fn train_sequence(cfg: &RsnnConfig, task: impl Fn(u64, usize) -> (Vec<usize>
         }
         if cfg.rec_count > 0 {
             let rl = net.layer_count() - 1;
-            recurrent_update(&mut net, cfg, &w, &err, &waves, rl);
+            recurrent_update(&mut net, cfg, &w, &err, &waves, &pots_top, &eff_top, rl);
         }
     }
     let mut correct = 0usize;
     let holdout = 400usize;
     for t in cfg.trials..cfg.trials + holdout {
         let (classes, label) = task(cfg.task_seed, t);
-        let (act, _) = sequence_trial(&mut net, cfg, &classes, t);
+        let (act, _, _, _) = sequence_trial(&mut net, cfg, &classes, t);
         let s = score(&w, &act);
         let pred = if s[1] > s[0] { 1 } else { 0 };
         if pred == label {
@@ -764,10 +905,15 @@ pub fn train_recurrent(cfg: &RsnnConfig) -> u64 {
     let theta: Vec<Vec<f32>> = (0..l)
         .map(|z| net.layer_thresholds(z.max(1)).iter().map(|&t| (t as f32).max(1.0)).collect())
         .collect();
+    // ALIF adaptation eligibility (guarded): β active only with adaptation; bump ψ implied when β>0.
+    let beta = if cfg.adapt_bump > 0 { cfg.elig_beta } else { 0.0 };
+    let use_adapt = beta != 0.0;
+    let use_bump = cfg.elig_bump_psi || use_adapt;
+    let rho = 1.0 - (2.0f32).powi(-(cfg.adapt_decay as i32));
     for t in 0..cfg.trials {
         let (a, b) = pick_ab(cfg.task_seed, t);
         let label = a ^ b;
-        let (act, spikes, pots) = xor_trial_layers(&mut net, cfg, a, b, t);
+        let (act, spikes, pots, effs) = xor_trial_layers(&mut net, cfg, a, b, t);
         let p = softmax(&score(&w, &act));
         let err: Vec<f32> = (0..2).map(|c| p[c] - if c == label { 1.0 } else { 0.0 }).collect();
         for c in 0..2 {
@@ -795,12 +941,14 @@ pub fn train_recurrent(cfg: &RsnnConfig) -> u64 {
                 }
             }
         }
-        // postsynaptic factor ψ: spike-time (fired) or sub-threshold ramp clamp(decide_potential/θ, 0, 1)
+        // postsynaptic factor ψ: normalized bump (centered at eff), sub-threshold ramp, or spike-time (fired)
         let mut post = vec![vec![vec![0f32; ls]; ttot]; l];
         for z in 1..l {
             for tt in 0..ttot {
                 for j in 0..ls {
-                    post[z][tt][j] = if cfg.subthreshold_psi {
+                    post[z][tt][j] = if use_bump {
+                        (PSI_GAMMA * (1.0 - (pots[z][tt][j] as f32 - effs[z][tt][j] as f32).abs() / cfg.elig_psi_width.max(1.0))).max(0.0)
+                    } else if cfg.subthreshold_psi {
                         (pots[z][tt][j] as f32 / theta[z][j]).clamp(0.0, 1.0)
                     } else {
                         fired[z][tt][j]
@@ -842,10 +990,15 @@ pub fn train_recurrent(cfg: &RsnnConfig) -> u64 {
                     let sg = (z * ls + i) as u32;
                     for k in 0..count {
                         let j = target_of(cfg.seed, sg, i as u32, level, k as u32, radius, cfg.size) as usize;
-                        let mut e = 0f32;
-                        for tt in 0..ttot {
-                            e += pretr[z][tt][i] * post[tz][tt][j];
-                        }
+                        let e = if use_adapt {
+                            elig_adapt_sum(ttot, beta, rho, |tt| post[tz][tt][j], |tt| pretr[z][tt][i])
+                        } else {
+                            let mut s = 0f32;
+                            for tt in 0..ttot {
+                                s += pretr[z][tt][i] * post[tz][tt][j];
+                            }
+                            s
+                        };
                         if e != 0.0 {
                             updates.push((i * total_slots + slot + k, -cfg.hidden_lr * l_sig(tz, j) * e));
                         }
@@ -867,7 +1020,7 @@ pub fn train_recurrent(cfg: &RsnnConfig) -> u64 {
     let holdout = 400usize;
     for t in cfg.trials..cfg.trials + holdout {
         let (a, b) = pick_ab(cfg.task_seed, t);
-        let (act, _, _) = xor_trial_layers(&mut net, cfg, a, b, t);
+        let (act, _, _, _) = xor_trial_layers(&mut net, cfg, a, b, t);
         let s = score(&w, &act);
         let pred = if s[1] > s[0] { 1 } else { 0 };
         if pred == (a ^ b) {
@@ -882,7 +1035,7 @@ pub fn train_recurrent(cfg: &RsnnConfig) -> u64 {
 /// with `out_weights`. Trains every trainable weight (forward, backward, lateral, skip) via the factored
 /// temporal eligibility × (symmetric-top / DFA-deep) signal. Returns held-out permille. Used for custom
 /// topologies like the side-car; `train_recurrent` keeps its own uniform loop.
-fn train_multilayer(cfg: &RsnnConfig, mut net: Network, layer_entries: &[Vec<(i32, usize, u32)>]) -> u64 {
+fn train_multilayer(cfg: &RsnnConfig, mut net: Network, layer_entries: &[Vec<(i32, usize, u32)>], task: impl Fn(u64, usize) -> (Vec<usize>, usize)) -> u64 {
     let l = net.layer_count();
     let ls = (cfg.size * cfg.size) as usize;
     let top = l - 1;
@@ -894,10 +1047,14 @@ fn train_multilayer(cfg: &RsnnConfig, mut net: Network, layer_entries: &[Vec<(i3
     let theta: Vec<Vec<f32>> = (0..l)
         .map(|z| net.layer_thresholds(z.max(1)).iter().map(|&t| (t as f32).max(1.0)).collect())
         .collect();
+    // ALIF adaptation eligibility (guarded): β active only with adaptation; bump ψ implied when β>0.
+    let beta = if cfg.adapt_bump > 0 { cfg.elig_beta } else { 0.0 };
+    let use_adapt = beta != 0.0;
+    let use_bump = cfg.elig_bump_psi || use_adapt;
+    let rho = 1.0 - (2.0f32).powi(-(cfg.adapt_decay as i32));
     for t in 0..cfg.trials {
-        let (a, b) = pick_ab(cfg.task_seed, t);
-        let label = a ^ b;
-        let (act, spikes, pots) = xor_trial_layers(&mut net, cfg, a, b, t);
+        let (classes, label) = task(cfg.task_seed, t);
+        let (act, spikes, pots, effs) = sequence_trial_layers(&mut net, cfg, &classes, t);
         let p = softmax(&score(&w, &act));
         let err: Vec<f32> = (0..2).map(|c| p[c] - if c == label { 1.0 } else { 0.0 }).collect();
         for c in 0..2 {
@@ -929,7 +1086,11 @@ fn train_multilayer(cfg: &RsnnConfig, mut net: Network, layer_entries: &[Vec<(i3
         for z in 1..l {
             for tt in 0..ttot {
                 for j in 0..ls {
-                    post[z][tt][j] = if cfg.subthreshold_psi {
+                    post[z][tt][j] = if use_bump {
+                        // normalized bump pseudo-derivative ψ = γ·max(0, 1−|v−eff|/θ), centered at the
+                        // ADAPTIVE firing threshold eff (so it stays alive when adaptation raises the bar)
+                        (PSI_GAMMA * (1.0 - (pots[z][tt][j] as f32 - effs[z][tt][j] as f32).abs() / cfg.elig_psi_width.max(1.0))).max(0.0)
+                    } else if cfg.subthreshold_psi {
                         (pots[z][tt][j] as f32 / theta[z][j]).clamp(0.0, 1.0)
                     } else {
                         fired[z][tt][j]
@@ -970,10 +1131,15 @@ fn train_multilayer(cfg: &RsnnConfig, mut net: Network, layer_entries: &[Vec<(i3
                     let sg = (z * ls + i) as u32;
                     for k in 0..count {
                         let j = target_of(cfg.seed, sg, i as u32, level, k as u32, radius, cfg.size) as usize;
-                        let mut e = 0f32;
-                        for tt in 0..ttot {
-                            e += pretr[z][tt][i] * post[tz][tt][j];
-                        }
+                        let e = if use_adapt {
+                            elig_adapt_sum(ttot, beta, rho, |tt| post[tz][tt][j], |tt| pretr[z][tt][i])
+                        } else {
+                            let mut s = 0f32;
+                            for tt in 0..ttot {
+                                s += pretr[z][tt][i] * post[tz][tt][j];
+                            }
+                            s
+                        };
                         if e != 0.0 {
                             // forward levels → per-neuron rate_reg (liveness). Recurrent levels (0/−1/−2) →
                             // per-LAYER rec_stab uniform bias (class-preserving) when set, else fall back to
@@ -1004,10 +1170,10 @@ fn train_multilayer(cfg: &RsnnConfig, mut net: Network, layer_entries: &[Vec<(i3
     let mut correct = 0usize;
     let holdout = 400usize;
     for t in cfg.trials..cfg.trials + holdout {
-        let (a, b) = pick_ab(cfg.task_seed, t);
-        let (act, _, _) = xor_trial_layers(&mut net, cfg, a, b, t);
+        let (classes, label) = task(cfg.task_seed, t);
+        let (act, _, _, _) = sequence_trial_layers(&mut net, cfg, &classes, t);
         let s = score(&w, &act);
-        if (if s[1] > s[0] { 1 } else { 0 }) == (a ^ b) {
+        if (if s[1] > s[0] { 1 } else { 0 }) == label {
             correct += 1;
         }
     }
@@ -1016,6 +1182,12 @@ fn train_multilayer(cfg: &RsnnConfig, mut net: Network, layer_entries: &[Vec<(i3
 
 /// Train the backward-fed recurrent side-car (see `engine_config_sidecar`) on temporal XOR; held-out permille.
 pub fn train_sidecar(cfg: &RsnnConfig) -> u64 {
+    train_sidecar_task(cfg, xor_task)
+}
+
+/// The backward-fed recurrent side-car (L1 skips to L3 via +2; L2 is a recurrent scratchpad; L3↔L2 loop, L3
+/// read) on an arbitrary binary-labelled sequence task.
+pub fn train_sidecar_task(cfg: &RsnnConfig, task: impl Fn(u64, usize) -> (Vec<usize>, usize)) -> u64 {
     let mut net = Network::new(cfg.engine_config_sidecar());
     net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
     let (uc, ur) = (cfg.up_count as usize, cfg.up_radius);
@@ -1027,24 +1199,40 @@ pub fn train_sidecar(cfg: &RsnnConfig) -> u64 {
         vec![(0i32, n, r), (1i32, n, r)], // L2: self + forward
         vec![(-1i32, n, r)],        // L3: backward
     ];
-    train_multilayer(cfg, net, &layer_entries)
+    train_multilayer(cfg, net, &layer_entries, task)
 }
 
 /// Train the clean hidden-recurrent stack (see `engine_config_hidden_rec`) on temporal XOR; permille.
 /// Forward weights get per-neuron `rate_reg` (liveness); L2's level-0 recurrence gets per-layer `rec_stab`.
 pub fn train_hidden_rec(cfg: &RsnnConfig) -> u64 {
+    train_hidden_rec_task(cfg, xor_task)
+}
+
+/// Same deep hidden-recurrent stack, on an arbitrary **binary-labelled sequence task** (parity, distractor,
+/// flip-flop, XOR). All forward layers are trained via multi-layer DFA; L2 carries the trained level-0
+/// recurrence. This is the deep-forward-trained + recurrence combination the recurrence-null doc flagged as
+/// the missing fair test.
+pub fn train_hidden_rec_task(cfg: &RsnnConfig, task: impl Fn(u64, usize) -> (Vec<usize>, usize)) -> u64 {
     let mut net = Network::new(cfg.engine_config_hidden_rec());
     net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
     let (uc, ur) = (cfg.up_count as usize, cfg.up_radius);
     let (n, r) = (cfg.rec_count as usize, cfg.rec_radius);
-    let l2 = if n > 0 { vec![(1i32, uc, ur), (0i32, n, r)] } else { vec![(1i32, uc, ur)] };
-    let layer_entries = vec![
-        vec![(1i32, uc, ur)], // L0
-        vec![(1i32, uc, ur)], // L1
-        l2,                   // L2 (forward + level-0 recurrence)
-        vec![],               // L3 (read, no outgoing)
-    ];
-    train_multilayer(cfg, net, &layer_entries)
+    let rec_entry = if n > 0 { vec![(1i32, uc, ur), (0i32, n, r)] } else { vec![(1i32, uc, ur)] };
+    let d = cfg.hidden_rec_depth.max(3);
+    // must mirror engine_config_hidden_rec's per-layer topology order: forward (+1) up to layer d-2, which
+    // also carries the level-0 recurrence; the read top (d-1) has no outgoing.
+    let layer_entries: Vec<Vec<(i32, usize, u32)>> = (0..d)
+        .map(|z| {
+            if z == d - 1 {
+                vec![]
+            } else if z == d - 2 {
+                rec_entry.clone()
+            } else {
+                vec![(1i32, uc, ur)]
+            }
+        })
+        .collect();
+    train_multilayer(cfg, net, &layer_entries, task)
 }
 
 /// Train the L0→L1→L2 stack with the L2↔L3 loop (see `engine_config_l2l3loop`) on temporal XOR; permille.
@@ -1060,12 +1248,32 @@ pub fn train_l2l3loop(cfg: &RsnnConfig) -> u64 {
         vec![(0i32, n, r), (1i32, n, r)], // L2: self + forward
         vec![(-1i32, n, r)],              // L3: backward
     ];
-    train_multilayer(cfg, net, &layer_entries)
+    train_multilayer(cfg, net, &layer_entries, xor_task)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn elig_adapt_sum_matches_closed_form_and_sign() {
+        // β=0 ⇒ pure membrane trace Σ ψ·εᵛ.
+        let psi = [0.5f32, 0.0, 0.3];
+        let ev = [1.0f32, 2.0, 4.0];
+        let membrane: f32 = psi.iter().zip(ev).map(|(p, v)| p * v).sum();
+        assert!((elig_adapt_sum(3, 0.0, 0.9, |t| psi[t], |t| ev[t]) - membrane).abs() < 1e-6);
+        // β>0 ⇒ the −β·εᵃ term makes the total SMALLER than the membrane-only trace (adaptation is
+        // suppressive: firing now raises future threshold), and εᵃ carries a slow trace forward.
+        let full = elig_adapt_sum(3, 0.2, 0.9, |t| psi[t], |t| ev[t]);
+        assert!(full < membrane, "adaptation term subtracts: {full} !< {membrane}");
+        // hand-rolled reference for the same recursion
+        let (mut eps_a, mut e) = (0.0f32, 0.0f32);
+        for t in 0..3 {
+            e += psi[t] * (ev[t] - 0.2 * eps_a);
+            eps_a = psi[t] * ev[t] + (0.9 - 0.2 * psi[t]) * eps_a;
+        }
+        assert!((full - e).abs() < 1e-6);
+    }
 
     /// The recurrence-requiring temporal-XOR config: LIF (no adaptation memory) + a delay that outlasts the
     /// membrane leak, so only a recurrent loop can hold A across the gap. (ALIF adaptation alone solves XOR
@@ -1167,7 +1375,7 @@ mod tests {
         let theta: Vec<Vec<f32>> = (0..l)
             .map(|z| net.layer_thresholds(z.max(1)).iter().map(|&t| (t as f32).max(1.0)).collect())
             .collect();
-        let (_, spikes, pots) = xor_trial_layers(&mut net, &cfg, 1, 0, 0);
+        let (_, spikes, pots, _) = xor_trial_layers(&mut net, &cfg, 1, 0, 0);
         let ttot = spikes[l - 1].len();
         // does sub-ψ (clamp(v/θ)) ever differ from spike-ψ (fired)? count charged-but-silent neurons
         for z in 1..l {
@@ -1226,7 +1434,7 @@ mod tests {
             c.rate_reg = reg;
             c.rate_target_permille = 100;
             let (mut net, _w) = train_xor_inner(&c);
-            let (_, waves) = xor_trial(&mut net, &c, 1, 0, 0);
+            let (_, waves, _, _) = xor_trial(&mut net, &c, 1, 0, 0);
             let per_wave: Vec<usize> = waves.iter().map(|wv| wv.len()).collect();
             eprintln!("rate_reg {reg}: L1 spikes/wave {per_wave:?}");
         }
@@ -1346,7 +1554,7 @@ mod tests {
             c.adapt_bump = ab;
             let mut net = Network::new(c.engine_config_recurrent());
             net.calibrate(&c.calib, &random_l0_input(c.seed ^ 0xE9, c.size, c.calib_fraction_q16));
-            let (_, spikes, _) = xor_trial_layers(&mut net, &c, 1, 0, 0);
+            let (_, spikes, _, _) = xor_trial_layers(&mut net, &c, 1, 0, 0);
             let per_layer: Vec<usize> = (1..spikes.len()).map(|z| spikes[z].iter().map(|w| w.len()).sum()).collect();
             eprintln!("adapt_bump {ab}: L1..L3 total spikes over a cue trial {per_layer:?}");
         }
@@ -1362,6 +1570,28 @@ mod tests {
         cfg.rec_stab = 5.0;
         cfg.trials = 100;
         assert_eq!(train_hidden_rec(&cfg), train_hidden_rec(&cfg));
+    }
+
+    #[test]
+    fn train_multilayer_elig_off_is_unchanged_and_on_differs() {
+        // Guard on an ALIVE config (so eligibility is non-zero and the εᵃ term can act): with the feature
+        // at its defaults the trainer takes the pre-change branch and returns the frozen characterization
+        // value (proves no regression); turning elig_beta on changes the trained result (proves it is wired).
+        let mut base = RsnnConfig::demo();
+        base.size = 8;
+        base.up_count = 32; // alive drive — deep layers fire, so eligibility is non-trivial
+        base.delay = 4;
+        base.rec_count = 8;
+        base.rate_reg = 5.0;
+        base.rec_stab = 5.0;
+        base.rec_radius = 2;
+        base.trials = 400;
+        let off = train_hidden_rec(&base); // elig defaults off (elig_beta 0, elig_bump_psi false)
+        assert_eq!(off, 550, "elig-off byte-identical to the pre-change baseline");
+        let mut on = base.clone();
+        on.elig_beta = 0.4;
+        let a = train_hidden_rec(&on);
+        assert_ne!(a, off, "completed eligibility changes the trained result (feature is wired)");
     }
 
     #[test]
@@ -1402,6 +1632,563 @@ mod tests {
             ra.iter().min().unwrap(),
             ra.iter().sum::<u64>() / 5
         );
+    }
+
+    #[test]
+    #[ignore] // expensive; run manually in --release
+    fn parity_fixed_vs_trained_recurrence() {
+        // The informative parity test (size 16, alive read layer). Four columns: FF (no recurrence, trained
+        // forward); FIXED-rec (±1 recurrence, readout only — classic LSM); CRUDE-rec (trained via spike-ψ);
+        // COMPLETED-rec (trained via the ALIF εᵃ eligibility). Worst-seed over 3 seeds. Tests whether the
+        // completed credit rule lets *trained* recurrence beat the *fixed* recurrence reservoir.
+        let seeds = [0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF];
+        for n in [3usize, 4] {
+            let mk = || {
+                let mut c = RsnnConfig::demo();
+                c.size = 16;
+                c.up_count = 16;
+                c.delay = 8;
+                c.trials = 1500;
+                c.rate_reg = 5.0;
+                c.rate_target_permille = 100;
+                c
+            };
+            let (mut wff, mut wfix, mut wcru, mut wcom) = (1000u64, 1000u64, 1000u64, 1000u64);
+            for &s in &seeds {
+                let run = |c: &RsnnConfig| train_sequence(c, |seed, t| task_parity(seed, t, n));
+                let mut ff = mk();
+                ff.seed = s; ff.task_seed = s; ff.rec_count = 0;
+                let mut rec = mk();
+                rec.seed = s; rec.task_seed = s; rec.rec_count = 24; rec.rec_radius = 4; rec.rec_tau = 20.0;
+                let mut fix = rec.clone(); fix.hidden_lr = 0.0;             // fixed recurrence, readout only
+                let mut cru = rec.clone(); cru.elig_beta = 0.0;            // crude spike-ψ eligibility
+                let mut com = rec.clone(); com.elig_beta = 0.4;           // completed ALIF εᵃ eligibility
+                let (fa, xa, ca, ma) = (run(&ff), run(&fix), run(&cru), run(&com));
+                eprintln!("parity N={n} seed {s:#x}  FF {fa}  fixed-rec {xa}  crude-rec {ca}  completed-rec {ma}");
+                wff = wff.min(fa); wfix = wfix.min(xa); wcru = wcru.min(ca); wcom = wcom.min(ma);
+            }
+            eprintln!("parity N={n} WORST:  FF {wff}  fixed-rec {wfix}  crude-rec {wcru}  completed-rec {wcom}");
+        }
+    }
+
+    #[test]
+    #[ignore] // expensive; run manually in --release
+    fn deep_fixed_vs_trained_recurrence() {
+        // The DEEP (4-layer) architecture where deep-FF + rate_reg reaches ~986: L0→L1→L2→L3, recurrence on
+        // L2, ALL forward layers trained via multi-layer DFA (train_hidden_rec). Temporal XOR, delay 20,
+        // size 16. Columns like the parity test — FF (no rec), FIXED-rec (hidden_lr 0 = frozen reservoir +
+        // trained readout), CRUDE-rec (spike-ψ), COMPLETED-rec (ALIF εᵃ) — plus a rec_count sweep {8, 24} to
+        // see whether a LIGHTER recurrence avoids the deep collapse the fair test showed at rec_count 24.
+        // Worst-seed over 3 seeds. NOTE: the deep "fixed" column freezes *all* hidden weights (no per-level
+        // freeze exists), so it reads the top of a frozen deep reservoir — not directly comparable to the
+        // shallow fixed-rec (where the recurrent layer IS the read layer).
+        let seeds = [0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF];
+        let base = || {
+            let mut c = RsnnConfig::demo();
+            c.size = 16;
+            c.up_count = 16;
+            c.delay = 20;
+            c.trials = 1500;
+            c.rate_reg = 5.0;
+            c.rate_target_permille = 100;
+            c
+        };
+        let ff: Vec<u64> = seeds
+            .iter()
+            .map(|&s| {
+                let mut c = base();
+                c.seed = s;
+                c.task_seed = s;
+                c.rec_count = 0;
+                train_hidden_rec(&c)
+            })
+            .collect();
+        eprintln!("deep-FF (4 layers, temporal XOR): {ff:?}  worst {}", ff.iter().min().unwrap());
+        for rc in [8u32, 24] {
+            let (mut wx, mut wc, mut wm) = (1000u64, 1000u64, 1000u64);
+            for &s in &seeds {
+                let mk = || {
+                    let mut c = base();
+                    c.seed = s;
+                    c.task_seed = s;
+                    c.rec_count = rc;
+                    c.rec_radius = 4;
+                    c.rec_tau = 20.0;
+                    c.rec_stab = 5.0;
+                    c
+                };
+                let mut fix = mk();
+                fix.hidden_lr = 0.0; // frozen reservoir + trained readout
+                let mut cru = mk();
+                cru.elig_beta = 0.0; // crude spike-ψ eligibility
+                let mut com = mk();
+                com.elig_beta = 0.4; // completed ALIF εᵃ eligibility
+                let (xa, ca, ma) = (train_hidden_rec(&fix), train_hidden_rec(&cru), train_hidden_rec(&com));
+                eprintln!("deep rec_count {rc} seed {s:#x}  fixed {xa}  crude {ca}  completed {ma}");
+                wx = wx.min(xa);
+                wc = wc.min(ca);
+                wm = wm.min(ma);
+            }
+            eprintln!("deep rec_count {rc} WORST:  FF {}  fixed {wx}  crude {wc}  completed {wm}", ff.iter().min().unwrap());
+        }
+    }
+
+    #[test]
+    #[ignore] // expensive; run manually in --release
+    fn sidecar_on_easy_tasks() {
+        // Does the side-car HURT where feed-forward is already enough? FF vs side-car on the FF-solvable tasks
+        // (temporal XOR, distractor-XOR, flip-flop), size 32, 3 seeds, worst-seed. A robust topology should
+        // match FF here, not wreck it.
+        let seeds = [0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF];
+        let mk = |s: u64| {
+            let mut c = RsnnConfig::demo();
+            c.seed = s;
+            c.task_seed = s;
+            c.size = 32;
+            c.up_count = 16;
+            c.trials = 1500;
+            c.rate_reg = 5.0;
+            c.rate_target_permille = 100;
+            c.rec_radius = 4;
+            c.rec_tau = 20.0;
+            c.rec_stab = 5.0;
+            c.rec_count = 8;
+            c.elig_beta = 0.4;
+            c
+        };
+        let run_pair = |tweak: &dyn Fn(&mut RsnnConfig), task: &dyn Fn(u64, usize) -> (Vec<usize>, usize)| -> (u64, u64) {
+            let (mut wf, mut ws) = (1000u64, 1000u64);
+            for &s in &seeds {
+                let mut ff = mk(s);
+                tweak(&mut ff);
+                ff.rec_count = 0;
+                let mut sc = mk(s);
+                tweak(&mut sc);
+                wf = wf.min(train_hidden_rec_task(&ff, task));
+                ws = ws.min(train_sidecar_task(&sc, task));
+            }
+            (wf, ws)
+        };
+        let (f1, s1) = run_pair(&|c| c.delay = 20, &|seed, t| xor_task(seed, t));
+        eprintln!("temporal-XOR (delay 20):  FF {f1}  sidecar {s1}");
+        let (f2, s2) = run_pair(&|c| c.delay = 20, &|seed, t| task_distractor(seed, t));
+        eprintln!("distractor-XOR (delay 20): FF {f2}  sidecar {s2}");
+        let (f3, s3) = run_pair(&|c| { c.delay = 12; c.read_waves = 12; }, &|seed, t| task_flipflop(seed, t, 3));
+        eprintln!("flip-flop (delay 12):     FF {f3}  sidecar {s3}");
+    }
+
+    #[test]
+    #[ignore] // expensive; run manually in --release
+    fn sidecar_verify() {
+        // Verify the side-car win (one-seed sweep found sidecar 837 vs FF ~590 on parity N=4) across 3 seeds,
+        // and the stacked config (side-car + β 1.2 + W 8, the three levers that each helped). vs FF and the
+        // hidden-rec baseline. All size 32, parity N=4.
+        let seeds = [0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF];
+        let base = |s: u64| {
+            let mut c = RsnnConfig::demo();
+            c.seed = s;
+            c.task_seed = s;
+            c.size = 32;
+            c.up_count = 16;
+            c.delay = 8;
+            c.trials = 1500;
+            c.rate_reg = 5.0;
+            c.rate_target_permille = 100;
+            c.rec_radius = 4;
+            c.rec_tau = 20.0;
+            c.rec_stab = 5.0;
+            c.rec_count = 8;
+            c.elig_beta = 0.4;
+            c
+        };
+        let (mut wff, mut whr, mut wsc, mut wst) = (1000u64, 1000u64, 1000u64, 1000u64);
+        for &s in &seeds {
+            let mut ff = base(s);
+            ff.rec_count = 0;
+            let mut st = base(s);
+            st.elig_beta = 1.2;
+            st.elig_psi_width = 8.0;
+            let fa = train_hidden_rec_task(&ff, |seed, t| task_parity(seed, t, 4));
+            let ha = train_hidden_rec_task(&base(s), |seed, t| task_parity(seed, t, 4));
+            let sa = train_sidecar_task(&base(s), |seed, t| task_parity(seed, t, 4));
+            let ta = train_sidecar_task(&st, |seed, t| task_parity(seed, t, 4));
+            eprintln!("seed {s:#x}  FF {fa}  hidden-rec {ha}  sidecar {sa}  sidecar+stack {ta}");
+            wff = wff.min(fa);
+            whr = whr.min(ha);
+            wsc = wsc.min(sa);
+            wst = wst.min(ta);
+        }
+        eprintln!("WORST:  FF {wff}  hidden-rec {whr}  sidecar {wsc}  sidecar+stack {wst}");
+    }
+
+    #[test]
+    #[ignore] // expensive; run manually in --release
+    fn parity_improve_sweep() {
+        // ONE-SEED exploration (the hard seed 0xE9_0B_0A17, where deep-parity N=4 had completed 560 < FF 620).
+        // Goal: push trained recurrence ABOVE FF by varying depth / rec_count / β / bump-width / topology.
+        // Each variant prints its completed-εᵃ held-out; FF baseline for reference.
+        let s = 0xE9_0B_0A17u64;
+        let base = || {
+            let mut c = RsnnConfig::demo();
+            c.seed = s;
+            c.task_seed = s;
+            c.size = 32;
+            c.up_count = 16;
+            c.delay = 8;
+            c.trials = 1500;
+            c.rate_reg = 5.0;
+            c.rate_target_permille = 100;
+            c.rec_radius = 4;
+            c.rec_tau = 20.0;
+            c.rec_stab = 5.0;
+            c.rec_count = 8;
+            c.elig_beta = 0.4;
+            c
+        };
+        let run = |c: &RsnnConfig| train_hidden_rec_task(c, |seed, t| task_parity(seed, t, 4));
+        let mut ff = base();
+        ff.rec_count = 0;
+        eprintln!("FF baseline (d4 s32): {}", run(&ff));
+        eprintln!("A baseline  (d4 s32 rc8 β0.4 W16): {}", run(&base()));
+        let mut b = base();
+        b.hidden_rec_depth = 5;
+        eprintln!("B depth 5:   {}", run(&b));
+        let mut d = base();
+        d.rec_count = 12;
+        eprintln!("C rc 12:     {}", run(&d));
+        let mut e = base();
+        e.rec_count = 16;
+        eprintln!("D rc 16:     {}", run(&e));
+        let mut f = base();
+        f.elig_beta = 0.8;
+        eprintln!("E β 0.8:     {}", run(&f));
+        let mut g = base();
+        g.elig_beta = 1.2;
+        eprintln!("F β 1.2:     {}", run(&g));
+        let mut h = base();
+        h.elig_psi_width = 32.0;
+        eprintln!("G W 32:      {}", run(&h));
+        let mut i = base();
+        i.elig_psi_width = 8.0;
+        eprintln!("H W 8:       {}", run(&i));
+        eprintln!("I sidecar (s32 rc8): {}", train_sidecar_task(&base(), |seed, t| task_parity(seed, t, 4)));
+    }
+
+    #[test]
+    #[ignore] // expensive; run manually in --release
+    fn deep_parity() {
+        // Parity N=3/4 on the DEEP 4-layer hidden-rec architecture (all forward layers trained via multi-layer
+        // DFA, recurrence on L2), size 32, rec_count 8. Parity N≥3 is non-monotone — a task with HEADROOM that
+        // ALIF feed-forward does not already saturate — so this is the test of whether trained recurrence can
+        // BEAT feed-forward once the completed ALIF eligibility is used. FF / crude / completed, 3 seeds, worst.
+        let seeds = [0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF];
+        for n in [3usize, 4] {
+            let base = |s: u64| {
+                let mut c = RsnnConfig::demo();
+                c.seed = s;
+                c.task_seed = s;
+                c.size = 32;
+                c.up_count = 16;
+                c.delay = 8;
+                c.trials = 1500;
+                c.rate_reg = 5.0;
+                c.rate_target_permille = 100;
+                c.rec_radius = 4;
+                c.rec_tau = 20.0;
+                c.rec_stab = 5.0;
+                c
+            };
+            let (mut wf, mut wc, mut wm) = (1000u64, 1000u64, 1000u64);
+            for &s in &seeds {
+                let mut ff = base(s);
+                ff.rec_count = 0;
+                let mut cru = base(s);
+                cru.rec_count = 8;
+                cru.elig_beta = 0.0;
+                let mut com = base(s);
+                com.rec_count = 8;
+                com.elig_beta = 0.4;
+                let fa = train_hidden_rec_task(&ff, |seed, t| task_parity(seed, t, n));
+                let ca = train_hidden_rec_task(&cru, |seed, t| task_parity(seed, t, n));
+                let ma = train_hidden_rec_task(&com, |seed, t| task_parity(seed, t, n));
+                eprintln!("deep-parity N={n} seed {s:#x}  FF {fa}  crude {ca}  completed {ma}");
+                wf = wf.min(fa);
+                wc = wc.min(ca);
+                wm = wm.min(ma);
+            }
+            eprintln!("deep-parity N={n} WORST:  FF {wf}  crude {wc}  completed {wm}");
+        }
+    }
+
+    #[test]
+    #[ignore] // expensive; run manually in --release
+    fn deep_density_sweep() {
+        // Deep 4-layer (train_hidden_rec), temporal XOR delay 20, size 16. Map trained recurrence vs
+        // recurrence density (rec_count on L2): where is it trainable, where does it collapse, and where does
+        // the completed ALIF eligibility (elig_beta 0.4) beat the crude spike-ψ (elig_beta 0)? 3 seeds, worst.
+        let seeds = [0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF];
+        let base = |s: u64| {
+            let mut c = RsnnConfig::demo();
+            c.seed = s;
+            c.task_seed = s;
+            c.size = 16;
+            c.up_count = 16;
+            c.delay = 20;
+            c.trials = 1500;
+            c.rate_reg = 5.0;
+            c.rate_target_permille = 100;
+            c.rec_radius = 4;
+            c.rec_tau = 20.0;
+            c.rec_stab = 5.0;
+            c
+        };
+        let ff: Vec<u64> = seeds
+            .iter()
+            .map(|&s| {
+                let mut c = base(s);
+                c.rec_count = 0;
+                train_hidden_rec(&c)
+            })
+            .collect();
+        eprintln!("deep-FF (size 16) worst {}  {ff:?}", ff.iter().min().unwrap());
+        for rc in [4u32, 8, 12, 16, 24] {
+            let (mut wc, mut wm) = (1000u64, 1000u64);
+            for &s in &seeds {
+                let mut cru = base(s);
+                cru.rec_count = rc;
+                cru.elig_beta = 0.0;
+                let mut com = base(s);
+                com.rec_count = rc;
+                com.elig_beta = 0.4;
+                let (ca, ma) = (train_hidden_rec(&cru), train_hidden_rec(&com));
+                eprintln!("density rc {rc} seed {s:#x}  crude {ca}  completed {ma}");
+                wc = wc.min(ca);
+                wm = wm.min(ma);
+            }
+            eprintln!("density rc {rc} WORST:  crude {wc}  completed {wm}");
+        }
+    }
+
+    #[test]
+    #[ignore] // expensive; run manually in --release
+    fn deep_size_sweep() {
+        // Deep 4-layer, temporal XOR delay 20, rec_count 8 (the trainable density from deep_fixed_vs_trained).
+        // Vary layer width (size 8/16/32 = 64/256/1024 neurons/layer). Does more width help TRAINED recurrence,
+        // and does the completed eligibility's edge over crude hold/grow? FF / crude / completed, 3 seeds,
+        // worst. Caveat: up_count (16) and rec_radius (4) are held fixed, so their *relative* density shrinks
+        // with size (radius 4 is full-coverage at size 8, local at size 32) — an exploratory first look.
+        let seeds = [0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF];
+        for size in [8u32, 16, 32] {
+            let base = |s: u64| {
+                let mut c = RsnnConfig::demo();
+                c.seed = s;
+                c.task_seed = s;
+                c.size = size;
+                c.up_count = 16;
+                c.delay = 20;
+                c.trials = 1500;
+                c.rate_reg = 5.0;
+                c.rate_target_permille = 100;
+                c.rec_radius = 4;
+                c.rec_tau = 20.0;
+                c.rec_stab = 5.0;
+                c
+            };
+            let (mut wf, mut wc, mut wm) = (1000u64, 1000u64, 1000u64);
+            for &s in &seeds {
+                let mut ff = base(s);
+                ff.rec_count = 0;
+                let mut cru = base(s);
+                cru.rec_count = 8;
+                cru.elig_beta = 0.0;
+                let mut com = base(s);
+                com.rec_count = 8;
+                com.elig_beta = 0.4;
+                let (fa, ca, ma) = (train_hidden_rec(&ff), train_hidden_rec(&cru), train_hidden_rec(&com));
+                eprintln!("size {size} seed {s:#x}  FF {fa}  crude {ca}  completed {ma}");
+                wf = wf.min(fa);
+                wc = wc.min(ca);
+                wm = wm.min(ma);
+            }
+            eprintln!("size {size} WORST:  FF {wf}  crude {wc}  completed {wm}");
+        }
+    }
+
+    #[test]
+    #[ignore] // temp diagnostic
+    fn _diag_fair_hidden_lr_sensitivity() {
+        // Is the fair +rec held-out sensitive to hidden training AT ALL? If (hidden_lr 0) == (hidden_lr>0) and
+        // every β gives the same number, the config is INERT to hidden weights (collapse masks them) — which
+        // fully explains byte-identical-across-β without a bug. If hidden_lr moves it but β doesn't, that would
+        // point at a β bug. Positive control: parity (known β-sensitive) must move.
+        let mk = |up: u32, delay: usize| {
+            let mut c = RsnnConfig::demo();
+            c.seed = 0xE9_0B_0A17;
+            c.task_seed = 0xE9_0B_0A17;
+            c.size = 16;
+            c.up_count = up;
+            c.delay = delay;
+            c.trials = 1500;
+            c.rate_reg = 5.0;
+            c.rec_count = 24;
+            c.rec_radius = 4;
+            c.rec_tau = 20.0;
+            c.rec_stab = 5.0;
+            c
+        };
+        eprintln!("--- FAIR hidden-rec (up16, delay20) ---");
+        for (hl, b) in [(0.0f32, 0.0f32), (0.004, 0.0), (0.004, 0.4), (0.004, 2.0), (0.02, 0.4)] {
+            let mut c = mk(16, 20);
+            c.hidden_lr = hl;
+            c.elig_beta = b;
+            eprintln!("hidden_lr {hl}  elig_beta {b}  ->  {}", train_hidden_rec(&c));
+        }
+        eprintln!("--- parity control (up16, delay8, N=3) positive control ---");
+        for (hl, b) in [(0.0f32, 0.0f32), (0.004, 0.0), (0.004, 0.4)] {
+            let mut c = mk(16, 8);
+            c.hidden_lr = hl;
+            c.elig_beta = b;
+            eprintln!("hidden_lr {hl}  elig_beta {b}  ->  {}", train_sequence(&c, |seed, t| task_parity(seed, t, 3)));
+        }
+    }
+
+    #[test]
+    #[ignore] // temp diagnostic
+    fn _diag_fair_elig_magnitude() {
+        // Why is the fair hidden-rec +rec test byte-identical across β? Compare the eligibility e_ij under the
+        // OLD rule (fired-ψ) vs the COMPLETED rule (bump-ψ + εᵃ) for L2's forward (+1) and recurrent (0)
+        // synapses over one calibrated (untrained) trial. If both are ~0, there's nothing to train and β is
+        // inert here (an uninformative config); if they differ substantially, the byte-identical training
+        // result is convergence-to-the-same-collapse instead.
+        let mut cfg = RsnnConfig::demo();
+        cfg.seed = 0xE9_0B_0A17;
+        cfg.task_seed = 0xE9_0B_0A17;
+        cfg.size = 16;
+        cfg.up_count = 16;
+        cfg.delay = 20;
+        cfg.rate_reg = 5.0;
+        cfg.rec_count = 24;
+        cfg.rec_radius = 4;
+        cfg.rec_tau = 20.0;
+        cfg.rec_stab = 5.0;
+        let mut net = Network::new(cfg.engine_config_hidden_rec());
+        net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
+        let l = net.layer_count();
+        let ls = (cfg.size * cfg.size) as usize;
+        let (uc, ur) = (cfg.up_count as usize, cfg.up_radius);
+        let (n, r) = (cfg.rec_count as usize, cfg.rec_radius);
+        let (_, spikes, pots, effs) = xor_trial_layers(&mut net, &cfg, 1, 0, 0);
+        let ttot = spikes[l - 1].len();
+        let mut fired = vec![vec![vec![0f32; ls]; ttot]; l];
+        let mut pretr = vec![vec![vec![0f32; ls]; ttot]; l];
+        let decay = 1.0 - 1.0 / cfg.rec_tau.max(1.0);
+        for z in 1..l {
+            for (tt, wv) in spikes[z].iter().enumerate() {
+                for &loc in wv { fired[z][tt][loc as usize] = 1.0; }
+            }
+            for i in 0..ls {
+                let mut tr = 0.0;
+                for tt in 0..ttot { tr = tr * decay + fired[z][tt][i]; pretr[z][tt][i] = tr; }
+            }
+        }
+        let bump = |z: usize, tt: usize, j: usize| (PSI_GAMMA * (1.0 - (pots[z][tt][j] as f32 - effs[z][tt][j] as f32).abs() / cfg.elig_psi_width.max(1.0))).max(0.0);
+        let rho = 1.0 - (2.0f32).powi(-(cfg.adapt_decay as i32));
+        // L2 (z=2): forward (+1 -> L3) and recurrent (0 -> L2). Compare e under fired-ψ vs bump-ψ+εᵃ.
+        for &(level, count, radius, tgtz) in &[(1i32, uc, ur, 3usize), (0i32, n, r, 2usize)] {
+            let (mut e_fired, mut e_full, mut n_nz_fired, mut n_nz_full) = (0f64, 0f64, 0usize, 0usize);
+            for i in 0..ls {
+                let sg = (2 * ls + i) as u32;
+                for k in 0..count {
+                    let j = target_of(cfg.seed, sg, i as u32, level, k as u32, radius, cfg.size) as usize;
+                    let ef: f32 = (0..ttot).map(|tt| pretr[2][tt][i] * fired[tgtz][tt][j]).sum();
+                    let eb = elig_adapt_sum(ttot, 0.4, rho, |tt| bump(tgtz, tt, j), |tt| pretr[2][tt][i]);
+                    e_fired += ef.abs() as f64; e_full += eb.abs() as f64;
+                    if ef != 0.0 { n_nz_fired += 1; }
+                    if eb != 0.0 { n_nz_full += 1; }
+                }
+            }
+            let tag = if level > 0 { "L2 forward +1" } else { "L2 recurrent 0" };
+            eprintln!("{tag}: fired-ψ Σ|e| {e_fired:.1} nz {n_nz_fired}   bump+εᵃ Σ|e| {e_full:.1} nz {n_nz_full}");
+        }
+    }
+
+    #[test]
+    #[ignore] // expensive; run manually in --release
+    fn fair_recurrence_eprop_complete() {
+        // THE headline re-run: the airtight fair recurrence test (deep-FF ~986 vs +hidden-rec ~498/chance),
+        // now comparing the OLD eligibility (elig_beta 0 — membrane-only, reproduces the null) against the
+        // COMPLETED ALIF eligibility (elig_beta > 0 — adds the εᵃ adaptation-trace credit) on the recurrent
+        // path. If +rec climbs back toward FF at some β, the null was an artifact of the incomplete rule.
+        let seeds = [0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF, 0xA5A5_1111, 0x0F0F_2222];
+        let base = |s: u64| {
+            let mut ff = RsnnConfig::demo();
+            ff.seed = s;
+            ff.task_seed = s;
+            ff.size = 16;
+            ff.up_count = 16; // sparse drive: deep FF is starved without rate_reg
+            ff.delay = 20;
+            ff.trials = 1500;
+            ff.rate_reg = 5.0; // revive the forward path (per-neuron liveness)
+            ff.rate_target_permille = 100;
+            ff.rec_count = 0; // FF baseline
+            ff
+        };
+        // FF baseline is β-independent — compute once per seed.
+        let ffa: Vec<u64> = seeds.iter().map(|&s| train_hidden_rec(&base(s))).collect();
+        for (s, f) in seeds.iter().zip(&ffa) {
+            eprintln!("deep-FF seed {s:#x}  {f}");
+        }
+        eprintln!("FF worst {} mean {}", ffa.iter().min().unwrap(), ffa.iter().sum::<u64>() / 5);
+        for &beta in &[0.0f32, 0.1, 0.2, 0.4] {
+            let mut ra = Vec::new();
+            for &s in &seeds {
+                let mut rec = base(s);
+                rec.rec_count = 24;
+                rec.rec_radius = 4;
+                rec.rec_tau = 20.0;
+                rec.rec_init = 0;
+                rec.rec_stab = 5.0; // class-preserving per-layer stabilizer
+                rec.elig_beta = beta;
+                let r = train_hidden_rec(&rec);
+                eprintln!("β {beta}  seed {s:#x}  +rec {r}");
+                ra.push(r);
+            }
+            eprintln!("β {beta}: +rec worst {} mean {}", ra.iter().min().unwrap(), ra.iter().sum::<u64>() / 5);
+        }
+    }
+
+    #[test]
+    #[ignore] // expensive; run manually in --release
+    fn parity_recurrence_eprop_complete() {
+        // Parity (needs recurrent computation), ALIF, FF vs +lateral-recurrence with the completed ALIF
+        // eligibility, β sweep. β=0 reproduces the documented "recurrence hurts parity" null.
+        let seeds = [0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF];
+        for n in [3usize, 4] {
+            for &beta in &[0.0f32, 0.2, 0.4] {
+                let (mut wf, mut wr) = (1000u64, 1000u64);
+                for &s in &seeds {
+                    let mut ff = RsnnConfig::demo();
+                    ff.seed = s;
+                    ff.task_seed = s;
+                    ff.delay = 8;
+                    ff.trials = 1500;
+                    ff.rate_reg = 5.0;
+                    ff.rate_target_permille = 100;
+                    let mut rec = ff.clone();
+                    rec.rec_count = 24;
+                    rec.rec_radius = 2;
+                    rec.rec_tau = 20.0;
+                    rec.rec_init = 0;
+                    rec.elig_beta = beta;
+                    let fa = train_sequence(&ff, |seed, t| task_parity(seed, t, n));
+                    let ra = train_sequence(&rec, |seed, t| task_parity(seed, t, n));
+                    eprintln!("parity N={n} β {beta} seed {s:#x}  FF {fa}  +rec {ra}");
+                    wf = wf.min(fa);
+                    wr = wr.min(ra);
+                }
+                eprintln!("parity N={n} β {beta}: WORST FF {wf}  +rec {wr}");
+            }
+        }
     }
 
     #[test]
@@ -1526,6 +2313,18 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn train_recurrent_elig_on_is_deterministic() {
+        let mut cfg = RsnnConfig::demo();
+        cfg.size = 16;
+        cfg.layers = 4;
+        cfg.back_count = 8;
+        cfg.delay = 20;
+        cfg.trials = 150;
+        cfg.elig_beta = 0.2;
+        assert_eq!(train_recurrent(&cfg), train_recurrent(&cfg));
     }
 
     #[test]
@@ -1691,6 +2490,26 @@ mod tests {
     }
 
     #[test]
+    fn recurrent_update_elig_on_is_deterministic_and_differs() {
+        // The recurrent-top path (train_sequence → recurrent_update) with the completed eligibility: it is a
+        // pure function of (seed, config), and turning elig_beta on changes the trained result vs. off.
+        let mut base = RsnnConfig::demo();
+        base.delay = 8;
+        base.rec_count = 8;
+        base.rec_init = 0;
+        base.rate_reg = 5.0;
+        base.trials = 300;
+        let run = |c: &RsnnConfig| train_sequence(c, |seed, t| task_parity(seed, t, 3));
+        let off = run(&base);
+        assert_eq!(off, run(&base), "default recurrent path deterministic");
+        let mut on = base.clone();
+        on.elig_beta = 0.4;
+        let a = run(&on);
+        assert_eq!(a, run(&on), "elig-on deterministic");
+        assert_ne!(a, off, "completed eligibility changes the recurrent-top result (feature is wired)");
+    }
+
+    #[test]
     fn train_sequence_is_deterministic() {
         let mut cfg = RsnnConfig::demo();
         cfg.delay = 8;
@@ -1735,10 +2554,33 @@ mod tests {
         };
         let mut n1 = build();
         let mut n2 = build();
-        let (a1, w1) = xor_trial(&mut n1, &cfg, 1, 0, 3);
-        let (a2, w2) = sequence_trial(&mut n2, &cfg, &[1, 0], 3);
+        let (a1, w1, _, _) = xor_trial(&mut n1, &cfg, 1, 0, 3);
+        let (a2, w2, _, _) = sequence_trial(&mut n2, &cfg, &[1, 0], 3);
         assert_eq!(a1, a2, "read-window activity matches xor_trial");
         assert_eq!(w1, w2, "per-wave fired-sets match xor_trial");
+    }
+
+    #[test]
+    fn sequence_trial_layers_matches_xor_on_two_cues() {
+        // The all-layer recorder must reproduce xor_trial_layers exactly for a 2-cue [a, b] sequence — this is
+        // what makes train_hidden_rec(cfg) == train_hidden_rec_task(cfg, xor_task) byte-identical.
+        let mut cfg = RsnnConfig::demo();
+        cfg.size = 8;
+        cfg.layers = 4;
+        cfg.delay = 12;
+        let build = || {
+            let mut net = Network::new(cfg.engine_config_hidden_rec());
+            net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
+            net
+        };
+        let mut n1 = build();
+        let mut n2 = build();
+        let (a1, s1, p1, e1) = xor_trial_layers(&mut n1, &cfg, 1, 0, 3);
+        let (a2, s2, p2, e2) = sequence_trial_layers(&mut n2, &cfg, &[1, 0], 3);
+        assert_eq!(a1, a2, "read-window activity matches");
+        assert_eq!(s1, s2, "per-wave fired-sets match across all layers");
+        assert_eq!(p1, p2, "per-wave decide potentials match");
+        assert_eq!(e1, e2, "per-wave decide effective thresholds match");
     }
 
     #[test]
