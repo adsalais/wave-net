@@ -1313,9 +1313,131 @@ pub fn train_l2l3loop(cfg: &RsnnConfig) -> u64 {
     train_multilayer(cfg, net, &layer_entries, xor_task)
 }
 
+/// σ criticality diagnostic — single-spike **damage spreading** (MEASUREMENT ONLY, no control). Under a
+/// sustained deterministic random L0 drive, runs the (already built + calibrated) net twice — a **reference**
+/// run and a **perturbed** run identical except for **one extra L0 spike at wave `warmup`** — and tracks the
+/// per-wave Hamming distance `d(t)` between the two runs' fired-sets across all computational layers: the
+/// descendant avalanche of that single spike. **σ** is `exp(slope of ln d(t))` over the `window` — the
+/// geometric per-wave growth of the avalanche: **σ > 1 super-critical (runaway), σ < 1 sub-critical (dies),
+/// σ ≈ 1 critical.** Averaged over `n_perturb` perturbation sites. Deterministic; bench-side (no engine
+/// change) — the caller builds/calibrates/(optionally trains) the net first, so σ can be read on any
+/// architecture or operating point in the benchmarks. Returns `(mean d(t) trajectory, σ)`.
+pub fn sigma_probe(net: &mut Network, cfg: &RsnnConfig, warmup: usize, window: usize, n_perturb: usize) -> (Vec<f64>, f64) {
+    use std::collections::HashSet;
+    let l = net.layer_count();
+    let ls = (cfg.size * cfg.size) as usize;
+    let drive = random_l0_input(cfg.seed ^ 0xC0FF_EE, cfg.size, cfg.calib_fraction_q16);
+    let steps = warmup + window + 1;
+    // One deterministic run from reset: `steps` waves under `drive`; at wave `warmup`, if `pert` is set, add
+    // that one extra L0 site. Returns each computational layer's per-wave fired locals.
+    let run = |net: &mut Network, pert: Option<u32>| -> Vec<Vec<Vec<u32>>> {
+        let rec: Arc<Mutex<Vec<Vec<Vec<u32>>>>> = Arc::new(Mutex::new(vec![Vec::new(); l]));
+        for z in 1..l {
+            let r = rec.clone();
+            net.on_layer(z, Box::new(move |_w, fired: &[u32]| r.lock().unwrap()[z].push(fired.to_vec())));
+        }
+        net.reset_state();
+        for w in 0..steps {
+            let mut sites = drive(w);
+            if let (Some(p), true) = (pert, w == warmup) {
+                if !sites.contains(&p) {
+                    sites.push(p);
+                }
+            }
+            net.wave(&sites);
+        }
+        net.clear_listeners();
+        let out = rec.lock().unwrap().clone();
+        out
+    };
+    let global = |rec: &[Vec<Vec<u32>>], wave: usize| -> HashSet<u32> {
+        let mut s = HashSet::new();
+        for z in 1..l {
+            for &loc in &rec[z][wave] {
+                s.insert(z as u32 * ls as u32 + loc);
+            }
+        }
+        s
+    };
+    let refr = run(net, None);
+    let driven: HashSet<u32> = drive(warmup).into_iter().collect();
+    let mut d_mean = vec![0f64; window];
+    let mut sigmas = Vec::new();
+    let np = n_perturb.max(1);
+    for k in 0..np {
+        // deterministic perturbation site, guaranteed to be an *extra* spike (not already driven at w0)
+        let mut p = (mix(key(cfg.seed, k as u32, 0, 0, 0xC1)) % ls as u64) as u32;
+        let mut guard = 0;
+        while driven.contains(&p) && guard < ls {
+            p = (p + 1) % ls as u32;
+            guard += 1;
+        }
+        let pert = run(net, Some(p));
+        let mut d = vec![0f64; window];
+        for t in 0..window {
+            let wv = warmup + 1 + t; // first wave the perturbation reaches the computational layers
+            d[t] = global(&refr, wv).symmetric_difference(&global(&pert, wv)).count() as f64;
+            d_mean[t] += d[t] / np as f64;
+        }
+        // σ = exp(least-squares slope of ln(d+0.5) vs t) over the window
+        let y: Vec<f64> = d.iter().map(|&v| (v + 0.5).ln()).collect();
+        let n = window as f64;
+        let sx: f64 = (0..window).map(|t| t as f64).sum();
+        let sy: f64 = y.iter().sum();
+        let sxx: f64 = (0..window).map(|t| (t * t) as f64).sum();
+        let sxy: f64 = (0..window).map(|t| t as f64 * y[t]).sum();
+        let denom = n * sxx - sx * sx;
+        let slope = if denom.abs() > 1e-9 { (n * sxy - sx * sy) / denom } else { 0.0 };
+        sigmas.push(slope.exp());
+    }
+    let sigma = sigmas.iter().sum::<f64>() / sigmas.len() as f64;
+    (d_mean, sigma)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sigma_probe_is_deterministic() {
+        let mut cfg = RsnnConfig::demo();
+        cfg.size = 8;
+        cfg.rec_count = 8;
+        let mk = || {
+            let mut net = Network::new(cfg.engine_config_sidecar());
+            net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
+            net
+        };
+        let (_, s1) = sigma_probe(&mut mk(), &cfg, 16, 6, 4);
+        let (_, s2) = sigma_probe(&mut mk(), &cfg, 16, 6, 4);
+        assert_eq!(s1.to_bits(), s2.to_bits(), "σ probe must be a pure function of (seed, config)");
+    }
+
+    #[test]
+    #[ignore] // criticality diagnostic; fast (no training)
+    fn sigma_across_configs() {
+        // σ across the side-car configs where parity flipped chance↔working (size 32, calibrated,
+        // pre-training). Expect: sub-critical (σ<1, starved) at low forward drive, super-critical (σ>1,
+        // collapse) at high recurrence density, σ≈1 in the working band — i.e. σ predicts the transitions.
+        let s = 0xE9_0B_0A17u64;
+        for rc in [8u32, 16, 32] {
+            for up in [16u32, 32, 64] {
+                let mut c = RsnnConfig::demo();
+                c.seed = s;
+                c.task_seed = s;
+                c.size = 32;
+                c.up_count = up;
+                c.up_radius = 3;
+                c.rec_count = rc;
+                c.rec_radius = 4;
+                let mut net = Network::new(c.engine_config_sidecar());
+                net.calibrate(&c.calib, &random_l0_input(c.seed ^ 0xE9, c.size, c.calib_fraction_q16));
+                let (traj, sigma) = sigma_probe(&mut net, &c, 32, 8, 8);
+                let t: Vec<f64> = traj.iter().map(|x| (x * 10.0).round() / 10.0).collect();
+                eprintln!("rc {rc:>2} up {up:>2}  σ {sigma:.3}  avalanche d(t) {t:?}");
+            }
+        }
+    }
 
     #[test]
     fn elig_adapt_sum_matches_closed_form_and_sign() {
