@@ -1579,6 +1579,68 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // expensive; run manually in --release
+    fn deep_fixed_vs_trained_recurrence() {
+        // The DEEP (4-layer) architecture where deep-FF + rate_reg reaches ~986: L0→L1→L2→L3, recurrence on
+        // L2, ALL forward layers trained via multi-layer DFA (train_hidden_rec). Temporal XOR, delay 20,
+        // size 16. Columns like the parity test — FF (no rec), FIXED-rec (hidden_lr 0 = frozen reservoir +
+        // trained readout), CRUDE-rec (spike-ψ), COMPLETED-rec (ALIF εᵃ) — plus a rec_count sweep {8, 24} to
+        // see whether a LIGHTER recurrence avoids the deep collapse the fair test showed at rec_count 24.
+        // Worst-seed over 3 seeds. NOTE: the deep "fixed" column freezes *all* hidden weights (no per-level
+        // freeze exists), so it reads the top of a frozen deep reservoir — not directly comparable to the
+        // shallow fixed-rec (where the recurrent layer IS the read layer).
+        let seeds = [0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF];
+        let base = || {
+            let mut c = RsnnConfig::demo();
+            c.size = 16;
+            c.up_count = 16;
+            c.delay = 20;
+            c.trials = 1500;
+            c.rate_reg = 5.0;
+            c.rate_target_permille = 100;
+            c
+        };
+        let ff: Vec<u64> = seeds
+            .iter()
+            .map(|&s| {
+                let mut c = base();
+                c.seed = s;
+                c.task_seed = s;
+                c.rec_count = 0;
+                train_hidden_rec(&c)
+            })
+            .collect();
+        eprintln!("deep-FF (4 layers, temporal XOR): {ff:?}  worst {}", ff.iter().min().unwrap());
+        for rc in [8u32, 24] {
+            let (mut wx, mut wc, mut wm) = (1000u64, 1000u64, 1000u64);
+            for &s in &seeds {
+                let mk = || {
+                    let mut c = base();
+                    c.seed = s;
+                    c.task_seed = s;
+                    c.rec_count = rc;
+                    c.rec_radius = 4;
+                    c.rec_tau = 20.0;
+                    c.rec_stab = 5.0;
+                    c
+                };
+                let mut fix = mk();
+                fix.hidden_lr = 0.0; // frozen reservoir + trained readout
+                let mut cru = mk();
+                cru.elig_beta = 0.0; // crude spike-ψ eligibility
+                let mut com = mk();
+                com.elig_beta = 0.4; // completed ALIF εᵃ eligibility
+                let (xa, ca, ma) = (train_hidden_rec(&fix), train_hidden_rec(&cru), train_hidden_rec(&com));
+                eprintln!("deep rec_count {rc} seed {s:#x}  fixed {xa}  crude {ca}  completed {ma}");
+                wx = wx.min(xa);
+                wc = wc.min(ca);
+                wm = wm.min(ma);
+            }
+            eprintln!("deep rec_count {rc} WORST:  FF {}  fixed {wx}  crude {wc}  completed {wm}", ff.iter().min().unwrap());
+        }
+    }
+
+    #[test]
     #[ignore] // temp diagnostic
     fn _diag_fair_hidden_lr_sensitivity() {
         // Is the fair +rec held-out sensitive to hidden training AT ALL? If (hidden_lr 0) == (hidden_lr>0) and
