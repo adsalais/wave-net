@@ -329,7 +329,7 @@ fn topo_entries(cfg: &RsnnConfig) -> Vec<(i32, usize, u32)> {
 
 /// Temporal-XOR trial (reset → cue(a) → delay → cue(b) → read) on a multi-layer net. Records every
 /// computational layer's per-wave fired-set and returns (top-layer read-window spike counts, spikes[z][t]).
-fn xor_trial_layers(net: &mut Network, cfg: &RsnnConfig, a: usize, b: usize, trial: usize) -> (Vec<f32>, Vec<Vec<Vec<u32>>>, Vec<Vec<Vec<i16>>>) {
+fn xor_trial_layers(net: &mut Network, cfg: &RsnnConfig, a: usize, b: usize, trial: usize) -> (Vec<f32>, Vec<Vec<Vec<u32>>>, Vec<Vec<Vec<i16>>>, Vec<Vec<Vec<i32>>>) {
     let l = net.layer_count();
     let ls = (cfg.size * cfg.size) as usize;
     let rec: Arc<Mutex<Vec<Vec<Vec<u32>>>>> = Arc::new(Mutex::new(vec![Vec::new(); l]));
@@ -339,9 +339,11 @@ fn xor_trial_layers(net: &mut Network, cfg: &RsnnConfig, a: usize, b: usize, tri
     }
     net.reset_state();
     let mut pots: Vec<Vec<Vec<i16>>> = vec![Vec::new(); l];
-    let record = |net: &Network, pots: &mut Vec<Vec<Vec<i16>>>| {
+    let mut effs: Vec<Vec<Vec<i32>>> = vec![Vec::new(); l];
+    let record = |net: &Network, pots: &mut Vec<Vec<Vec<i16>>>, effs: &mut Vec<Vec<Vec<i32>>>| {
         for z in 1..l {
             pots[z].push(net.layer_decide_potential(z));
+            effs[z].push(net.layer_effective_threshold(z));
         }
     };
     for (class, phase) in [(a, 0usize), (b, 1)] {
@@ -349,18 +351,18 @@ fn xor_trial_layers(net: &mut Network, cfg: &RsnnConfig, a: usize, b: usize, tri
         if phase == 1 {
             for _ in 0..cfg.delay {
                 net.wave(&[]);
-                record(net, &mut pots);
+                record(net, &mut pots, &mut effs);
             }
         }
         for w in 0..cfg.present_waves {
             let sites = cue_realization(cfg.task_seed, cfg.size, class, trial * 2 + phase, w, cfg.base_q16, cfg.keep_q16, cfg.noise_q16);
             net.wave(&sites);
-            record(net, &mut pots);
+            record(net, &mut pots, &mut effs);
         }
     }
     for _ in 0..cfg.read_waves {
         net.wave(&[]);
-        record(net, &mut pots);
+        record(net, &mut pots, &mut effs);
     }
     net.clear_listeners();
     let spikes = rec.lock().unwrap().clone();
@@ -371,7 +373,7 @@ fn xor_trial_layers(net: &mut Network, cfg: &RsnnConfig, a: usize, b: usize, tri
             act[loc as usize] += 1.0;
         }
     }
-    (act, spikes, pots)
+    (act, spikes, pots, effs)
 }
 
 const P_DFA: u64 = 61; // fixed random Direct-Feedback-Alignment weights
@@ -380,6 +382,26 @@ const P_DFA: u64 = 61; // fixed random Direct-Feedback-Alignment weights
 /// deterministic, hash-derived, stored-free. Broadcasts the output error to a deep layer.
 fn dfa_weight(seed: u64, neuron_global: u32, class: usize) -> f32 {
     if mix(key(seed, neuron_global, class as i32, 0, P_DFA)) & 1 == 1 { 1.0 } else { -1.0 }
+}
+
+/// Dampening (γ) for the normalized bump pseudo-derivative ψ = γ·max(0, 1−|v−eff|/θ). LSNN uses 0.3.
+const PSI_GAMMA: f32 = 0.3;
+
+/// Σ_t of the ALIF eligibility trace `e_ij(t) = ψ_j(t)·(εᵛ_i(t) − β·εᵃ_ij(t))`, with the adaptation
+/// eligibility εᵃ recursed at the slow rate ρ: `εᵃ(t+1) = ψ(t)·εᵛ(t) + (ρ − β·ψ(t))·εᵃ(t)`. β = 0 reduces
+/// to the plain membrane trace `Σ_t ψ_j·εᵛ_i` (what the code did before). `psi(tt)` is ψ_j(tt), `ev(tt)`
+/// is εᵛ_i(tt) (the presynaptic trace). Bellec et al. 2020, Eq. 24–25 (verified against the official
+/// autodiff implementation: ψ multiplies both the membrane and the −β·εᵃ term).
+fn elig_adapt_sum(ttot: usize, beta: f32, rho: f32, psi: impl Fn(usize) -> f32, ev: impl Fn(usize) -> f32) -> f32 {
+    let mut eps_a = 0.0f32;
+    let mut e = 0.0f32;
+    for tt in 0..ttot {
+        let p = psi(tt);
+        let v = ev(tt);
+        e += p * (v - beta * eps_a);
+        eps_a = p * v + (rho - beta * p) * eps_a;
+    }
+    e
 }
 
 fn target_of(seed: u64, source_global: u32, src_local: u32, level: i32, k: u32, radius: u32, size: u32) -> u32 {
@@ -771,7 +793,7 @@ pub fn train_recurrent(cfg: &RsnnConfig) -> u64 {
     for t in 0..cfg.trials {
         let (a, b) = pick_ab(cfg.task_seed, t);
         let label = a ^ b;
-        let (act, spikes, pots) = xor_trial_layers(&mut net, cfg, a, b, t);
+        let (act, spikes, pots, _effs) = xor_trial_layers(&mut net, cfg, a, b, t);
         let p = softmax(&score(&w, &act));
         let err: Vec<f32> = (0..2).map(|c| p[c] - if c == label { 1.0 } else { 0.0 }).collect();
         for c in 0..2 {
@@ -871,7 +893,7 @@ pub fn train_recurrent(cfg: &RsnnConfig) -> u64 {
     let holdout = 400usize;
     for t in cfg.trials..cfg.trials + holdout {
         let (a, b) = pick_ab(cfg.task_seed, t);
-        let (act, _, _) = xor_trial_layers(&mut net, cfg, a, b, t);
+        let (act, _, _, _) = xor_trial_layers(&mut net, cfg, a, b, t);
         let s = score(&w, &act);
         let pred = if s[1] > s[0] { 1 } else { 0 };
         if pred == (a ^ b) {
@@ -898,10 +920,15 @@ fn train_multilayer(cfg: &RsnnConfig, mut net: Network, layer_entries: &[Vec<(i3
     let theta: Vec<Vec<f32>> = (0..l)
         .map(|z| net.layer_thresholds(z.max(1)).iter().map(|&t| (t as f32).max(1.0)).collect())
         .collect();
+    // ALIF adaptation eligibility (guarded): β active only with adaptation; bump ψ implied when β>0.
+    let beta = if cfg.adapt_bump > 0 { cfg.elig_beta } else { 0.0 };
+    let use_adapt = beta != 0.0;
+    let use_bump = cfg.elig_bump_psi || use_adapt;
+    let rho = 1.0 - (2.0f32).powi(-(cfg.adapt_decay as i32));
     for t in 0..cfg.trials {
         let (a, b) = pick_ab(cfg.task_seed, t);
         let label = a ^ b;
-        let (act, spikes, pots) = xor_trial_layers(&mut net, cfg, a, b, t);
+        let (act, spikes, pots, effs) = xor_trial_layers(&mut net, cfg, a, b, t);
         let p = softmax(&score(&w, &act));
         let err: Vec<f32> = (0..2).map(|c| p[c] - if c == label { 1.0 } else { 0.0 }).collect();
         for c in 0..2 {
@@ -933,7 +960,11 @@ fn train_multilayer(cfg: &RsnnConfig, mut net: Network, layer_entries: &[Vec<(i3
         for z in 1..l {
             for tt in 0..ttot {
                 for j in 0..ls {
-                    post[z][tt][j] = if cfg.subthreshold_psi {
+                    post[z][tt][j] = if use_bump {
+                        // normalized bump pseudo-derivative ψ = γ·max(0, 1−|v−eff|/θ), centered at the
+                        // ADAPTIVE firing threshold eff (so it stays alive when adaptation raises the bar)
+                        (PSI_GAMMA * (1.0 - (pots[z][tt][j] as f32 - effs[z][tt][j] as f32).abs() / theta[z][j])).max(0.0)
+                    } else if cfg.subthreshold_psi {
                         (pots[z][tt][j] as f32 / theta[z][j]).clamp(0.0, 1.0)
                     } else {
                         fired[z][tt][j]
@@ -974,10 +1005,15 @@ fn train_multilayer(cfg: &RsnnConfig, mut net: Network, layer_entries: &[Vec<(i3
                     let sg = (z * ls + i) as u32;
                     for k in 0..count {
                         let j = target_of(cfg.seed, sg, i as u32, level, k as u32, radius, cfg.size) as usize;
-                        let mut e = 0f32;
-                        for tt in 0..ttot {
-                            e += pretr[z][tt][i] * post[tz][tt][j];
-                        }
+                        let e = if use_adapt {
+                            elig_adapt_sum(ttot, beta, rho, |tt| post[tz][tt][j], |tt| pretr[z][tt][i])
+                        } else {
+                            let mut s = 0f32;
+                            for tt in 0..ttot {
+                                s += pretr[z][tt][i] * post[tz][tt][j];
+                            }
+                            s
+                        };
                         if e != 0.0 {
                             // forward levels → per-neuron rate_reg (liveness). Recurrent levels (0/−1/−2) →
                             // per-LAYER rec_stab uniform bias (class-preserving) when set, else fall back to
@@ -1009,7 +1045,7 @@ fn train_multilayer(cfg: &RsnnConfig, mut net: Network, layer_entries: &[Vec<(i3
     let holdout = 400usize;
     for t in cfg.trials..cfg.trials + holdout {
         let (a, b) = pick_ab(cfg.task_seed, t);
-        let (act, _, _) = xor_trial_layers(&mut net, cfg, a, b, t);
+        let (act, _, _, _) = xor_trial_layers(&mut net, cfg, a, b, t);
         let s = score(&w, &act);
         if (if s[1] > s[0] { 1 } else { 0 }) == (a ^ b) {
             correct += 1;
@@ -1070,6 +1106,26 @@ pub fn train_l2l3loop(cfg: &RsnnConfig) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn elig_adapt_sum_matches_closed_form_and_sign() {
+        // β=0 ⇒ pure membrane trace Σ ψ·εᵛ.
+        let psi = [0.5f32, 0.0, 0.3];
+        let ev = [1.0f32, 2.0, 4.0];
+        let membrane: f32 = psi.iter().zip(ev).map(|(p, v)| p * v).sum();
+        assert!((elig_adapt_sum(3, 0.0, 0.9, |t| psi[t], |t| ev[t]) - membrane).abs() < 1e-6);
+        // β>0 ⇒ the −β·εᵃ term makes the total SMALLER than the membrane-only trace (adaptation is
+        // suppressive: firing now raises future threshold), and εᵃ carries a slow trace forward.
+        let full = elig_adapt_sum(3, 0.2, 0.9, |t| psi[t], |t| ev[t]);
+        assert!(full < membrane, "adaptation term subtracts: {full} !< {membrane}");
+        // hand-rolled reference for the same recursion
+        let (mut eps_a, mut e) = (0.0f32, 0.0f32);
+        for t in 0..3 {
+            e += psi[t] * (ev[t] - 0.2 * eps_a);
+            eps_a = psi[t] * ev[t] + (0.9 - 0.2 * psi[t]) * eps_a;
+        }
+        assert!((full - e).abs() < 1e-6);
+    }
 
     /// The recurrence-requiring temporal-XOR config: LIF (no adaptation memory) + a delay that outlasts the
     /// membrane leak, so only a recurrent loop can hold A across the gap. (ALIF adaptation alone solves XOR
@@ -1171,7 +1227,7 @@ mod tests {
         let theta: Vec<Vec<f32>> = (0..l)
             .map(|z| net.layer_thresholds(z.max(1)).iter().map(|&t| (t as f32).max(1.0)).collect())
             .collect();
-        let (_, spikes, pots) = xor_trial_layers(&mut net, &cfg, 1, 0, 0);
+        let (_, spikes, pots, _) = xor_trial_layers(&mut net, &cfg, 1, 0, 0);
         let ttot = spikes[l - 1].len();
         // does sub-ψ (clamp(v/θ)) ever differ from spike-ψ (fired)? count charged-but-silent neurons
         for z in 1..l {
@@ -1350,7 +1406,7 @@ mod tests {
             c.adapt_bump = ab;
             let mut net = Network::new(c.engine_config_recurrent());
             net.calibrate(&c.calib, &random_l0_input(c.seed ^ 0xE9, c.size, c.calib_fraction_q16));
-            let (_, spikes, _) = xor_trial_layers(&mut net, &c, 1, 0, 0);
+            let (_, spikes, _, _) = xor_trial_layers(&mut net, &c, 1, 0, 0);
             let per_layer: Vec<usize> = (1..spikes.len()).map(|z| spikes[z].iter().map(|w| w.len()).sum()).collect();
             eprintln!("adapt_bump {ab}: L1..L3 total spikes over a cue trial {per_layer:?}");
         }
@@ -1366,6 +1422,28 @@ mod tests {
         cfg.rec_stab = 5.0;
         cfg.trials = 100;
         assert_eq!(train_hidden_rec(&cfg), train_hidden_rec(&cfg));
+    }
+
+    #[test]
+    fn train_multilayer_elig_off_is_unchanged_and_on_differs() {
+        // Guard on an ALIVE config (so eligibility is non-zero and the εᵃ term can act): with the feature
+        // at its defaults the trainer takes the pre-change branch and returns the frozen characterization
+        // value (proves no regression); turning elig_beta on changes the trained result (proves it is wired).
+        let mut base = RsnnConfig::demo();
+        base.size = 8;
+        base.up_count = 32; // alive drive — deep layers fire, so eligibility is non-trivial
+        base.delay = 4;
+        base.rec_count = 8;
+        base.rate_reg = 5.0;
+        base.rec_stab = 5.0;
+        base.rec_radius = 2;
+        base.trials = 400;
+        let off = train_hidden_rec(&base); // elig defaults off (elig_beta 0, elig_bump_psi false)
+        assert_eq!(off, 550, "elig-off byte-identical to the pre-change baseline");
+        let mut on = base.clone();
+        on.elig_beta = 0.4;
+        let a = train_hidden_rec(&on);
+        assert_ne!(a, off, "completed eligibility changes the trained result (feature is wired)");
     }
 
     #[test]
