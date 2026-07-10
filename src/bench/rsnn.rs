@@ -546,7 +546,7 @@ pub fn task_flipflop(seed: u64, trial: usize, n_ops: usize) -> (Vec<usize>, usiz
 
 /// reset → present cue(a) → delay → present cue(b) → read (silent). Records L1 per-wave fired-sets and
 /// returns (read-window L1 spike counts, per-wave L1 fired-sets over the whole trial).
-fn xor_trial(net: &mut Network, cfg: &RsnnConfig, a: usize, b: usize, trial: usize) -> (Vec<f32>, Vec<Vec<u32>>) {
+fn xor_trial(net: &mut Network, cfg: &RsnnConfig, a: usize, b: usize, trial: usize) -> (Vec<f32>, Vec<Vec<u32>>, Vec<Vec<i16>>, Vec<Vec<i32>>) {
     let ls = (cfg.size * cfg.size) as usize;
     let rec: Arc<Mutex<Vec<Vec<u32>>>> = Arc::new(Mutex::new(Vec::new()));
     {
@@ -554,20 +554,30 @@ fn xor_trial(net: &mut Network, cfg: &RsnnConfig, a: usize, b: usize, trial: usi
         net.on_layer(1, Box::new(move |_w, fired: &[u32]| r.lock().unwrap().push(fired.to_vec())));
     }
     net.reset_state();
-    let present = |net: &mut Network, class: usize, phase: usize| {
+    // per-wave decide potential + effective threshold of the recorded/recurrent layer (layer 1 = top here),
+    // aligned one-per-wave with `waves`, so recurrent_update can build the bump ψ centered at eff.
+    let mut pots_top: Vec<Vec<i16>> = Vec::new();
+    let mut eff_top: Vec<Vec<i32>> = Vec::new();
+    let present = |net: &mut Network, class: usize, phase: usize, pots: &mut Vec<Vec<i16>>, effs: &mut Vec<Vec<i32>>| {
         for w in 0..cfg.present_waves {
             let sites = cue_realization(cfg.task_seed, cfg.size, class, trial * 2 + phase, w, cfg.base_q16, cfg.keep_q16, cfg.noise_q16);
             net.wave(&sites);
+            pots.push(net.layer_decide_potential(1));
+            effs.push(net.layer_effective_threshold(1));
         }
     };
-    present(net, a, 0);
+    present(net, a, 0, &mut pots_top, &mut eff_top);
     for _ in 0..cfg.delay {
         net.wave(&[]);
+        pots_top.push(net.layer_decide_potential(1));
+        eff_top.push(net.layer_effective_threshold(1));
     }
-    present(net, b, 1);
+    present(net, b, 1, &mut pots_top, &mut eff_top);
     let read_start = rec.lock().unwrap().len();
     for _ in 0..cfg.read_waves {
         net.wave(&[]);
+        pots_top.push(net.layer_decide_potential(1));
+        eff_top.push(net.layer_effective_threshold(1));
     }
     net.clear_listeners();
     let waves = rec.lock().unwrap().clone();
@@ -577,14 +587,14 @@ fn xor_trial(net: &mut Network, cfg: &RsnnConfig, a: usize, b: usize, trial: usi
             act[loc as usize] += 1.0;
         }
     }
-    (act, waves)
+    (act, waves, pots_top, eff_top)
 }
 
 /// reset → for each class in `classes`: (a `delay` gap before every cue except the first) present
 /// cue(class) for `present_waves` → `read_waves` silent. Records L1 per-wave fired-sets; returns
 /// (read-window L1 spike counts, per-wave fired-sets). Generalizes `xor_trial`: `classes = [a, b]` with the
 /// per-cue seed `trial·n + pos` reproduces `xor_trial(a, b)` exactly.
-fn sequence_trial(net: &mut Network, cfg: &RsnnConfig, classes: &[usize], trial: usize) -> (Vec<f32>, Vec<Vec<u32>>) {
+fn sequence_trial(net: &mut Network, cfg: &RsnnConfig, classes: &[usize], trial: usize) -> (Vec<f32>, Vec<Vec<u32>>, Vec<Vec<i16>>, Vec<Vec<i32>>) {
     let ls = (cfg.size * cfg.size) as usize;
     let n = classes.len();
     let top = net.layer_count() - 1; // read (and, for the recurrent-top stack, train) the top computational layer
@@ -594,20 +604,29 @@ fn sequence_trial(net: &mut Network, cfg: &RsnnConfig, classes: &[usize], trial:
         net.on_layer(top, Box::new(move |_w, fired: &[u32]| r.lock().unwrap().push(fired.to_vec())));
     }
     net.reset_state();
+    // per-wave decide potential + effective threshold of the recurrent (top) layer, aligned with `waves`.
+    let mut pots_top: Vec<Vec<i16>> = Vec::new();
+    let mut eff_top: Vec<Vec<i32>> = Vec::new();
     for (pos, &class) in classes.iter().enumerate() {
         if pos > 0 {
             for _ in 0..cfg.delay {
                 net.wave(&[]);
+                pots_top.push(net.layer_decide_potential(top));
+                eff_top.push(net.layer_effective_threshold(top));
             }
         }
         for w in 0..cfg.present_waves {
             let sites = cue_realization(cfg.task_seed, cfg.size, class, trial * n + pos, w, cfg.base_q16, cfg.keep_q16, cfg.noise_q16);
             net.wave(&sites);
+            pots_top.push(net.layer_decide_potential(top));
+            eff_top.push(net.layer_effective_threshold(top));
         }
     }
     let read_start = rec.lock().unwrap().len();
     for _ in 0..cfg.read_waves {
         net.wave(&[]);
+        pots_top.push(net.layer_decide_potential(top));
+        eff_top.push(net.layer_effective_threshold(top));
     }
     net.clear_listeners();
     let waves = rec.lock().unwrap().clone();
@@ -617,13 +636,13 @@ fn sequence_trial(net: &mut Network, cfg: &RsnnConfig, classes: &[usize], trial:
             act[loc as usize] += 1.0;
         }
     }
-    (act, waves)
+    (act, waves, pots_top, eff_top)
 }
 
 /// Temporal e-prop on the L1 level-0 recurrent weights. Builds a decaying presynaptic trace per neuron
 /// over the recorded waves, correlates it with postsynaptic spikes (`e_ij = Σ_t pre_trace_i(t)·fired_j(t)`),
 /// and updates the stored weights via the symmetric-feedback learning signal.
-fn recurrent_update(net: &mut Network, cfg: &RsnnConfig, w: &[Vec<f32>], err: &[f32], waves: &[Vec<u32>], rec_layer: usize) {
+fn recurrent_update(net: &mut Network, cfg: &RsnnConfig, w: &[Vec<f32>], err: &[f32], waves: &[Vec<u32>], pots_top: &[Vec<i16>], eff_top: &[Vec<i32>], rec_layer: usize) {
     let ls = (cfg.size * cfg.size) as usize;
     let up = cfg.rec_count as usize;
     let ttot = waves.len();
@@ -652,15 +671,34 @@ fn recurrent_update(net: &mut Network, cfg: &RsnnConfig, w: &[Vec<f32>], err: &[
             l_sig[j] += cfg.rate_reg * (r_j - r_target);
         }
     }
+    // ALIF adaptation eligibility (guarded): β active only with adaptation; bump ψ implied when β>0.
+    let beta = if cfg.adapt_bump > 0 { cfg.elig_beta } else { 0.0 };
+    let use_adapt = beta != 0.0;
+    let use_bump = cfg.elig_bump_psi || use_adapt;
+    let rho = 1.0 - (2.0f32).powi(-(cfg.adapt_decay as i32));
+    let theta: Vec<f32> = net.layer_thresholds(rec_layer).iter().map(|&t| (t as f32).max(1.0)).collect();
+    // ψ_j(t): normalized bump centered at the ADAPTIVE firing threshold, else the raw spike (old behavior)
+    let psi = |t: usize, j: usize| -> f32 {
+        if use_bump {
+            (PSI_GAMMA * (1.0 - (pots_top[t][j] as f32 - eff_top[t][j] as f32).abs() / theta[j])).max(0.0)
+        } else {
+            fired[t][j]
+        }
+    };
     net.with_layer_mut(rec_layer, |l1| {
         for i in 0..ls {
             let sg = (rec_layer * ls + i) as u32; // recurrent layer's global neuron id
             for kk in 0..up {
                 let j = target_of(cfg.seed, sg, i as u32, 0, kk as u32, cfg.rec_radius, cfg.size) as usize;
-                let mut e = 0f32;
-                for t in 0..ttot {
-                    e += tr[t][i] * fired[t][j];
-                }
+                let e = if use_adapt {
+                    elig_adapt_sum(ttot, beta, rho, |t| psi(t, j), |t| tr[t][i])
+                } else {
+                    let mut s = 0f32;
+                    for t in 0..ttot {
+                        s += tr[t][i] * fired[t][j];
+                    }
+                    s
+                };
                 l1.out_shadow[i * up + kk] += -cfg.hidden_lr * l_sig[j] * e;
             }
         }
@@ -694,7 +732,7 @@ fn train_xor_inner(cfg: &RsnnConfig) -> (Network, Vec<Vec<f32>>) {
     for t in 0..cfg.trials {
         let (a, b) = pick_ab(cfg.task_seed, t);
         let label = a ^ b;
-        let (act, waves) = xor_trial(&mut net, cfg, a, b, t);
+        let (act, waves, pots_top, eff_top) = xor_trial(&mut net, cfg, a, b, t);
         let p = softmax(&score(&w, &act));
         let err: Vec<f32> = (0..2).map(|c| p[c] - if c == label { 1.0 } else { 0.0 }).collect();
         for c in 0..2 {
@@ -704,7 +742,7 @@ fn train_xor_inner(cfg: &RsnnConfig) -> (Network, Vec<Vec<f32>>) {
         }
         if cfg.rec_count > 0 {
             let rl = net.layer_count() - 1;
-            recurrent_update(&mut net, cfg, &w, &err, &waves, rl);
+            recurrent_update(&mut net, cfg, &w, &err, &waves, &pots_top, &eff_top, rl);
         }
     }
     (net, w)
@@ -721,7 +759,7 @@ pub fn train_xor(cfg: &RsnnConfig) -> u64 {
     let holdout = 400usize;
     for t in cfg.trials..cfg.trials + holdout {
         let (a, b) = pick_ab(cfg.task_seed, t);
-        let (act, _) = xor_trial(&mut net, cfg, a, b, t);
+        let (act, _, _, _) = xor_trial(&mut net, cfg, a, b, t);
         let s = score(&w, &act);
         let pred = if s[1] > s[0] { 1 } else { 0 };
         if pred == (a ^ b) {
@@ -744,7 +782,7 @@ pub fn train_sequence(cfg: &RsnnConfig, task: impl Fn(u64, usize) -> (Vec<usize>
     };
     for t in 0..cfg.trials {
         let (classes, label) = task(cfg.task_seed, t);
-        let (act, waves) = sequence_trial(&mut net, cfg, &classes, t);
+        let (act, waves, pots_top, eff_top) = sequence_trial(&mut net, cfg, &classes, t);
         let p = softmax(&score(&w, &act));
         let err: Vec<f32> = (0..2).map(|c| p[c] - if c == label { 1.0 } else { 0.0 }).collect();
         for c in 0..2 {
@@ -754,14 +792,14 @@ pub fn train_sequence(cfg: &RsnnConfig, task: impl Fn(u64, usize) -> (Vec<usize>
         }
         if cfg.rec_count > 0 {
             let rl = net.layer_count() - 1;
-            recurrent_update(&mut net, cfg, &w, &err, &waves, rl);
+            recurrent_update(&mut net, cfg, &w, &err, &waves, &pots_top, &eff_top, rl);
         }
     }
     let mut correct = 0usize;
     let holdout = 400usize;
     for t in cfg.trials..cfg.trials + holdout {
         let (classes, label) = task(cfg.task_seed, t);
-        let (act, _) = sequence_trial(&mut net, cfg, &classes, t);
+        let (act, _, _, _) = sequence_trial(&mut net, cfg, &classes, t);
         let s = score(&w, &act);
         let pred = if s[1] > s[0] { 1 } else { 0 };
         if pred == label {
@@ -1286,7 +1324,7 @@ mod tests {
             c.rate_reg = reg;
             c.rate_target_permille = 100;
             let (mut net, _w) = train_xor_inner(&c);
-            let (_, waves) = xor_trial(&mut net, &c, 1, 0, 0);
+            let (_, waves, _, _) = xor_trial(&mut net, &c, 1, 0, 0);
             let per_wave: Vec<usize> = waves.iter().map(|wv| wv.len()).collect();
             eprintln!("rate_reg {reg}: L1 spikes/wave {per_wave:?}");
         }
@@ -1773,6 +1811,26 @@ mod tests {
     }
 
     #[test]
+    fn recurrent_update_elig_on_is_deterministic_and_differs() {
+        // The recurrent-top path (train_sequence → recurrent_update) with the completed eligibility: it is a
+        // pure function of (seed, config), and turning elig_beta on changes the trained result vs. off.
+        let mut base = RsnnConfig::demo();
+        base.delay = 8;
+        base.rec_count = 8;
+        base.rec_init = 0;
+        base.rate_reg = 5.0;
+        base.trials = 300;
+        let run = |c: &RsnnConfig| train_sequence(c, |seed, t| task_parity(seed, t, 3));
+        let off = run(&base);
+        assert_eq!(off, run(&base), "default recurrent path deterministic");
+        let mut on = base.clone();
+        on.elig_beta = 0.4;
+        let a = run(&on);
+        assert_eq!(a, run(&on), "elig-on deterministic");
+        assert_ne!(a, off, "completed eligibility changes the recurrent-top result (feature is wired)");
+    }
+
+    #[test]
     fn train_sequence_is_deterministic() {
         let mut cfg = RsnnConfig::demo();
         cfg.delay = 8;
@@ -1817,8 +1875,8 @@ mod tests {
         };
         let mut n1 = build();
         let mut n2 = build();
-        let (a1, w1) = xor_trial(&mut n1, &cfg, 1, 0, 3);
-        let (a2, w2) = sequence_trial(&mut n2, &cfg, &[1, 0], 3);
+        let (a1, w1, _, _) = xor_trial(&mut n1, &cfg, 1, 0, 3);
+        let (a2, w2, _, _) = sequence_trial(&mut n2, &cfg, &[1, 0], 3);
         assert_eq!(a1, a2, "read-window activity matches xor_trial");
         assert_eq!(w1, w2, "per-wave fired-sets match xor_trial");
     }
