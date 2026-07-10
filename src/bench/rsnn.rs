@@ -376,6 +376,58 @@ fn xor_trial_layers(net: &mut Network, cfg: &RsnnConfig, a: usize, b: usize, tri
     (act, spikes, pots, effs)
 }
 
+/// Like `xor_trial_layers` but for an arbitrary cue sequence `classes` (a `delay` gap before every cue
+/// except the first), recording *every* computational layer's per-wave fired-set, decide-potential, and
+/// decide-time effective threshold. For `classes = [a, b]` (per-cue seed `trial·n + pos`) it is byte-identical
+/// to `xor_trial_layers(a, b, trial)` — see `sequence_trial_layers_matches_xor`. Lets the deep multi-layer
+/// trainer run any binary-labelled sequence task (parity, distractor, flip-flop), not just temporal XOR.
+fn sequence_trial_layers(net: &mut Network, cfg: &RsnnConfig, classes: &[usize], trial: usize) -> (Vec<f32>, Vec<Vec<Vec<u32>>>, Vec<Vec<Vec<i16>>>, Vec<Vec<Vec<i32>>>) {
+    let l = net.layer_count();
+    let ls = (cfg.size * cfg.size) as usize;
+    let n = classes.len();
+    let rec: Arc<Mutex<Vec<Vec<Vec<u32>>>>> = Arc::new(Mutex::new(vec![Vec::new(); l]));
+    for z in 1..l {
+        let r = rec.clone();
+        net.on_layer(z, Box::new(move |_w, fired: &[u32]| r.lock().unwrap()[z].push(fired.to_vec())));
+    }
+    net.reset_state();
+    let mut pots: Vec<Vec<Vec<i16>>> = vec![Vec::new(); l];
+    let mut effs: Vec<Vec<Vec<i32>>> = vec![Vec::new(); l];
+    let record = |net: &Network, pots: &mut Vec<Vec<Vec<i16>>>, effs: &mut Vec<Vec<Vec<i32>>>| {
+        for z in 1..l {
+            pots[z].push(net.layer_decide_potential(z));
+            effs[z].push(net.layer_decide_effective_threshold(z));
+        }
+    };
+    for (pos, &class) in classes.iter().enumerate() {
+        if pos > 0 {
+            for _ in 0..cfg.delay {
+                net.wave(&[]);
+                record(net, &mut pots, &mut effs);
+            }
+        }
+        for w in 0..cfg.present_waves {
+            let sites = cue_realization(cfg.task_seed, cfg.size, class, trial * n + pos, w, cfg.base_q16, cfg.keep_q16, cfg.noise_q16);
+            net.wave(&sites);
+            record(net, &mut pots, &mut effs);
+        }
+    }
+    for _ in 0..cfg.read_waves {
+        net.wave(&[]);
+        record(net, &mut pots, &mut effs);
+    }
+    net.clear_listeners();
+    let spikes = rec.lock().unwrap().clone();
+    let ttot = spikes[l - 1].len();
+    let mut act = vec![0f32; ls];
+    for wv in spikes[l - 1].iter().skip(ttot - cfg.read_waves) {
+        for &loc in wv {
+            act[loc as usize] += 1.0;
+        }
+    }
+    (act, spikes, pots, effs)
+}
+
 const P_DFA: u64 = 61; // fixed random Direct-Feedback-Alignment weights
 
 /// Fixed random ±1 DFA feedback weight for (target neuron `neuron_global`, output class `class`) —
@@ -523,6 +575,13 @@ pub fn train_eprop(cfg: &RsnnConfig) -> u64 {
 }
 
 /// Two independent input bits for trial `t` (deterministic).
+/// The temporal-XOR task as a sequence task: two independent cue bits (a, b), label = a XOR b. Passing this
+/// to the task-parameterized deep trainer reproduces the original temporal-XOR training exactly.
+fn xor_task(seed: u64, t: usize) -> (Vec<usize>, usize) {
+    let (a, b) = pick_ab(seed, t);
+    (vec![a, b], a ^ b)
+}
+
 fn pick_ab(seed: u64, t: usize) -> (usize, usize) {
     let a = (mix(key(seed, t as u32, 0, 0, 51)) & 1) as usize;
     let b = (mix(key(seed, t as u32, 0, 0, 53)) & 1) as usize;
@@ -963,7 +1022,7 @@ pub fn train_recurrent(cfg: &RsnnConfig) -> u64 {
 /// with `out_weights`. Trains every trainable weight (forward, backward, lateral, skip) via the factored
 /// temporal eligibility × (symmetric-top / DFA-deep) signal. Returns held-out permille. Used for custom
 /// topologies like the side-car; `train_recurrent` keeps its own uniform loop.
-fn train_multilayer(cfg: &RsnnConfig, mut net: Network, layer_entries: &[Vec<(i32, usize, u32)>]) -> u64 {
+fn train_multilayer(cfg: &RsnnConfig, mut net: Network, layer_entries: &[Vec<(i32, usize, u32)>], task: impl Fn(u64, usize) -> (Vec<usize>, usize)) -> u64 {
     let l = net.layer_count();
     let ls = (cfg.size * cfg.size) as usize;
     let top = l - 1;
@@ -981,9 +1040,8 @@ fn train_multilayer(cfg: &RsnnConfig, mut net: Network, layer_entries: &[Vec<(i3
     let use_bump = cfg.elig_bump_psi || use_adapt;
     let rho = 1.0 - (2.0f32).powi(-(cfg.adapt_decay as i32));
     for t in 0..cfg.trials {
-        let (a, b) = pick_ab(cfg.task_seed, t);
-        let label = a ^ b;
-        let (act, spikes, pots, effs) = xor_trial_layers(&mut net, cfg, a, b, t);
+        let (classes, label) = task(cfg.task_seed, t);
+        let (act, spikes, pots, effs) = sequence_trial_layers(&mut net, cfg, &classes, t);
         let p = softmax(&score(&w, &act));
         let err: Vec<f32> = (0..2).map(|c| p[c] - if c == label { 1.0 } else { 0.0 }).collect();
         for c in 0..2 {
@@ -1099,10 +1157,10 @@ fn train_multilayer(cfg: &RsnnConfig, mut net: Network, layer_entries: &[Vec<(i3
     let mut correct = 0usize;
     let holdout = 400usize;
     for t in cfg.trials..cfg.trials + holdout {
-        let (a, b) = pick_ab(cfg.task_seed, t);
-        let (act, _, _, _) = xor_trial_layers(&mut net, cfg, a, b, t);
+        let (classes, label) = task(cfg.task_seed, t);
+        let (act, _, _, _) = sequence_trial_layers(&mut net, cfg, &classes, t);
         let s = score(&w, &act);
-        if (if s[1] > s[0] { 1 } else { 0 }) == (a ^ b) {
+        if (if s[1] > s[0] { 1 } else { 0 }) == label {
             correct += 1;
         }
     }
@@ -1122,12 +1180,20 @@ pub fn train_sidecar(cfg: &RsnnConfig) -> u64 {
         vec![(0i32, n, r), (1i32, n, r)], // L2: self + forward
         vec![(-1i32, n, r)],        // L3: backward
     ];
-    train_multilayer(cfg, net, &layer_entries)
+    train_multilayer(cfg, net, &layer_entries, xor_task)
 }
 
 /// Train the clean hidden-recurrent stack (see `engine_config_hidden_rec`) on temporal XOR; permille.
 /// Forward weights get per-neuron `rate_reg` (liveness); L2's level-0 recurrence gets per-layer `rec_stab`.
 pub fn train_hidden_rec(cfg: &RsnnConfig) -> u64 {
+    train_hidden_rec_task(cfg, xor_task)
+}
+
+/// Same deep hidden-recurrent stack, on an arbitrary **binary-labelled sequence task** (parity, distractor,
+/// flip-flop, XOR). All forward layers are trained via multi-layer DFA; L2 carries the trained level-0
+/// recurrence. This is the deep-forward-trained + recurrence combination the recurrence-null doc flagged as
+/// the missing fair test.
+pub fn train_hidden_rec_task(cfg: &RsnnConfig, task: impl Fn(u64, usize) -> (Vec<usize>, usize)) -> u64 {
     let mut net = Network::new(cfg.engine_config_hidden_rec());
     net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
     let (uc, ur) = (cfg.up_count as usize, cfg.up_radius);
@@ -1139,7 +1205,7 @@ pub fn train_hidden_rec(cfg: &RsnnConfig) -> u64 {
         l2,                   // L2 (forward + level-0 recurrence)
         vec![],               // L3 (read, no outgoing)
     ];
-    train_multilayer(cfg, net, &layer_entries)
+    train_multilayer(cfg, net, &layer_entries, task)
 }
 
 /// Train the L0→L1→L2 stack with the L2↔L3 loop (see `engine_config_l2l3loop`) on temporal XOR; permille.
@@ -1155,7 +1221,7 @@ pub fn train_l2l3loop(cfg: &RsnnConfig) -> u64 {
         vec![(0i32, n, r), (1i32, n, r)], // L2: self + forward
         vec![(-1i32, n, r)],              // L3: backward
     ];
-    train_multilayer(cfg, net, &layer_entries)
+    train_multilayer(cfg, net, &layer_entries, xor_task)
 }
 
 #[cfg(test)]
@@ -2278,6 +2344,29 @@ mod tests {
         let (a2, w2, _, _) = sequence_trial(&mut n2, &cfg, &[1, 0], 3);
         assert_eq!(a1, a2, "read-window activity matches xor_trial");
         assert_eq!(w1, w2, "per-wave fired-sets match xor_trial");
+    }
+
+    #[test]
+    fn sequence_trial_layers_matches_xor_on_two_cues() {
+        // The all-layer recorder must reproduce xor_trial_layers exactly for a 2-cue [a, b] sequence — this is
+        // what makes train_hidden_rec(cfg) == train_hidden_rec_task(cfg, xor_task) byte-identical.
+        let mut cfg = RsnnConfig::demo();
+        cfg.size = 8;
+        cfg.layers = 4;
+        cfg.delay = 12;
+        let build = || {
+            let mut net = Network::new(cfg.engine_config_hidden_rec());
+            net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
+            net
+        };
+        let mut n1 = build();
+        let mut n2 = build();
+        let (a1, s1, p1, e1) = xor_trial_layers(&mut n1, &cfg, 1, 0, 3);
+        let (a2, s2, p2, e2) = sequence_trial_layers(&mut n2, &cfg, &[1, 0], 3);
+        assert_eq!(a1, a2, "read-window activity matches");
+        assert_eq!(s1, s2, "per-wave fired-sets match across all layers");
+        assert_eq!(p1, p2, "per-wave decide potentials match");
+        assert_eq!(e1, e2, "per-wave decide effective thresholds match");
     }
 
     #[test]
