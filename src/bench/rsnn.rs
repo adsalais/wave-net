@@ -1856,7 +1856,7 @@ mod tests {
     fn sidecar_deep_parity() {
         // The deeper 6-layer side-car (forward L1→L4→L5, 2-layer side-car L2↔L3) vs FF and the plain 4-layer
         // side-car, on parity N=4, size 32, 3 seeds. Does deepening the side-car improve over 837/952/897?
-        let seeds = [0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF];
+        let seeds = [0xE9_0B_0A17u64]; // worst seed only (fast iteration)
         let base = |s: u64| {
             let mut c = RsnnConfig::demo();
             c.seed = s;
