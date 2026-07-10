@@ -20,9 +20,10 @@ So the project moved from "pure procedural, train thresholds" to the **GeNN hybr
 
 **Current state:** that hybrid *works*. A **feed-forward + ALIF** network with e-prop / multi-layer-DFA
 credit is a **reliable learner** (held-out, multi-seed), usable to ~16 layers, and `rate_reg` reliably keeps
-deep stacks alive. **Recurrence is the one open problem** — an exhaustive campaign (see Learning below)
-showed trained recurrence never earns its keep and actively harms a working baseline, leaving
-surrogate-gradient BPTT as the only untried lever.
+deep stacks alive. **Trained recurrence now also works** — once e-prop's ALIF adaptation eligibility is
+completed — in the deep + wide + sub-critical-density regime, where it beats feed-forward on a headroom task
+(parity N=4). Pushing it to a *robust* multi-seed win is the open problem (see Learning below). **BPTT is out
+of scope — permanently; do not propose it.**
 
 ## The three modules (read this before touching code)
 
@@ -125,9 +126,10 @@ criticality) calibration is unsolved — see the recurrence null in `docs/experi
 ## Learning: what is built, and what it found
 
 The learning rules live in `bench/` (chiefly `bench::rsnn`), not in the engine. Treat
-`docs/experiments_results.md` as the **source of truth** for findings. **Bottom line after an exhaustive
-campaign: the substrate's *working* learner is wide + shallow + feed-forward + ALIF; recurrence is an
-airtight null and remains the one open problem (short of BPTT).** Headline results:
+`docs/experiments_results.md` as the **source of truth** for findings. **Bottom line: wide + deep +
+feed-forward + ALIF with multi-layer-DFA credit is the reliable learner; trained recurrence works too — with
+the completed ALIF eligibility, in the deep + wide + sub-critical-density regime — and beats feed-forward on
+a headroom task (robust multi-seed superiority is the open problem).** Headline results:
 
 - **The working learner — e-prop on stored weights + trained readout, feed-forward + ALIF (the good
   result).** A factored per-neuron eligibility (`e = pre-trace × ψ`, both O(neurons) engine state) × a
@@ -159,8 +161,8 @@ airtight null and remains the one open problem (short of BPTT).** Headline resul
   eligibility **consistently beats the crude rule** where recurrence is trainable (edge largest at light
   density / small width), and on a **headroom task — parity N=4 (FF ≈ 620, not saturated) — trained
   recurrence beats FF on 2/3 seeds** (687 vs 680, 642 vs 637). First time recurrence out-performs
-  feed-forward here. **Open:** robustness on the hardest seed; more depth / a 2nd recurrent layer / side-car
-  topology / β·`PSI_WIDTH` tuning; BPTT. See `docs/experiments_results.md`.
+  feed-forward here. **Open:** robustness on the hardest seed — more depth / a 2nd recurrent layer / side-car
+  topology / more width+rec_count / β·`elig_psi_width` tuning. See `docs/experiments_results.md`.
 
 ## Reading & training: the multi-wave rule
 
