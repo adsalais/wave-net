@@ -1885,6 +1885,47 @@ mod tests {
 
     #[test]
     #[ignore] // expensive; run manually in --release
+    fn sidecar_uniform_params() {
+        // Both side-cars with UNIFORM synapse params for EVERY layer/group — count 16, radius 3 (forward and
+        // side-car alike), removing the forward-vs-side-car confound. parity N=4, size 32, 3 seeds. FF for
+        // reference. (rec_count 16 at size 32 ≈ 1.6% density — comfortably sub-critical.)
+        let seeds = [0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF];
+        let base = |s: u64| {
+            let mut c = RsnnConfig::demo();
+            c.seed = s;
+            c.task_seed = s;
+            c.size = 32;
+            c.delay = 8;
+            c.trials = 1500;
+            c.rate_reg = 5.0;
+            c.rate_target_permille = 100;
+            c.rec_stab = 5.0;
+            c.rec_tau = 20.0;
+            c.elig_beta = 0.4;
+            // uniform: same count + radius on forward and side-car groups
+            c.up_count = 16;
+            c.up_radius = 3;
+            c.rec_count = 16;
+            c.rec_radius = 3;
+            c
+        };
+        let (mut wf, mut ws, mut wd) = (1000u64, 1000u64, 1000u64);
+        for &s in &seeds {
+            let mut ff = base(s);
+            ff.rec_count = 0;
+            let fa = train_hidden_rec_task(&ff, |seed, t| task_parity(seed, t, 4));
+            let sa = train_sidecar_task(&base(s), |seed, t| task_parity(seed, t, 4));
+            let da = train_sidecar_deep_task(&base(s), |seed, t| task_parity(seed, t, 4));
+            eprintln!("seed {s:#x}  FF {fa}  sidecar {sa}  sidecar-deep {da}");
+            wf = wf.min(fa);
+            ws = ws.min(sa);
+            wd = wd.min(da);
+        }
+        eprintln!("WORST (uniform 16/r3):  FF {wf}  sidecar {ws}  sidecar-deep {wd}");
+    }
+
+    #[test]
+    #[ignore] // expensive; run manually in --release
     fn sidecar_verify() {
         // Verify the side-car win (one-seed sweep found sidecar 837 vs FF ~590 on parity N=4) across 3 seeds,
         // and the stacked config (side-car + β 1.2 + W 8, the three levers that each helped). vs FF and the
