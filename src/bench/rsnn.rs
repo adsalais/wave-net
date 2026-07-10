@@ -1875,13 +1875,12 @@ mod tests {
         let mut ff = base();
         ff.rec_count = 0;
         eprintln!("FF {}", train_hidden_rec_task(&ff, |seed, t| task_parity(seed, t, 4)));
-        for (rc, rr) in [(32u32, 5u32)] {
+        for (rc, rr) in [(16u32, 4u32)] {
             let mut c = base();
             c.rec_count = rc;
             c.rec_radius = rr;
             let sa = train_sidecar_task(&c, |seed, t| task_parity(seed, t, 4));
-            let da = train_sidecar_deep_task(&c, |seed, t| task_parity(seed, t, 4));
-            eprintln!("rec {rc}/r{rr}  sidecar {sa}  sidecar-deep {da}");
+            eprintln!("rec {rc}/r{rr}  compact sidecar {sa}");
         }
     }
 
