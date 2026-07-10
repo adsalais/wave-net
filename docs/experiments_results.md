@@ -58,7 +58,10 @@ topology that isolates the recurrent layer from the forward path**. The winning 
 backward-fed **side-car** (`train_sidecar_task`, `engine_config_sidecar`): the forward signal **skips past**
 the recurrent layer (L1 → L3 via a +2 skip) while a separate **recurrent scratchpad** (L2: self-loop + a
 L2→L3 forward, with L3 feeding L2 back) holds state alongside — so the loop computes *without* injecting its
-reverberation into the clean forward projection.
+reverberation into the clean forward projection. *(These numbers are the original **direct-read** side-car —
+the readout reads the recurrent layer **L3 directly**, so L3 is the top layer with clean symmetric feedback.
+The code's `engine_config_sidecar` has since been extended with a dedicated read layer L4 for the scaling
+study below; reading L3 directly scored higher — see "Scaling study".)*
 
 **Result (size 32, worst-seed / 3 seeds) — a strict improvement over feed-forward on every benchmark:**
 
@@ -97,3 +100,46 @@ scratchpad + backward loop) is what unlocks it — working hypothesis: isolating
 keeps the class projection clean while the scratchpad holds temporal state (a hypothesis to check against the
 LSNN/e-prop literature). Tools: `train_sidecar_task` / `train_hidden_rec_task` / `sequence_trial_layers`,
 `elig_beta` / `elig_bump_psi` / `elig_psi_width`, `hidden_rec_depth`.
+
+## Scaling study (in progress) — forward drive, width, and read-layer topology
+
+**Status: ongoing systematic exploration, mostly single-seed / preliminary** — the single-threaded integer
+engine is too slow to run these sweeps multi-seed at the sizes needed. Recorded so the direction survives;
+*re-verify multi-seed once the engine is faster.*
+
+**Topology note (direct-read vs read-layer).** The robust headline result above (parity N=4 = 837, plus
+XOR/flip-flop/distractor) is the **direct-read** side-car — readout on the recurrent layer **L3 directly** (L3
+is the top layer → clean symmetric readout feedback). The code's `engine_config_sidecar` now instead has a
+**dedicated read layer L4** (`… L3 → L4 (+1); L4 read`) — the *read-layer variant* used for this study.
+Reading L3 directly scored **higher** (parity N=4, same params: direct-read **837** vs read-layer **~700–765**
+single-seed): a separate read layer **demotes** the recurrent layer from symmetric feedback to noisy DFA
+(≈ −200). So *reading the recurrent computation directly is itself load-bearing.* The read-layer variant is
+kept because it cleanly separates "readout" from "computation" for the parameter sweeps.
+
+**Forward drive × width (read-layer variant, parity N=4, rec 16/r4, single seed 0xE9…):**
+
+| size ↓ / up_count → | 8 | 16 | 32 | 64 |
+|---|---|---|---|---|
+| 16 (256) | 540 | 540 | 557 | 560 |
+| 32 (1024) | 540 | 540 | 712 | 710 |
+| 64 (4096) | 540 | 542 | 697 | **765** |
+
+Three relationships (preliminary):
+- **Per-neuron forward-drive threshold ≈ up_count 32** (at radius 3), roughly **width-independent** — below
+  it *everything* is chance. `up_count` is synapses/neuron into a fixed window, so it's a per-neuron drive
+  switch, not a total-count one.
+- **Width is a capacity floor** — size 16 (256) never leaves chance; ≥ size 32 (1024) is needed to have a
+  working regime at all.
+- **Above both bars, width × forward scale *jointly*** — size 64 + up 64 (765) beats either lever alone
+  (~710). It's an AND, not a sum, and hasn't plateaued (size/up 128 may keep climbing).
+
+**Recurrence density** wants to stay **sparse** — rec_count ≈ 8–16 is the sweet spot (16 slightly best at high
+forward drive); rec_count 32 goes super-critical and collapses toward chance (radius trades against count:
+wider radius lowers local density and partly rescues a high count). **Depth hurts** — every deeper (6-layer)
+side-car variant underperformed the compact one (DFA credit noise + propagation lag + starved deep read
+layers), across couplings, an L3 self-loop, and forward/recurrence density tuning.
+
+**Direction:** harder / deeper recurrent computation appears to need **more width + more forward drive
+together**, and the **forward topology** (skip distances, where the side-car couples) is a large untested
+axis. **Immediate blocker → next step: engine performance optimization** (the single-threaded integer engine
+can't run these sweeps multi-seed at size ≥ 64), then resume the systematic scaling / forward-topology study.
