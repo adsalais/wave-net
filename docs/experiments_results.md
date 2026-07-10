@@ -518,3 +518,85 @@ is *no working baseline without ALIF* to test it on (489). Recurrence has **no r
 crude e-prop where it earns its keep, ALIF is essential, and **surrogate-gradient BPTT (proper temporal
 credit) is the sole remaining lever** — every substrate/stabilizer/topology/neuron-model confound is now
 ruled out.
+
+## Completing the ALIF adaptation eligibility — the credit rule *was* incomplete, and it still doesn't rescue recurrence
+
+> **Correction to the verdict above.** "Every confound ruled out … BPTT is the sole remaining lever" was
+> **premature on one axis**: the *credit rule itself was never complete*. All recurrence experiments above used
+> a **crude spike-timing eligibility** — only the fast membrane term `e_ij = Σ_t εᵛ_i(t)·ψ_j(t)`, with `ψ`
+> the hard spike. Textbook e-prop for **ALIF** neurons (Bellec et al. 2020, Eq. 24–25) has a **second**
+> component — the **adaptation eligibility** `εᵃ`, recursed at the *slow* adaptation rate `ρ`, entering as
+> `e = ψ·(εᵛ − β·εᵃ)`. That term is exactly what carries credit over the ~64-wave adaptation horizon (the
+> substrate's actual delay-memory), and it **was never implemented**. This section builds it faithfully
+> (`bench::rsnn`, guarded behind `RsnnConfig.elig_beta`/`elig_bump_psi`; a decide-time effective-threshold
+> snapshot `Layer.decide_eff` in the engine) and re-runs the ALIF recurrence benchmarks.
+
+**Two implementation bugs found and fixed on the way (both would have faked a result).** A first cut looked
+like it *helped* recurrence — it was an artifact:
+
+1. **ψ read the effective threshold post-wave.** `eff = baseline + adapt` was sampled *after* the wave, but a
+   fire **bumps `adapt` by ~`adapt_bump` during that wave** — so the recorded `eff` was ~20 too high and the
+   at-spike overshoot `v−eff` read as **−16** (impossible; a spike has `v ≥ eff`). Fixed by snapshotting the
+   **decide-time** `eff` in the engine (before the fire-bump), paired with `decide_potential`.
+2. **ψ normalized by θ = baseline**, which calibration floors to ~1, while integer ±1 drive makes potentials
+   overshoot `eff` by **O(2–26)** at a spike. So `ψ = γ·max(0,1−|v−eff|/θ)` collapsed to **~0 everywhere**
+   (>99% of entries), silently disabling the eligibility **and** `rate_reg` (which is carried by the same
+   eligibility). Fixed with a **fixed-width band** `PSI_WIDTH=16` matched to the potential scale (the engine's
+   own working `elig_post` uses `PSI_BAND=8`; deeper layers overshoot more) → ψ non-degenerate for 70–100% of
+   spikes. With the degenerate ψ, `elig_beta>0` merely *disabled* recurrent learning (leaving the less-harmful
+   ±1 init), which *looked* like an improvement (parity 562→700). The corrected ψ removes that confound.
+
+**Result 1 — parity (the informative test: read layer alive, eligibility verified to engage), size 16, 3
+seeds.** Four columns isolate *what* about recurrence helps or hurts — **FF** (no recurrence, trained
+forward); **fixed-rec** (±1 recurrence, `hidden_lr 0` — untrained reservoir + trained readout, a classic
+LSM); **crude-rec** (recurrence trained via the spike-ψ eligibility); **completed-rec** (trained via the
+faithful ALIF `e = ψ·(εᵛ − β·εᵃ)`, `elig_beta 0.4`). Worst-seed:
+
+| N | FF | fixed-rec (readout only) | crude-rec | completed-rec |
+|---|---|---|---|---|
+| 3 | **980** | **950** | 542 | 617 |
+| 4 | **900** | **817** | 487 | 472 |
+
+The result is clean and it **relocates the blocker**: the **fixed random recurrence is a strong reservoir**
+(950 / 817, right behind FF) — recurrence is *not* useless. What craters performance is **training the
+recurrent weights**: e-prop drops it from 950 → ~550, and **completing the ALIF eligibility does not fix
+this** — `completed ≈ crude`, both cratering (N=3 617 vs 542, N=4 472 vs 487; per-seed mixed, no consistent
+edge). The eligibility is verifiably *engaged*, not a no-op: an L2 magnitude probe shows `Σ|e|` differs
+between the rules (forward 5188 crude vs 7145 completed; recurrent 16680 vs 6155,
+`_diag_fair_elig_magnitude`). So the credit *is* flowing differently — it just doesn't help, because e-prop's
+factorized credit (itself only *approaching* BPTT) pushes the recurrent weights off the good random operating
+point rather than toward a better one. (Earlier size-8 numbers hinted "completed slightly ≤ crude"; the
+size-16 multi-seed picture shows they are effectively tied — both destroy the reservoir.)
+
+**Result 2 — fair hidden-rec test (the 986→498 null): byte-identical across `elig_beta ∈ {0, 0.1, 0.2, 0.4}`,
+because that config is inert to *all* hidden training.** A `hidden_lr` × `elig_beta` probe is decisive:
+`hidden_lr 0` (no hidden training at all) gives **475**, identical to `hidden_lr 0.02, elig_beta 2.0` — every
+combination is **475** (`_diag_fair_hidden_lr_sensitivity`). So held-out here is set *entirely* by the readout
+on the recurrence-collapsed reservoir, independent of any hidden weights; a differing `e` (the eligibility
+*does* engage) cannot move a number that hidden training cannot move. This is the **reservoir-collapse**
+blocker — the ±1 recurrence erases the class signal from the read layer — **downstream of and orthogonal to**
+the credit rule. Byte-identical-across-β is therefore *expected*, not a bug.
+
+**Corrected verdict.** Completing the credit rule was the right thing to rule out, and it is now ruled out:
+the eligibility matches Bellec 2020 (Eq. 24–25, cross-checked against the official implementation) and is
+verified to engage on-substrate, yet it **does not make trained recurrence earn its keep anywhere** — fixed
+recurrence beats trained recurrence, FF beats both, and the fair-test collapse is untouched. The earlier
+"only BPTT left, every confound ruled out" was premature *because the credit rule was incomplete*; with it
+completed, the honest picture is **two separated, still-open blockers**:
+
+- **(a) Training the recurrence is destructive.** Fixed random recurrence is a good reservoir; e-prop
+  training (crude *or* complete) craters it. The lever is either **don't train the loop** (use it as a fixed
+  reservoir — which already works) or **exact temporal credit (surrogate-gradient BPTT)** in place of
+  e-prop's approximation.
+- **(b) Reservoir collapse in the deep hidden-rec regime.** The ±1 recurrence drives the read layer to a
+  class-agnostic chance state; needs recurrent-gain control (σ≈1) so the loop neither dies nor runs away —
+  independent of the credit rule.
+
+**Scope / limitations:** `elig_beta ∈ {0.1, 0.2, 0.4}` (plus a `2.0` spot-check on the inert config),
+`PSI_WIDTH = 16`, `rec_tau` for εᵛ rather than the true membrane α, and `z(t)` rather than `z(t−1)` in the
+pre-trace — the eligibility *structure* is faithful (εᵃ recursion, `−β·εᵃ` sign, ρ from the substrate's real
+adaptation decay), but W, β, and the εᵛ time-constant are not exhaustively swept, and the `elig_bump_psi`
+ablation (bump-ψ without εᵃ) was not run. The completed eligibility, the decide-time `eff` snapshot
+(`Layer.decide_eff`), and the `elig_beta` / `elig_bump_psi` knobs are now in place for a future BPTT
+comparison and for a "fixed vs trained recurrence" study — the latter being the more promising near-term lead
+(fixed recurrence *works*).

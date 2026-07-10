@@ -148,15 +148,20 @@ airtight null and remains the one open problem (short of BPTT).** Headline resul
   computation (XOR) feed-forward — LIF wins those short tasks — **but it is *necessary* for deep-FF
   propagation** (removing it kills the deep stack; `rate_reg` can't revive LIF). Calibration = a one-time
   sensible init; ALIF owns the operating point during a run.
-- **Recurrence is an airtight null — the sole open problem, and only BPTT is left to try.** Across an
-  exhaustive matrix — lateral (`level 0`), backward (`level −1/−2`), skip/side-car and hidden-recurrent
-  topologies, sparse and dense, shallow and deep, ALIF and LIF, XOR/parity/distractor/flip-flop, with and
-  without `rate_reg`, and with a class-preserving per-layer stabilizer (`rec_stab`) — trained recurrence via
-  the crude spike-timing e-prop **never earns its keep, and on a *working* baseline it actively destroys the
-  signal** (986 → chance). Every substrate / stabilizer / topology / neuron-model confound is ruled out, so
-  the blocker is the **credit rule**; the sole remaining lever is **surrogate-gradient BPTT** (proper
-  temporal credit), a heavy un-built option. (Earlier "sustaining dynamics" / "ψ is the blocker" readings
-  are superseded — see the doc.)
+- **Recurrence: the blocker is not the credit rule (now completed) — it is that *training* the loop is
+  destructive; the *fixed* random recurrence already works.** e-prop's **ALIF adaptation eligibility** `εᵃ`
+  (`e = ψ·(εᵛ − β·εᵃ)`, Bellec 2020) — missing from the earlier crude spike-timing rule — is now built and
+  verified (`RsnnConfig.elig_beta`/`elig_bump_psi`; decide-time `eff` snapshot `Layer.decide_eff`;
+  fixed-width bump ψ; two ψ bugs found and fixed, see the doc). Completing it **does not rescue recurrence**.
+  The clean size-16 parity result (worst-seed): **FF 980, fixed-rec 950 (±1 recurrence, readout only —
+  untrained!), crude-trained 542, completed-trained 617** (N=3; N=4: 900 / 817 / 487 / 472). So fixed random
+  recurrence is a *strong* reservoir, and e-prop **training** of the recurrent weights craters it — crude and
+  completed alike (they tie; the εᵃ term verifiably *engages*, `Σ|e|` differs, it just doesn't help). The
+  hidden-rec "fair" test stays byte-identical across β because that config is inert to *all* hidden training
+  (`hidden_lr 0` == `hidden_lr 0.02` == 475 — reservoir collapse, orthogonal to the credit rule). **Two
+  separated open levers:** (a) don't train the loop (fixed reservoir works) or use exact temporal credit
+  (**surrogate-gradient BPTT**) instead of e-prop's approximation; (b) recurrent-gain control (σ≈1) to stop
+  the deep hidden-rec collapse. See `docs/experiments_results.md`.
 
 ## Reading & training: the multi-wave rule
 
@@ -248,6 +253,3 @@ baselines; `adapt` is Q12 fixed point so its geometric decay stays exponential (
 valid only while `adapt_decay <= ADAPT_SHIFT` (`Config::validate` enforces it); a `Layer` is a
 self-contained, persistable unit (owns its structure, thresholds, and stored weights) — serialization
 itself is not yet built.
-
-
-trained forward-projection + recurrence
