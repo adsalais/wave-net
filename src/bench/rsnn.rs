@@ -1641,6 +1641,100 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // expensive; run manually in --release
+    fn deep_density_sweep() {
+        // Deep 4-layer (train_hidden_rec), temporal XOR delay 20, size 16. Map trained recurrence vs
+        // recurrence density (rec_count on L2): where is it trainable, where does it collapse, and where does
+        // the completed ALIF eligibility (elig_beta 0.4) beat the crude spike-ψ (elig_beta 0)? 3 seeds, worst.
+        let seeds = [0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF];
+        let base = |s: u64| {
+            let mut c = RsnnConfig::demo();
+            c.seed = s;
+            c.task_seed = s;
+            c.size = 16;
+            c.up_count = 16;
+            c.delay = 20;
+            c.trials = 1500;
+            c.rate_reg = 5.0;
+            c.rate_target_permille = 100;
+            c.rec_radius = 4;
+            c.rec_tau = 20.0;
+            c.rec_stab = 5.0;
+            c
+        };
+        let ff: Vec<u64> = seeds
+            .iter()
+            .map(|&s| {
+                let mut c = base(s);
+                c.rec_count = 0;
+                train_hidden_rec(&c)
+            })
+            .collect();
+        eprintln!("deep-FF (size 16) worst {}  {ff:?}", ff.iter().min().unwrap());
+        for rc in [4u32, 8, 12, 16, 24] {
+            let (mut wc, mut wm) = (1000u64, 1000u64);
+            for &s in &seeds {
+                let mut cru = base(s);
+                cru.rec_count = rc;
+                cru.elig_beta = 0.0;
+                let mut com = base(s);
+                com.rec_count = rc;
+                com.elig_beta = 0.4;
+                let (ca, ma) = (train_hidden_rec(&cru), train_hidden_rec(&com));
+                eprintln!("density rc {rc} seed {s:#x}  crude {ca}  completed {ma}");
+                wc = wc.min(ca);
+                wm = wm.min(ma);
+            }
+            eprintln!("density rc {rc} WORST:  crude {wc}  completed {wm}");
+        }
+    }
+
+    #[test]
+    #[ignore] // expensive; run manually in --release
+    fn deep_size_sweep() {
+        // Deep 4-layer, temporal XOR delay 20, rec_count 8 (the trainable density from deep_fixed_vs_trained).
+        // Vary layer width (size 8/16/32 = 64/256/1024 neurons/layer). Does more width help TRAINED recurrence,
+        // and does the completed eligibility's edge over crude hold/grow? FF / crude / completed, 3 seeds,
+        // worst. Caveat: up_count (16) and rec_radius (4) are held fixed, so their *relative* density shrinks
+        // with size (radius 4 is full-coverage at size 8, local at size 32) — an exploratory first look.
+        let seeds = [0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF];
+        for size in [8u32, 16, 32] {
+            let base = |s: u64| {
+                let mut c = RsnnConfig::demo();
+                c.seed = s;
+                c.task_seed = s;
+                c.size = size;
+                c.up_count = 16;
+                c.delay = 20;
+                c.trials = 1500;
+                c.rate_reg = 5.0;
+                c.rate_target_permille = 100;
+                c.rec_radius = 4;
+                c.rec_tau = 20.0;
+                c.rec_stab = 5.0;
+                c
+            };
+            let (mut wf, mut wc, mut wm) = (1000u64, 1000u64, 1000u64);
+            for &s in &seeds {
+                let mut ff = base(s);
+                ff.rec_count = 0;
+                let mut cru = base(s);
+                cru.rec_count = 8;
+                cru.elig_beta = 0.0;
+                let mut com = base(s);
+                com.rec_count = 8;
+                com.elig_beta = 0.4;
+                let (fa, ca, ma) = (train_hidden_rec(&ff), train_hidden_rec(&cru), train_hidden_rec(&com));
+                eprintln!("size {size} seed {s:#x}  FF {fa}  crude {ca}  completed {ma}");
+                wf = wf.min(fa);
+                wc = wc.min(ca);
+                wm = wm.min(ma);
+            }
+            eprintln!("size {size} WORST:  FF {wf}  crude {wc}  completed {wm}");
+        }
+    }
+
+    #[test]
     #[ignore] // temp diagnostic
     fn _diag_fair_hidden_lr_sensitivity() {
         // Is the fair +rec held-out sensitive to hidden training AT ALL? If (hidden_lr 0) == (hidden_lr>0) and
