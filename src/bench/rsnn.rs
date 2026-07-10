@@ -184,10 +184,11 @@ impl RsnnConfig {
         Config { seed: self.seed, size: self.size, layers }
     }
 
-    /// Deeper side-car (6 layers): the forward path is L0→L1→L4→L5 (L1 **skips** the side-car via +3), and the
-    /// side-car is a **2-layer** recurrent branch L2↔L3 that enters from L1 (+1) and rejoins the forward path
-    /// at L4 (L3 → L4, +1). L5 is read. Extends `engine_config_sidecar`'s single-layer scratchpad to a 2-layer
-    /// loop with a longer forward skip.
+    /// Deeper side-car (6 layers): forward path L0→L1→L4→L5 (L1 **skips** the side-car via +3), with the
+    /// **2-layer** recurrent scratchpad L2↔L3 hanging off the **pre-read layer L4** — L4 drives it backward
+    /// (L4 → L2, −2), it loops internally (L2→L3, L3→L2), and writes back forward (L3 → L4, +1). L5 is read.
+    /// This mirrors the original single-layer side-car (scratchpad hangs off the read-adjacent layer, driven
+    /// backward, writes forward), extended to a 2-layer loop with a longer forward skip.
     fn engine_config_sidecar_deep(&self) -> Config {
         let mk = |topology| LayerConfig {
             topology,
@@ -203,20 +204,20 @@ impl RsnnConfig {
         let (n, r) = (self.rec_count, self.rec_radius);
         let layers = vec![
             mk(vec![TopologyLevel { level: 1, radius: ur, count: uc }]), // L0 input → L1
-            mk(vec![
-                TopologyLevel { level: 3, radius: ur, count: uc }, // L1 → L4 (forward, skip the side-car)
-                TopologyLevel { level: 1, radius: r, count: n },   // L1 → L2 (side-car entry)
-            ]),
+            mk(vec![TopologyLevel { level: 3, radius: ur, count: uc }]), // L1 → L4 (forward, skip the side-car)
             mk(vec![
                 TopologyLevel { level: 0, radius: r, count: n }, // L2 self-recurse
                 TopologyLevel { level: 1, radius: r, count: n }, // L2 → L3
             ]),
             mk(vec![
-                TopologyLevel { level: 1, radius: r, count: n },  // L3 → L4 (side-car rejoins forward)
+                TopologyLevel { level: 1, radius: r, count: n },  // L3 → L4 (side-car writes back to forward)
                 TopologyLevel { level: -1, radius: r, count: n }, // L3 → L2 (loop back)
             ]),
-            mk(vec![TopologyLevel { level: 1, radius: ur, count: uc }]), // L4 → L5 (forward to read)
-            mk(vec![]),                                                  // L5 read (top)
+            mk(vec![
+                TopologyLevel { level: 1, radius: ur, count: uc }, // L4 → L5 (forward to read)
+                TopologyLevel { level: -2, radius: r, count: n },  // L4 → L2 (drive the side-car backward)
+            ]),
+            mk(vec![]), // L5 read (top)
         ];
         Config { seed: self.seed, size: self.size, layers }
     }
@@ -1248,10 +1249,10 @@ pub fn train_sidecar_deep_task(cfg: &RsnnConfig, task: impl Fn(u64, usize) -> (V
     // per-layer entries, matching engine_config_sidecar_deep's topology order exactly
     let layer_entries = vec![
         vec![(1i32, uc, ur)],              // L0: +1 → L1
-        vec![(3i32, uc, ur), (1i32, n, r)], // L1: +3 skip → L4, +1 → L2 (side-car entry)
+        vec![(3i32, uc, ur)],              // L1: +3 skip → L4
         vec![(0i32, n, r), (1i32, n, r)],  // L2: self, +1 → L3
-        vec![(1i32, n, r), (-1i32, n, r)], // L3: +1 → L4 (rejoin), -1 → L2 (loop)
-        vec![(1i32, uc, ur)],              // L4: +1 → L5
+        vec![(1i32, n, r), (-1i32, n, r)], // L3: +1 → L4 (write back), -1 → L2 (loop)
+        vec![(1i32, uc, ur), (-2i32, n, r)], // L4: +1 → L5, -2 → L2 (drive side-car)
         vec![],                            // L5: read
     ];
     train_multilayer(cfg, net, &layer_entries, task)
