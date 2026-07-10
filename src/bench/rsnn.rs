@@ -1735,6 +1735,59 @@ mod tests {
 
     #[test]
     #[ignore] // expensive; run manually in --release
+    fn parity_improve_sweep() {
+        // ONE-SEED exploration (the hard seed 0xE9_0B_0A17, where deep-parity N=4 had completed 560 < FF 620).
+        // Goal: push trained recurrence ABOVE FF by varying depth / rec_count / β / bump-width / topology.
+        // Each variant prints its completed-εᵃ held-out; FF baseline for reference.
+        let s = 0xE9_0B_0A17u64;
+        let base = || {
+            let mut c = RsnnConfig::demo();
+            c.seed = s;
+            c.task_seed = s;
+            c.size = 32;
+            c.up_count = 16;
+            c.delay = 8;
+            c.trials = 1500;
+            c.rate_reg = 5.0;
+            c.rate_target_permille = 100;
+            c.rec_radius = 4;
+            c.rec_tau = 20.0;
+            c.rec_stab = 5.0;
+            c.rec_count = 8;
+            c.elig_beta = 0.4;
+            c
+        };
+        let run = |c: &RsnnConfig| train_hidden_rec_task(c, |seed, t| task_parity(seed, t, 4));
+        let mut ff = base();
+        ff.rec_count = 0;
+        eprintln!("FF baseline (d4 s32): {}", run(&ff));
+        eprintln!("A baseline  (d4 s32 rc8 β0.4 W16): {}", run(&base()));
+        let mut b = base();
+        b.hidden_rec_depth = 5;
+        eprintln!("B depth 5:   {}", run(&b));
+        let mut d = base();
+        d.rec_count = 12;
+        eprintln!("C rc 12:     {}", run(&d));
+        let mut e = base();
+        e.rec_count = 16;
+        eprintln!("D rc 16:     {}", run(&e));
+        let mut f = base();
+        f.elig_beta = 0.8;
+        eprintln!("E β 0.8:     {}", run(&f));
+        let mut g = base();
+        g.elig_beta = 1.2;
+        eprintln!("F β 1.2:     {}", run(&g));
+        let mut h = base();
+        h.elig_psi_width = 32.0;
+        eprintln!("G W 32:      {}", run(&h));
+        let mut i = base();
+        i.elig_psi_width = 8.0;
+        eprintln!("H W 8:       {}", run(&i));
+        eprintln!("I sidecar (s32 rc8): {}", train_sidecar_task(&base(), |seed, t| task_parity(seed, t, 4)));
+    }
+
+    #[test]
+    #[ignore] // expensive; run manually in --release
     fn deep_parity() {
         // Parity N=3/4 on the DEEP 4-layer hidden-rec architecture (all forward layers trained via multi-layer
         // DFA, recurrence on L2), size 32, rec_count 8. Parity N≥3 is non-monotone — a task with HEADROOM that
