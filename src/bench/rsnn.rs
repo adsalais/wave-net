@@ -1854,33 +1854,32 @@ mod tests {
     #[test]
     #[ignore] // expensive; run manually in --release
     fn sidecar_deep_parity() {
-        // The deeper 6-layer side-car (forward L1→L4→L5, 2-layer side-car L2↔L3) vs FF and the plain 4-layer
-        // side-car, on parity N=4, size 32, 3 seeds. Does deepening the side-car improve over 837/952/897?
-        let s = 0xE9_0B_0A17u64; // worst seed only (fast iteration)
-        let base = || {
+        // Forward-count × width study on the (L4-read) compact side-car. Recurrence fixed at 16/r4 (best
+        // read-layer config). parity N=4, single seed. Grid: size {16,32,64} × up_count {8,16,32,64}.
+        let s = 0xE9_0B_0A17u64;
+        let base = |size: u32, up: u32| {
             let mut c = RsnnConfig::demo();
             c.seed = s;
             c.task_seed = s;
-            c.size = 32;
-            c.up_count = 64;
+            c.size = size;
+            c.up_count = up;
+            c.up_radius = 3;
             c.delay = 8;
             c.trials = 1500;
             c.rate_reg = 5.0;
             c.rate_target_permille = 100;
+            c.rec_count = 16;
+            c.rec_radius = 4;
             c.rec_tau = 20.0;
             c.rec_stab = 5.0;
             c.elig_beta = 0.4;
             c
         };
-        let mut ff = base();
-        ff.rec_count = 0;
-        eprintln!("FF {}", train_hidden_rec_task(&ff, |seed, t| task_parity(seed, t, 4)));
-        for (rc, rr) in [(16u32, 4u32)] {
-            let mut c = base();
-            c.rec_count = rc;
-            c.rec_radius = rr;
-            let sa = train_sidecar_task(&c, |seed, t| task_parity(seed, t, 4));
-            eprintln!("rec {rc}/r{rr}  compact sidecar {sa}");
+        for size in [16u32, 32, 64] {
+            for up in [8u32, 16, 32, 64] {
+                let sc = train_sidecar_task(&base(size, up), |seed, t| task_parity(seed, t, 4));
+                eprintln!("size {size:>3}  up {up:>3}  compact-sidecar {sc}");
+            }
         }
     }
 
