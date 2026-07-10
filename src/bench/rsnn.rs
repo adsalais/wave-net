@@ -179,7 +179,11 @@ impl RsnnConfig {
                 TopologyLevel { level: 0, radius: r, count: n }, // L2 self-recurse
                 TopologyLevel { level: 1, radius: r, count: n }, // L2 → L3 (forward from side-car)
             ]),
-            mk(vec![TopologyLevel { level: -1, radius: r, count: n }]), // L3 → L2 (backward); L3 is read
+            mk(vec![
+                TopologyLevel { level: -1, radius: r, count: n },  // L3 → L2 (backward loop)
+                TopologyLevel { level: 1, radius: ur, count: uc },  // L3 → L4 (forward to the read layer)
+            ]),
+            mk(vec![]), // L4 read (top) — separates recurrent computation (L3) from the readout
         ];
         Config { seed: self.seed, size: self.size, layers }
     }
@@ -216,7 +220,7 @@ impl RsnnConfig {
             ]),
             mk(vec![
                 TopologyLevel { level: 1, radius: ur, count: uc }, // L4 → L5 (forward to read)
-                TopologyLevel { level: -2, radius: r, count: n },  // L4 → L2 (drive the side-car backward)
+                TopologyLevel { level: -1, radius: r, count: n },  // L4 → L3 (drive the side-car top backward)
             ]),
             mk(vec![]), // L5 read (top)
         ];
@@ -1236,7 +1240,8 @@ pub fn train_sidecar_task(cfg: &RsnnConfig, task: impl Fn(u64, usize) -> (Vec<us
         vec![(1i32, uc, ur)],       // L0: +1
         vec![(2i32, uc, ur)],       // L1: +2 skip
         vec![(0i32, n, r), (1i32, n, r)], // L2: self + forward
-        vec![(-1i32, n, r)],        // L3: backward
+        vec![(-1i32, n, r), (1i32, uc, ur)], // L3: backward loop + forward to L4 read
+        vec![],                     // L4: read
     ];
     train_multilayer(cfg, net, &layer_entries, task)
 }
@@ -1253,7 +1258,7 @@ pub fn train_sidecar_deep_task(cfg: &RsnnConfig, task: impl Fn(u64, usize) -> (V
         vec![(3i32, uc, ur)],              // L1: +3 skip → L4
         vec![(0i32, n, r), (1i32, n, r)],  // L2: self, +1 → L3
         vec![(0i32, n, r), (1i32, n, r), (-1i32, n, r)], // L3: self, +1 → L4 (write back), -1 → L2 (loop)
-        vec![(1i32, uc, ur), (-2i32, n, r)], // L4: +1 → L5, -2 → L2 (drive side-car)
+        vec![(1i32, uc, ur), (-1i32, n, r)], // L4: +1 → L5, -1 → L3 (drive side-car top)
         vec![],                            // L5: read
     ];
     train_multilayer(cfg, net, &layer_entries, task)
