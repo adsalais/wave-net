@@ -1735,6 +1735,50 @@ mod tests {
 
     #[test]
     #[ignore] // expensive; run manually in --release
+    fn sidecar_on_easy_tasks() {
+        // Does the side-car HURT where feed-forward is already enough? FF vs side-car on the FF-solvable tasks
+        // (temporal XOR, distractor-XOR, flip-flop), size 32, 3 seeds, worst-seed. A robust topology should
+        // match FF here, not wreck it.
+        let seeds = [0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF];
+        let mk = |s: u64| {
+            let mut c = RsnnConfig::demo();
+            c.seed = s;
+            c.task_seed = s;
+            c.size = 32;
+            c.up_count = 16;
+            c.trials = 1500;
+            c.rate_reg = 5.0;
+            c.rate_target_permille = 100;
+            c.rec_radius = 4;
+            c.rec_tau = 20.0;
+            c.rec_stab = 5.0;
+            c.rec_count = 8;
+            c.elig_beta = 0.4;
+            c
+        };
+        let run_pair = |tweak: &dyn Fn(&mut RsnnConfig), task: &dyn Fn(u64, usize) -> (Vec<usize>, usize)| -> (u64, u64) {
+            let (mut wf, mut ws) = (1000u64, 1000u64);
+            for &s in &seeds {
+                let mut ff = mk(s);
+                tweak(&mut ff);
+                ff.rec_count = 0;
+                let mut sc = mk(s);
+                tweak(&mut sc);
+                wf = wf.min(train_hidden_rec_task(&ff, task));
+                ws = ws.min(train_sidecar_task(&sc, task));
+            }
+            (wf, ws)
+        };
+        let (f1, s1) = run_pair(&|c| c.delay = 20, &|seed, t| xor_task(seed, t));
+        eprintln!("temporal-XOR (delay 20):  FF {f1}  sidecar {s1}");
+        let (f2, s2) = run_pair(&|c| c.delay = 20, &|seed, t| task_distractor(seed, t));
+        eprintln!("distractor-XOR (delay 20): FF {f2}  sidecar {s2}");
+        let (f3, s3) = run_pair(&|c| { c.delay = 12; c.read_waves = 12; }, &|seed, t| task_flipflop(seed, t, 3));
+        eprintln!("flip-flop (delay 12):     FF {f3}  sidecar {s3}");
+    }
+
+    #[test]
+    #[ignore] // expensive; run manually in --release
     fn sidecar_verify() {
         // Verify the side-car win (one-seed sweep found sidecar 837 vs FF ~590 on parity N=4) across 3 seeds,
         // and the stacked config (side-car + β 1.2 + W 8, the three levers that each helped). vs FF and the
