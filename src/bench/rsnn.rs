@@ -1322,14 +1322,16 @@ pub fn train_l2l3loop(cfg: &RsnnConfig) -> u64 {
 /// σ ≈ 1 critical.** Averaged over `n_perturb` perturbation sites. Deterministic; bench-side (no engine
 /// change) — the caller builds/calibrates/(optionally trains) the net first, so σ can be read on any
 /// architecture or operating point in the benchmarks. Returns `(mean d(t) trajectory, σ)`.
-pub fn sigma_probe(net: &mut Network, cfg: &RsnnConfig, warmup: usize, window: usize, n_perturb: usize) -> (Vec<f64>, f64) {
+pub fn sigma_probe(net: &mut Network, cfg: &RsnnConfig, warmup: usize, window: usize, n_perturb: usize, perturb_layer: Option<usize>) -> (Vec<f64>, f64) {
     use std::collections::HashSet;
     let l = net.layer_count();
     let ls = (cfg.size * cfg.size) as usize;
     let drive = random_l0_input(cfg.seed ^ 0xC0FF_EE, cfg.size, cfg.calib_fraction_q16);
     let steps = warmup + window + 1;
     // One deterministic run from reset: `steps` waves under `drive`; at wave `warmup`, if `pert` is set, add
-    // that one extra L0 site. Returns each computational layer's per-wave fired locals.
+    // one extra spike — an extra L0 site (`perturb_layer == None`), or force neuron `pert` in layer `z` to
+    // fire (`perturb_layer == Some(z)`, to probe the recurrent-loop gain). Returns each computational layer's
+    // per-wave fired locals.
     let run = |net: &mut Network, pert: Option<u32>| -> Vec<Vec<Vec<u32>>> {
         let rec: Arc<Mutex<Vec<Vec<Vec<u32>>>>> = Arc::new(Mutex::new(vec![Vec::new(); l]));
         for z in 1..l {
@@ -1338,13 +1340,21 @@ pub fn sigma_probe(net: &mut Network, cfg: &RsnnConfig, warmup: usize, window: u
         }
         net.reset_state();
         for w in 0..steps {
-            let mut sites = drive(w);
-            if let (Some(p), true) = (pert, w == warmup) {
-                if !sites.contains(&p) {
-                    sites.push(p);
+            let sites = drive(w);
+            match (pert, w == warmup, perturb_layer) {
+                (Some(p), true, None) => {
+                    let mut s = sites;
+                    if !s.contains(&p) {
+                        s.push(p);
+                    }
+                    net.wave(&s);
                 }
+                (Some(p), true, Some(z)) => {
+                    net.force_spike(z, p as usize);
+                    net.wave(&sites);
+                }
+                _ => net.wave(&sites),
             }
-            net.wave(&sites);
         }
         net.clear_listeners();
         let out = rec.lock().unwrap().clone();
@@ -1360,7 +1370,9 @@ pub fn sigma_probe(net: &mut Network, cfg: &RsnnConfig, warmup: usize, window: u
         s
     };
     let refr = run(net, None);
-    let driven: HashSet<u32> = drive(warmup).into_iter().collect();
+    // avoid picking an L0 site that is already driven at w0 (would be a no-op extra spike); no such
+    // constraint for a forced hidden-neuron perturbation.
+    let driven: HashSet<u32> = if perturb_layer.is_none() { drive(warmup).into_iter().collect() } else { HashSet::new() };
     let mut d_mean = vec![0f64; window];
     let mut sigmas = Vec::new();
     let np = n_perturb.max(1);
@@ -1408,9 +1420,13 @@ mod tests {
             net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
             net
         };
-        let (_, s1) = sigma_probe(&mut mk(), &cfg, 16, 6, 4);
-        let (_, s2) = sigma_probe(&mut mk(), &cfg, 16, 6, 4);
+        let (_, s1) = sigma_probe(&mut mk(), &cfg, 16, 6, 4, None);
+        let (_, s2) = sigma_probe(&mut mk(), &cfg, 16, 6, 4, None);
         assert_eq!(s1.to_bits(), s2.to_bits(), "σ probe must be a pure function of (seed, config)");
+        // recurrent-site perturbation (force a spike in the L2 scratchpad) is also deterministic
+        let (_, r1) = sigma_probe(&mut mk(), &cfg, 16, 6, 4, Some(2));
+        let (_, r2) = sigma_probe(&mut mk(), &cfg, 16, 6, 4, Some(2));
+        assert_eq!(r1.to_bits(), r2.to_bits(), "recurrent-site σ probe must be deterministic");
     }
 
     #[test]
@@ -1432,9 +1448,12 @@ mod tests {
                 c.rec_radius = 4;
                 let mut net = Network::new(c.engine_config_sidecar());
                 net.calibrate(&c.calib, &random_l0_input(c.seed ^ 0xE9, c.size, c.calib_fraction_q16));
-                let (traj, sigma) = sigma_probe(&mut net, &c, 32, 8, 8);
-                let t: Vec<f64> = traj.iter().map(|x| (x * 10.0).round() / 10.0).collect();
-                eprintln!("rc {rc:>2} up {up:>2}  σ {sigma:.3}  avalanche d(t) {t:?}");
+                // L0 perturbation (forward branching) vs recurrent-site perturbation (force a spike in the L2
+                // scratchpad → the recurrent-loop gain that should track the rec_count collapse).
+                let (_, sig_l0) = sigma_probe(&mut net, &c, 32, 8, 8, None);
+                let (traj_r, sig_rec) = sigma_probe(&mut net, &c, 32, 8, 8, Some(2));
+                let t: Vec<f64> = traj_r.iter().map(|x| (x * 10.0).round() / 10.0).collect();
+                eprintln!("rc {rc:>2} up {up:>2}  σ_L0 {sig_l0:.3}  σ_rec(L2) {sig_rec:.3}  rec-avalanche {t:?}");
             }
         }
     }

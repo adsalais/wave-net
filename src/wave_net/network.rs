@@ -132,6 +132,17 @@ impl Network {
         self.layers[layer].lock().unwrap().adapt[local]
     }
 
+    /// Force neuron `local` in layer `z` to fire on the *next* `wave()` — sets its potential to `i16::MAX`
+    /// and clears its cooldown, so the decide step fires it (the effective threshold of the low-baseline
+    /// computational layers is well under `i16::MAX`). Also zeroes its adaptation so the fire is guaranteed
+    /// even if the neuron was heavily adapted. For criticality perturbation probes; no effect unless called.
+    pub fn force_spike(&self, z: usize, local: usize) {
+        let mut l = self.layers[z].lock().unwrap();
+        l.potential[local] = i16::MAX;
+        l.cooldown[local] = 0;
+        l.adapt[local] = 0;
+    }
+
     pub fn size(&self) -> u32 {
         self.size
     }
@@ -233,6 +244,19 @@ mod tests {
         let eff1 = net.layer_effective_threshold(1);
         assert_eq!(eff1[0], base[0] as i32 + 5);
         assert_eq!(&eff1[1..], &eff0[1..]);
+    }
+
+    #[test]
+    fn force_spike_fires_the_neuron() {
+        let mut net = Network::new(two_layer());
+        let fired = Arc::new(Mutex::new(Vec::new()));
+        {
+            let f = fired.clone();
+            net.on_layer(1, Box::new(move |_w, fd: &[u32]| f.lock().unwrap().extend_from_slice(fd)));
+        }
+        net.force_spike(1, 5);
+        net.wave(&[]); // no input — only the forced neuron should fire in L1
+        assert_eq!(fired.lock().unwrap().as_slice(), &[5], "force_spike fires exactly the targeted neuron");
     }
 
     // two 4x4 layers, L0 -> L1 straight up (level+1, radius 0), all excitatory
