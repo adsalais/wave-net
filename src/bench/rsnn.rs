@@ -1867,10 +1867,10 @@ mod tests {
             c.trials = 1500;
             c.rate_reg = 5.0;
             c.rate_target_permille = 100;
-            c.rec_radius = 4;
+            c.rec_radius = 3;
             c.rec_tau = 20.0;
             c.rec_stab = 5.0;
-            c.rec_count = 8;
+            c.rec_count = 16;
             c.elig_beta = 0.4;
             c
         };
