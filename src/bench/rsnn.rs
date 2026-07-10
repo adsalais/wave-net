@@ -1904,9 +1904,9 @@ mod tests {
             c.elig_beta = 0.4;
             // uniform: same count + radius on forward and side-car groups
             c.up_count = 8;
-            c.up_radius = 4;
+            c.up_radius = 3;
             c.rec_count = 8;
-            c.rec_radius = 4;
+            c.rec_radius = 3;
             c
         };
         let (mut wf, mut ws, mut wd) = (1000u64, 1000u64, 1000u64);
@@ -1921,7 +1921,7 @@ mod tests {
             ws = ws.min(sa);
             wd = wd.min(da);
         }
-        eprintln!("WORST (uniform 8/r4):  FF {wf}  sidecar {ws}  sidecar-deep {wd}");
+        eprintln!("WORST (uniform 8/r3):  FF {wf}  sidecar {ws}  sidecar-deep {wd}");
     }
 
     #[test]
