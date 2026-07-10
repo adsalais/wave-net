@@ -1708,6 +1708,52 @@ mod tests {
 
     #[test]
     #[ignore] // expensive; run manually in --release
+    fn deep_parity() {
+        // Parity N=3/4 on the DEEP 4-layer hidden-rec architecture (all forward layers trained via multi-layer
+        // DFA, recurrence on L2), size 32, rec_count 8. Parity N≥3 is non-monotone — a task with HEADROOM that
+        // ALIF feed-forward does not already saturate — so this is the test of whether trained recurrence can
+        // BEAT feed-forward once the completed ALIF eligibility is used. FF / crude / completed, 3 seeds, worst.
+        let seeds = [0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF];
+        for n in [3usize, 4] {
+            let base = |s: u64| {
+                let mut c = RsnnConfig::demo();
+                c.seed = s;
+                c.task_seed = s;
+                c.size = 32;
+                c.up_count = 16;
+                c.delay = 8;
+                c.trials = 1500;
+                c.rate_reg = 5.0;
+                c.rate_target_permille = 100;
+                c.rec_radius = 4;
+                c.rec_tau = 20.0;
+                c.rec_stab = 5.0;
+                c
+            };
+            let (mut wf, mut wc, mut wm) = (1000u64, 1000u64, 1000u64);
+            for &s in &seeds {
+                let mut ff = base(s);
+                ff.rec_count = 0;
+                let mut cru = base(s);
+                cru.rec_count = 8;
+                cru.elig_beta = 0.0;
+                let mut com = base(s);
+                com.rec_count = 8;
+                com.elig_beta = 0.4;
+                let fa = train_hidden_rec_task(&ff, |seed, t| task_parity(seed, t, n));
+                let ca = train_hidden_rec_task(&cru, |seed, t| task_parity(seed, t, n));
+                let ma = train_hidden_rec_task(&com, |seed, t| task_parity(seed, t, n));
+                eprintln!("deep-parity N={n} seed {s:#x}  FF {fa}  crude {ca}  completed {ma}");
+                wf = wf.min(fa);
+                wc = wc.min(ca);
+                wm = wm.min(ma);
+            }
+            eprintln!("deep-parity N={n} WORST:  FF {wf}  crude {wc}  completed {wm}");
+        }
+    }
+
+    #[test]
+    #[ignore] // expensive; run manually in --release
     fn deep_density_sweep() {
         // Deep 4-layer (train_hidden_rec), temporal XOR delay 20, size 16. Map trained recurrence vs
         // recurrence density (rec_count on L2): where is it trainable, where does it collapse, and where does
