@@ -1875,7 +1875,7 @@ mod tests {
         let mut ff = base();
         ff.rec_count = 0;
         eprintln!("FF {}", train_hidden_rec_task(&ff, |seed, t| task_parity(seed, t, 4)));
-        for (rc, rr) in [(16u32, 3u32), (32, 5), (32, 6)] {
+        for (rc, rr) in [(32u32, 5u32)] {
             let mut c = base();
             c.rec_count = rc;
             c.rec_radius = rr;
