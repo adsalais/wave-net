@@ -179,7 +179,50 @@ impl RsnnConfig {
                 TopologyLevel { level: 0, radius: r, count: n }, // L2 self-recurse
                 TopologyLevel { level: 1, radius: r, count: n }, // L2 → L3 (forward from side-car)
             ]),
-            mk(vec![TopologyLevel { level: -1, radius: r, count: n }]), // L3 → L2 (backward); L3 is read
+            mk(vec![
+                TopologyLevel { level: -1, radius: r, count: n },  // L3 → L2 (backward loop)
+                TopologyLevel { level: 1, radius: ur, count: uc },  // L3 → L4 (forward to the read layer)
+            ]),
+            mk(vec![]), // L4 read (top) — separates recurrent computation (L3) from the readout
+        ];
+        Config { seed: self.seed, size: self.size, layers }
+    }
+
+    /// Deeper side-car (6 layers): forward path L0→L1→L4→L5 (L1 **skips** the side-car via +3), with the
+    /// **2-layer** recurrent scratchpad L2↔L3 hanging off the **pre-read layer L4** — L4 drives it backward
+    /// (L4 → L2, −2), it loops internally (L2→L3, L3→L2), and writes back forward (L3 → L4, +1). L5 is read.
+    /// This mirrors the original single-layer side-car (scratchpad hangs off the read-adjacent layer, driven
+    /// backward, writes forward), extended to a 2-layer loop with a longer forward skip.
+    fn engine_config_sidecar_deep(&self) -> Config {
+        let mk = |topology| LayerConfig {
+            topology,
+            leak: (3, 5),
+            cooldown_base: 2,
+            inhibitor_ratio: 0,
+            threshold_jitter: 32,
+            baseline_init: 6,
+            adapt_bump: self.adapt_bump,
+            adapt_decay: self.adapt_decay,
+        };
+        let (uc, ur) = (self.up_count, self.up_radius);
+        let (n, r) = (self.rec_count, self.rec_radius);
+        let layers = vec![
+            mk(vec![TopologyLevel { level: 1, radius: ur, count: uc }]), // L0 input → L1
+            mk(vec![TopologyLevel { level: 3, radius: ur, count: uc }]), // L1 → L4 (forward, skip the side-car)
+            mk(vec![
+                TopologyLevel { level: 0, radius: r, count: n }, // L2 self-recurse
+                TopologyLevel { level: 1, radius: r, count: n }, // L2 → L3
+            ]),
+            mk(vec![
+                TopologyLevel { level: 0, radius: r, count: n },  // L3 self-recurse (holds state, like L2)
+                TopologyLevel { level: 1, radius: r, count: n },  // L3 → L4 (side-car writes back to forward)
+                TopologyLevel { level: -1, radius: r, count: n }, // L3 → L2 (loop back)
+            ]),
+            mk(vec![
+                TopologyLevel { level: 1, radius: ur, count: uc }, // L4 → L5 (forward to read)
+                TopologyLevel { level: -1, radius: r, count: n },  // L4 → L3 (drive the side-car top backward)
+            ]),
+            mk(vec![]), // L5 read (top)
         ];
         Config { seed: self.seed, size: self.size, layers }
     }
@@ -1197,7 +1240,26 @@ pub fn train_sidecar_task(cfg: &RsnnConfig, task: impl Fn(u64, usize) -> (Vec<us
         vec![(1i32, uc, ur)],       // L0: +1
         vec![(2i32, uc, ur)],       // L1: +2 skip
         vec![(0i32, n, r), (1i32, n, r)], // L2: self + forward
-        vec![(-1i32, n, r)],        // L3: backward
+        vec![(-1i32, n, r), (1i32, uc, ur)], // L3: backward loop + forward to L4 read
+        vec![],                     // L4: read
+    ];
+    train_multilayer(cfg, net, &layer_entries, task)
+}
+
+/// The deeper 6-layer side-car (see `engine_config_sidecar_deep`) on an arbitrary binary sequence task.
+pub fn train_sidecar_deep_task(cfg: &RsnnConfig, task: impl Fn(u64, usize) -> (Vec<usize>, usize)) -> u64 {
+    let mut net = Network::new(cfg.engine_config_sidecar_deep());
+    net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
+    let (uc, ur) = (cfg.up_count as usize, cfg.up_radius);
+    let (n, r) = (cfg.rec_count as usize, cfg.rec_radius);
+    // per-layer entries, matching engine_config_sidecar_deep's topology order exactly
+    let layer_entries = vec![
+        vec![(1i32, uc, ur)],              // L0: +1 → L1
+        vec![(3i32, uc, ur)],              // L1: +3 skip → L4
+        vec![(0i32, n, r), (1i32, n, r)],  // L2: self, +1 → L3
+        vec![(0i32, n, r), (1i32, n, r), (-1i32, n, r)], // L3: self, +1 → L4 (write back), -1 → L2 (loop)
+        vec![(1i32, uc, ur), (-1i32, n, r)], // L4: +1 → L5, -1 → L3 (drive side-car top)
+        vec![],                            // L5: read
     ];
     train_multilayer(cfg, net, &layer_entries, task)
 }
@@ -1775,6 +1837,91 @@ mod tests {
         eprintln!("distractor-XOR (delay 20): FF {f2}  sidecar {s2}");
         let (f3, s3) = run_pair(&|c| { c.delay = 12; c.read_waves = 12; }, &|seed, t| task_flipflop(seed, t, 3));
         eprintln!("flip-flop (delay 12):     FF {f3}  sidecar {s3}");
+    }
+
+    #[test]
+    fn train_sidecar_deep_is_deterministic() {
+        let mut cfg = RsnnConfig::demo();
+        cfg.size = 8;
+        cfg.delay = 8;
+        cfg.rec_count = 8;
+        cfg.elig_beta = 0.4;
+        cfg.trials = 80;
+        let run = || train_sidecar_deep_task(&cfg, |seed, t| task_parity(seed, t, 4));
+        assert_eq!(run(), run());
+    }
+
+    #[test]
+    #[ignore] // expensive; run manually in --release
+    fn sidecar_deep_parity() {
+        // Forward-count × width study on the (L4-read) compact side-car. Recurrence fixed at 16/r4 (best
+        // read-layer config). parity N=4, single seed. Grid: size {16,32,64} × up_count {8,16,32,64}.
+        let s = 0xE9_0B_0A17u64;
+        let base = |size: u32, up: u32| {
+            let mut c = RsnnConfig::demo();
+            c.seed = s;
+            c.task_seed = s;
+            c.size = size;
+            c.up_count = up;
+            c.up_radius = 3;
+            c.delay = 8;
+            c.trials = 1500;
+            c.rate_reg = 5.0;
+            c.rate_target_permille = 100;
+            c.rec_count = 16;
+            c.rec_radius = 4;
+            c.rec_tau = 20.0;
+            c.rec_stab = 5.0;
+            c.elig_beta = 0.4;
+            c
+        };
+        for size in [16u32, 32, 64] {
+            for up in [8u32, 16, 32, 64] {
+                let sc = train_sidecar_task(&base(size, up), |seed, t| task_parity(seed, t, 4));
+                eprintln!("size {size:>3}  up {up:>3}  compact-sidecar {sc}");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore] // expensive; run manually in --release
+    fn sidecar_uniform_params() {
+        // Both side-cars with UNIFORM synapse params for EVERY layer/group — count 8, radius 4 (forward and
+        // side-car alike), the "everything sparse" unification that respects the recurrence's density
+        // preference. parity N=4, size 32, 3 seeds. FF for reference.
+        let seeds = [0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF];
+        let base = |s: u64| {
+            let mut c = RsnnConfig::demo();
+            c.seed = s;
+            c.task_seed = s;
+            c.size = 32;
+            c.delay = 8;
+            c.trials = 1500;
+            c.rate_reg = 5.0;
+            c.rate_target_permille = 100;
+            c.rec_stab = 5.0;
+            c.rec_tau = 20.0;
+            c.elig_beta = 0.4;
+            // uniform: same count + radius on forward and side-car groups
+            c.up_count = 8;
+            c.up_radius = 3;
+            c.rec_count = 8;
+            c.rec_radius = 3;
+            c
+        };
+        let (mut wf, mut ws, mut wd) = (1000u64, 1000u64, 1000u64);
+        for &s in &seeds {
+            let mut ff = base(s);
+            ff.rec_count = 0;
+            let fa = train_hidden_rec_task(&ff, |seed, t| task_parity(seed, t, 4));
+            let sa = train_sidecar_task(&base(s), |seed, t| task_parity(seed, t, 4));
+            let da = train_sidecar_deep_task(&base(s), |seed, t| task_parity(seed, t, 4));
+            eprintln!("seed {s:#x}  FF {fa}  sidecar {sa}  sidecar-deep {da}");
+            wf = wf.min(fa);
+            ws = ws.min(sa);
+            wd = wd.min(da);
+        }
+        eprintln!("WORST (uniform 8/r3):  FF {wf}  sidecar {ws}  sidecar-deep {wd}");
     }
 
     #[test]

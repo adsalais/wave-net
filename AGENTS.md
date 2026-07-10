@@ -163,8 +163,12 @@ across every benchmark and seed (a strict improvement, no downside).** Headline 
   (`RsnnConfig.elig_beta`/`elig_bump_psi`/`elig_psi_width`; decide-time `eff` snapshot `Layer.decide_eff`;
   fixed-width bump ψ; two ψ bugs fixed). Levers that matter: **topology (isolation) ≫ hyperparameter tuning**
   (β·W tuning that helped the hidden-rec stack *hurt* the side-car), **width** (sets the ceiling), and
-  **sub-critical recurrence density** (collapse cliff at rec_count ≈ 12 — keep it below). **Open:** generality
-  to larger sizes, and *why* the skip+scratchpad+loop structure works. See `docs/experiments_results.md`.
+  **sub-critical recurrence density** (collapse cliff at rec_count ≈ 12 — keep it below). A **scaling study**
+  (in progress, `docs/experiments_results.md`) finds a per-neuron forward-drive threshold (~up_count 32), width
+  as a capacity floor (≥ size 32 for parity N=4), joint width×forward scaling above both bars, and that
+  reading the recurrent layer *directly* beats a dedicated read layer. **Blocker: the single-threaded integer
+  engine is too slow to run these sweeps multi-seed at size ≥ 64 — the immediate next work is performance
+  optimization, then resume the systematic scaling / forward-topology exploration.**
 
 ## Reading & training: the multi-wave rule
 

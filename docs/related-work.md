@@ -304,6 +304,45 @@ its drive density to the task; (d) let recurrence + e-prop **compute** on top of
 real "does recurrence earn its keep" test is **ALIF + recurrence vs ALIF-alone** at a delay where adaptation
 alone is marginal — not bare-LIF recurrence vs FF.
 
+## The side-car recurrence result vs the literature (2026-07-10)
+
+`wave_net`'s recurrence result — trained recurrence robustly beats feed-forward **only** on a backward-fed
+**side-car** topology that *isolates the recurrent layer from the forward path* (the forward signal skips past
+it; a separate recurrent scratchpad holds state and writes back) — is not idiosyncratic. The same design
+principle, and even the same two side-findings (isolation + sparse recurrence), recur across the RNN and
+e-prop literature:
+
+- **e-prop's own successors independently found "noise separation."** *…intrinsic noise filtering / intrinsic
+  noise separation in RSNNs trained with e-prop* (bioRxiv **2025-05-25**; peer-reviewed *Neuromorphic
+  Computing and Engineering* **5(4), 2025**) reports (a) an intrinsic mechanism in the **input layer that
+  separates noise and stabilizes the recurrent layer**, and (b) that **increased sparsity in the recurrent
+  layer significantly improves learning**. Those are exactly our two findings — *isolate the recurrent layer
+  from forward noise* and *keep recurrence sub-critical/sparse* — from the same algorithm family, ~a year
+  before we rediscovered them from the substrate up. (We already cited this group for its firing-rate figures;
+  its noise-separation result is the load-bearing one for us.)
+- **The side-car IS a "dual RNN".** *Separation of Memory and Processing in Dual Recurrent Neural Networks*
+  (arXiv 2020) splits the net into a **recurrent layer that only holds the time-dependencies (memory)** and a
+  **feed-forward layer that combines input + memory to answer** — architecturally our side-car (recurrent
+  scratchpad + skip-past forward path), in non-spiking RNNs.
+- **Dual memory pathways in SNNs.** *Algorithm–hardware co-design of neuromorphic networks with dual memory
+  pathways* (Nature Machine Intelligence 2026) adds an explicit **slow memory pathway alongside fast spiking
+  activity** — the same "separate the memory subsystem" move on a spiking substrate.
+- **The general principle is canonical:** skip/residual connections that *bypass* recurrent layers (residual
+  RNNs, Residual Memory Networks, identity skips between LSTM layers); **gated memory** (the LSTM/GRU *cell
+  state* is a protected highway the gates isolate from the input transformation); and **reservoir computing**
+  (recurrence kept out of the trained forward path).
+- **Where we depart from vanilla LSNN.** The original LSNN (Bellec 2018/2020) uses a **single fully-recurrent
+  hidden layer** — recurrence *mixed into* the forward path, the opposite of isolation. Our data says that on
+  this substrate, training recurrence *in* the forward path craters the reservoir, while isolating it
+  (side-car) works — putting us on the **dual-pathway / residual-RNN** branch of the field, not the
+  monolithic-recurrent-hidden-layer design.
+
+**Takeaway:** the side-car is an integer-substrate instance of the dual-pathway / memory-isolation principle
+that both classic RNN engineering (gating, skips, reservoirs) and the newest e-prop work converge on. It also
+gives the open "why does isolation help?" question a literature-backed hypothesis to test: training recurrence
+*in* the forward path injects reverberation that corrupts the class projection; a side-car lets the loop hold
+temporal state without polluting it.
+
 ## Sources
 
 Format: *Title* (tag) — Venue Year — link(s).
@@ -326,4 +365,7 @@ Format: *Title* (tag) — Venue Year — link(s).
 - *Long Short-Term Memory Spiking Networks and Their Applications* (LSNN net sizes: TIMIT 400, N-MNIST 120+84) — arXiv 2020 — [arxiv](https://arxiv.org/pdf/2007.04779)
 - *Effective and Efficient Computation with Multiple-timescale Spiking Recurrent Neural Networks* (fully-recurrent hidden layer, temporal-task sizes) — arXiv 2020 — [arxiv](https://arxiv.org/pdf/2005.11633)
 - Higuchi et al., *Balanced Resonate-and-Fire Neurons* (BRF — memory in the neuron's oscillatory dynamics, not the trained loop) — 2024 — [code](https://github.com/AdaptiveAILab/brf-neurons) (MIT)
+- *Efficient learning and intrinsic noise filtering in RSNNs trained with e-prop* (input layer separates noise → stabilizes the recurrent layer; recurrent sparsity helps — matches our side-car isolation + sub-critical density) — bioRxiv 2025-05-25 — [biorxiv](https://www.biorxiv.org/content/10.1101/2025.05.25.656058v1); published as *Efficient connectivity and intrinsic noise separation…* — Neuromorphic Computing and Engineering 5(4), 2025 — [iop](https://iopscience.iop.org/article/10.1088/2634-4386/ae0826)
+- *Separation of Memory and Processing in Dual Recurrent Neural Networks* (a recurrent memory layer + a feed-forward layer that combines input + memory — the side-car pattern, non-spiking) — arXiv 2020 — [arxiv](https://arxiv.org/pdf/2005.13971)
+- *Algorithm–hardware co-design of neuromorphic networks with dual memory pathways* (explicit slow-memory pathway alongside fast spiking) — Nature Machine Intelligence 2026 — [nature](https://www.nature.com/articles/s42256-026-01255-3)
 - *Can Biologically Plausible Temporal Credit Assignment Rules Match BPTT? E-prop as an Example* (e-prop only approaches BPTT — open question) — ICML 2025 — [arxiv](https://arxiv.org/abs/2506.06904)
