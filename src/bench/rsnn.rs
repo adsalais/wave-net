@@ -1886,9 +1886,9 @@ mod tests {
     #[test]
     #[ignore] // expensive; run manually in --release
     fn sidecar_uniform_params() {
-        // Both side-cars with UNIFORM synapse params for EVERY layer/group — count 16, radius 3 (forward and
-        // side-car alike), removing the forward-vs-side-car confound. parity N=4, size 32, 3 seeds. FF for
-        // reference. (rec_count 16 at size 32 ≈ 1.6% density — comfortably sub-critical.)
+        // Both side-cars with UNIFORM synapse params for EVERY layer/group — count 8, radius 4 (forward and
+        // side-car alike), the "everything sparse" unification that respects the recurrence's density
+        // preference. parity N=4, size 32, 3 seeds. FF for reference.
         let seeds = [0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF];
         let base = |s: u64| {
             let mut c = RsnnConfig::demo();
@@ -1903,10 +1903,10 @@ mod tests {
             c.rec_tau = 20.0;
             c.elig_beta = 0.4;
             // uniform: same count + radius on forward and side-car groups
-            c.up_count = 16;
-            c.up_radius = 3;
-            c.rec_count = 16;
-            c.rec_radius = 3;
+            c.up_count = 8;
+            c.up_radius = 4;
+            c.rec_count = 8;
+            c.rec_radius = 4;
             c
         };
         let (mut wf, mut ws, mut wd) = (1000u64, 1000u64, 1000u64);
@@ -1921,7 +1921,7 @@ mod tests {
             ws = ws.min(sa);
             wd = wd.min(da);
         }
-        eprintln!("WORST (uniform 16/r3):  FF {wf}  sidecar {ws}  sidecar-deep {wd}");
+        eprintln!("WORST (uniform 8/r4):  FF {wf}  sidecar {ws}  sidecar-deep {wd}");
     }
 
     #[test]
