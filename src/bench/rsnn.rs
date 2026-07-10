@@ -1735,6 +1735,50 @@ mod tests {
 
     #[test]
     #[ignore] // expensive; run manually in --release
+    fn sidecar_verify() {
+        // Verify the side-car win (one-seed sweep found sidecar 837 vs FF ~590 on parity N=4) across 3 seeds,
+        // and the stacked config (side-car + β 1.2 + W 8, the three levers that each helped). vs FF and the
+        // hidden-rec baseline. All size 32, parity N=4.
+        let seeds = [0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF];
+        let base = |s: u64| {
+            let mut c = RsnnConfig::demo();
+            c.seed = s;
+            c.task_seed = s;
+            c.size = 32;
+            c.up_count = 16;
+            c.delay = 8;
+            c.trials = 1500;
+            c.rate_reg = 5.0;
+            c.rate_target_permille = 100;
+            c.rec_radius = 4;
+            c.rec_tau = 20.0;
+            c.rec_stab = 5.0;
+            c.rec_count = 8;
+            c.elig_beta = 0.4;
+            c
+        };
+        let (mut wff, mut whr, mut wsc, mut wst) = (1000u64, 1000u64, 1000u64, 1000u64);
+        for &s in &seeds {
+            let mut ff = base(s);
+            ff.rec_count = 0;
+            let mut st = base(s);
+            st.elig_beta = 1.2;
+            st.elig_psi_width = 8.0;
+            let fa = train_hidden_rec_task(&ff, |seed, t| task_parity(seed, t, 4));
+            let ha = train_hidden_rec_task(&base(s), |seed, t| task_parity(seed, t, 4));
+            let sa = train_sidecar_task(&base(s), |seed, t| task_parity(seed, t, 4));
+            let ta = train_sidecar_task(&st, |seed, t| task_parity(seed, t, 4));
+            eprintln!("seed {s:#x}  FF {fa}  hidden-rec {ha}  sidecar {sa}  sidecar+stack {ta}");
+            wff = wff.min(fa);
+            whr = whr.min(ha);
+            wsc = wsc.min(sa);
+            wst = wst.min(ta);
+        }
+        eprintln!("WORST:  FF {wff}  hidden-rec {whr}  sidecar {wsc}  sidecar+stack {wst}");
+    }
+
+    #[test]
+    #[ignore] // expensive; run manually in --release
     fn parity_improve_sweep() {
         // ONE-SEED exploration (the hard seed 0xE9_0B_0A17, where deep-parity N=4 had completed 560 < FF 620).
         // Goal: push trained recurrence ABOVE FF by varying depth / rec_count / β / bump-width / topology.
