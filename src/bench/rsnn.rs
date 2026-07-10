@@ -45,6 +45,8 @@ pub struct RsnnConfig {
     pub rate_target_permille: u32, // target per-neuron firing rate r_target, permille (e.g. 100 = 10%)
     pub xor_layers: usize,         // depth of the sequence-task stack: forward layers under a recurrent top (2 = the original L0→L1)
     pub rec_stab: f32,             // per-LAYER recurrent stabilizer (uniform bias toward r_target on recurrent levels; class-preserving, unlike per-neuron rate_reg). 0 = off
+    pub elig_beta: f32,      // ALIF adaptation-eligibility coupling β (0.0 = off → membrane-only, byte-identical). Active only when adapt_bump > 0.
+    pub elig_bump_psi: bool, // use normalized bump pseudo-derivative ψ instead of spike/ramp post-factor (ablation: bump-ψ without the εᵃ term)
 }
 
 impl RsnnConfig {
@@ -84,6 +86,8 @@ impl RsnnConfig {
             rate_target_permille: 100,
             xor_layers: 2,
             rec_stab: 0.0,
+            elig_beta: 0.0,
+            elig_bump_psi: false,
         }
     }
 

@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::wave_net::config::Config;
-use crate::wave_net::neurons::Layer;
+use crate::wave_net::neurons::{Layer, ADAPT_SHIFT};
 use crate::wave_net::synapse::SynapseGroup;
 use crate::wave_net::wave::process_layer;
 
@@ -160,6 +160,17 @@ impl Network {
         self.layers[z].lock().unwrap().decide_potential.clone()
     }
 
+    /// Per-neuron effective ALIF firing threshold `baseline + (adapt >> ADAPT_SHIFT)` — the value the
+    /// decide step compares potential against. Read-only snapshot; no dynamics change.
+    pub fn layer_effective_threshold(&self, z: usize) -> Vec<i32> {
+        let l = self.layers[z].lock().unwrap();
+        l.threshold
+            .iter()
+            .zip(l.adapt.iter())
+            .map(|(&t, &a)| t as i32 + (a >> ADAPT_SHIFT))
+            .collect()
+    }
+
     /// Reset, run `warmup` waves (discarded), then `waves` counted; per-layer firing rate =
     /// spikes / (layer_size * waves). Saves and restores the caller's listeners around the run.
     pub(crate) fn measure_layer_rates(
@@ -200,6 +211,20 @@ mod tests {
     use crate::wave_net::config::{Config, LayerConfig};
     use crate::wave_net::synapse::TopologyLevel;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn effective_threshold_is_baseline_plus_adapt_shifted() {
+        let net = Network::new(two_layer());
+        // baseline with zero adaptation == the threshold itself
+        let base = net.layer_thresholds(1);
+        let eff0 = net.layer_effective_threshold(1);
+        assert_eq!(eff0, base.iter().map(|&t| t as i32).collect::<Vec<_>>());
+        // inject adaptation on neuron 0 of layer 1 and check the >> ADAPT_SHIFT contribution
+        net.with_layer_mut(1, |l| l.adapt[0] = 5 << ADAPT_SHIFT);
+        let eff1 = net.layer_effective_threshold(1);
+        assert_eq!(eff1[0], base[0] as i32 + 5);
+        assert_eq!(&eff1[1..], &eff0[1..]);
+    }
 
     // two 4x4 layers, L0 -> L1 straight up (level+1, radius 0), all excitatory
     fn two_layer() -> Config {
