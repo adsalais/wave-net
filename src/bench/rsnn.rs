@@ -1538,6 +1538,85 @@ mod tests {
 
     #[test]
     #[ignore] // expensive; run manually in --release
+    fn fair_recurrence_eprop_complete() {
+        // THE headline re-run: the airtight fair recurrence test (deep-FF ~986 vs +hidden-rec ~498/chance),
+        // now comparing the OLD eligibility (elig_beta 0 — membrane-only, reproduces the null) against the
+        // COMPLETED ALIF eligibility (elig_beta > 0 — adds the εᵃ adaptation-trace credit) on the recurrent
+        // path. If +rec climbs back toward FF at some β, the null was an artifact of the incomplete rule.
+        let seeds = [0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF, 0xA5A5_1111, 0x0F0F_2222];
+        let base = |s: u64| {
+            let mut ff = RsnnConfig::demo();
+            ff.seed = s;
+            ff.task_seed = s;
+            ff.size = 16;
+            ff.up_count = 16; // sparse drive: deep FF is starved without rate_reg
+            ff.delay = 20;
+            ff.trials = 1500;
+            ff.rate_reg = 5.0; // revive the forward path (per-neuron liveness)
+            ff.rate_target_permille = 100;
+            ff.rec_count = 0; // FF baseline
+            ff
+        };
+        // FF baseline is β-independent — compute once per seed.
+        let ffa: Vec<u64> = seeds.iter().map(|&s| train_hidden_rec(&base(s))).collect();
+        for (s, f) in seeds.iter().zip(&ffa) {
+            eprintln!("deep-FF seed {s:#x}  {f}");
+        }
+        eprintln!("FF worst {} mean {}", ffa.iter().min().unwrap(), ffa.iter().sum::<u64>() / 5);
+        for &beta in &[0.0f32, 0.1, 0.2, 0.4] {
+            let mut ra = Vec::new();
+            for &s in &seeds {
+                let mut rec = base(s);
+                rec.rec_count = 24;
+                rec.rec_radius = 4;
+                rec.rec_tau = 20.0;
+                rec.rec_init = 0;
+                rec.rec_stab = 5.0; // class-preserving per-layer stabilizer
+                rec.elig_beta = beta;
+                let r = train_hidden_rec(&rec);
+                eprintln!("β {beta}  seed {s:#x}  +rec {r}");
+                ra.push(r);
+            }
+            eprintln!("β {beta}: +rec worst {} mean {}", ra.iter().min().unwrap(), ra.iter().sum::<u64>() / 5);
+        }
+    }
+
+    #[test]
+    #[ignore] // expensive; run manually in --release
+    fn parity_recurrence_eprop_complete() {
+        // Parity (needs recurrent computation), ALIF, FF vs +lateral-recurrence with the completed ALIF
+        // eligibility, β sweep. β=0 reproduces the documented "recurrence hurts parity" null.
+        let seeds = [0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF];
+        for n in [3usize, 4] {
+            for &beta in &[0.0f32, 0.2, 0.4] {
+                let (mut wf, mut wr) = (1000u64, 1000u64);
+                for &s in &seeds {
+                    let mut ff = RsnnConfig::demo();
+                    ff.seed = s;
+                    ff.task_seed = s;
+                    ff.delay = 8;
+                    ff.trials = 1500;
+                    ff.rate_reg = 5.0;
+                    ff.rate_target_permille = 100;
+                    let mut rec = ff.clone();
+                    rec.rec_count = 24;
+                    rec.rec_radius = 2;
+                    rec.rec_tau = 20.0;
+                    rec.rec_init = 0;
+                    rec.elig_beta = beta;
+                    let fa = train_sequence(&ff, |seed, t| task_parity(seed, t, n));
+                    let ra = train_sequence(&rec, |seed, t| task_parity(seed, t, n));
+                    eprintln!("parity N={n} β {beta} seed {s:#x}  FF {fa}  +rec {ra}");
+                    wf = wf.min(fa);
+                    wr = wr.min(ra);
+                }
+                eprintln!("parity N={n} β {beta}: WORST FF {wf}  +rec {wr}");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore] // expensive; run manually in --release
     fn fair_recurrence_lif() {
         // Final fair test with STANDARD LIF neurons (adapt_bump 0 — no ALIF adaptation quenching the
         // recurrent gain). Hidden-rec architecture, sparse drive + forward rate_reg. FF baseline, then
