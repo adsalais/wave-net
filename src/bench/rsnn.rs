@@ -47,6 +47,8 @@ pub struct RsnnConfig {
     pub rec_stab: f32,             // per-LAYER recurrent stabilizer (uniform bias toward r_target on recurrent levels; class-preserving, unlike per-neuron rate_reg). 0 = off
     pub elig_beta: f32,      // ALIF adaptation-eligibility coupling β (0.0 = off → membrane-only, byte-identical). Active only when adapt_bump > 0.
     pub elig_bump_psi: bool, // use normalized bump pseudo-derivative ψ instead of spike/ramp post-factor (ablation: bump-ψ without the εᵃ term)
+    pub elig_psi_width: f32, // half-width W of the bump pseudo-derivative ψ = γ·max(0, 1−|v−eff|/W) (default 16; θ≈1 baseline is too narrow)
+    pub hidden_rec_depth: usize, // depth of the hidden-recurrent stack in engine_config_hidden_rec (default 4: L0→L1→L2→L3, recurrence on the second-from-top layer)
 }
 
 impl RsnnConfig {
@@ -88,6 +90,8 @@ impl RsnnConfig {
             rec_stab: 0.0,
             elig_beta: 0.0,
             elig_bump_psi: false,
+            elig_psi_width: PSI_WIDTH,
+            hidden_rec_depth: 4,
         }
     }
 
@@ -208,9 +212,11 @@ impl RsnnConfig {
         Config { seed: self.seed, size: self.size, layers }
     }
 
-    /// Clean hidden recurrent layer (4 layers): L0→L1→L2→L3(read), with **level-0 recurrence on L2** when
-    /// `rec_count > 0`. The signal flows *through* L2's recurrence; L1/L3 are plain forward. For the fair
-    /// recurrence test — forward path revived by `rate_reg`, L2's loop stabilized by `rec_stab`.
+    /// Clean hidden recurrent stack of `hidden_rec_depth` layers (default 4: L0→L1→L2→L3(read)), with
+    /// **level-0 recurrence on the second-from-top layer** when `rec_count > 0`. The signal flows *through*
+    /// that layer's recurrence; the other computational layers are plain forward. Forward path revived by
+    /// `rate_reg`, the loop stabilized by `rec_stab`. (`hidden_rec_depth = 4` is byte-identical to the
+    /// original L0→L1→L2→L3.)
     fn engine_config_hidden_rec(&self) -> Config {
         let mk = |topology| LayerConfig {
             topology,
@@ -223,17 +229,24 @@ impl RsnnConfig {
             adapt_decay: self.adapt_decay,
         };
         let fwd = TopologyLevel { level: 1, radius: self.up_radius, count: self.up_count };
-        let l2 = if self.rec_count > 0 {
+        let rec = if self.rec_count > 0 {
             vec![fwd.clone(), TopologyLevel { level: 0, radius: self.rec_radius, count: self.rec_count }]
         } else {
             vec![fwd.clone()]
         };
-        let layers = vec![
-            mk(vec![fwd.clone()]), // L0 → L1
-            mk(vec![fwd.clone()]), // L1 → L2
-            mk(l2),                // L2 → L3 (+ level-0 recurrence if rec_count>0)
-            mk(vec![]),            // L3 read (top)
-        ];
+        let d = self.hidden_rec_depth.max(3);
+        // layers 0..d-2 are plain forward (+1); layer d-2 carries the recurrence; layer d-1 is the read top.
+        let layers: Vec<LayerConfig> = (0..d)
+            .map(|z| {
+                if z == d - 1 {
+                    mk(vec![]) // read top (no outgoing)
+                } else if z == d - 2 {
+                    mk(rec.clone()) // forward + level-0 recurrence
+                } else {
+                    mk(vec![fwd.clone()]) // plain forward
+                }
+            })
+            .collect();
         Config { seed: self.seed, size: self.size, layers }
     }
 }
@@ -744,7 +757,7 @@ fn recurrent_update(net: &mut Network, cfg: &RsnnConfig, w: &[Vec<f32>], err: &[
     // ψ_j(t): fixed-width bump centered at the decide-time ADAPTIVE firing threshold, else the raw spike.
     let psi = |t: usize, j: usize| -> f32 {
         if use_bump {
-            (PSI_GAMMA * (1.0 - (pots_top[t][j] as f32 - eff_top[t][j] as f32).abs() / PSI_WIDTH)).max(0.0)
+            (PSI_GAMMA * (1.0 - (pots_top[t][j] as f32 - eff_top[t][j] as f32).abs() / cfg.elig_psi_width.max(1.0))).max(0.0)
         } else {
             fired[t][j]
         }
@@ -934,7 +947,7 @@ pub fn train_recurrent(cfg: &RsnnConfig) -> u64 {
             for tt in 0..ttot {
                 for j in 0..ls {
                     post[z][tt][j] = if use_bump {
-                        (PSI_GAMMA * (1.0 - (pots[z][tt][j] as f32 - effs[z][tt][j] as f32).abs() / PSI_WIDTH)).max(0.0)
+                        (PSI_GAMMA * (1.0 - (pots[z][tt][j] as f32 - effs[z][tt][j] as f32).abs() / cfg.elig_psi_width.max(1.0))).max(0.0)
                     } else if cfg.subthreshold_psi {
                         (pots[z][tt][j] as f32 / theta[z][j]).clamp(0.0, 1.0)
                     } else {
@@ -1076,7 +1089,7 @@ fn train_multilayer(cfg: &RsnnConfig, mut net: Network, layer_entries: &[Vec<(i3
                     post[z][tt][j] = if use_bump {
                         // normalized bump pseudo-derivative ψ = γ·max(0, 1−|v−eff|/θ), centered at the
                         // ADAPTIVE firing threshold eff (so it stays alive when adaptation raises the bar)
-                        (PSI_GAMMA * (1.0 - (pots[z][tt][j] as f32 - effs[z][tt][j] as f32).abs() / PSI_WIDTH)).max(0.0)
+                        (PSI_GAMMA * (1.0 - (pots[z][tt][j] as f32 - effs[z][tt][j] as f32).abs() / cfg.elig_psi_width.max(1.0))).max(0.0)
                     } else if cfg.subthreshold_psi {
                         (pots[z][tt][j] as f32 / theta[z][j]).clamp(0.0, 1.0)
                     } else {
@@ -1169,6 +1182,12 @@ fn train_multilayer(cfg: &RsnnConfig, mut net: Network, layer_entries: &[Vec<(i3
 
 /// Train the backward-fed recurrent side-car (see `engine_config_sidecar`) on temporal XOR; held-out permille.
 pub fn train_sidecar(cfg: &RsnnConfig) -> u64 {
+    train_sidecar_task(cfg, xor_task)
+}
+
+/// The backward-fed recurrent side-car (L1 skips to L3 via +2; L2 is a recurrent scratchpad; L3↔L2 loop, L3
+/// read) on an arbitrary binary-labelled sequence task.
+pub fn train_sidecar_task(cfg: &RsnnConfig, task: impl Fn(u64, usize) -> (Vec<usize>, usize)) -> u64 {
     let mut net = Network::new(cfg.engine_config_sidecar());
     net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
     let (uc, ur) = (cfg.up_count as usize, cfg.up_radius);
@@ -1180,7 +1199,7 @@ pub fn train_sidecar(cfg: &RsnnConfig) -> u64 {
         vec![(0i32, n, r), (1i32, n, r)], // L2: self + forward
         vec![(-1i32, n, r)],        // L3: backward
     ];
-    train_multilayer(cfg, net, &layer_entries, xor_task)
+    train_multilayer(cfg, net, &layer_entries, task)
 }
 
 /// Train the clean hidden-recurrent stack (see `engine_config_hidden_rec`) on temporal XOR; permille.
@@ -1198,13 +1217,21 @@ pub fn train_hidden_rec_task(cfg: &RsnnConfig, task: impl Fn(u64, usize) -> (Vec
     net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
     let (uc, ur) = (cfg.up_count as usize, cfg.up_radius);
     let (n, r) = (cfg.rec_count as usize, cfg.rec_radius);
-    let l2 = if n > 0 { vec![(1i32, uc, ur), (0i32, n, r)] } else { vec![(1i32, uc, ur)] };
-    let layer_entries = vec![
-        vec![(1i32, uc, ur)], // L0
-        vec![(1i32, uc, ur)], // L1
-        l2,                   // L2 (forward + level-0 recurrence)
-        vec![],               // L3 (read, no outgoing)
-    ];
+    let rec_entry = if n > 0 { vec![(1i32, uc, ur), (0i32, n, r)] } else { vec![(1i32, uc, ur)] };
+    let d = cfg.hidden_rec_depth.max(3);
+    // must mirror engine_config_hidden_rec's per-layer topology order: forward (+1) up to layer d-2, which
+    // also carries the level-0 recurrence; the read top (d-1) has no outgoing.
+    let layer_entries: Vec<Vec<(i32, usize, u32)>> = (0..d)
+        .map(|z| {
+            if z == d - 1 {
+                vec![]
+            } else if z == d - 2 {
+                rec_entry.clone()
+            } else {
+                vec![(1i32, uc, ur)]
+            }
+        })
+        .collect();
     train_multilayer(cfg, net, &layer_entries, task)
 }
 
@@ -1923,7 +1950,7 @@ mod tests {
                 for tt in 0..ttot { tr = tr * decay + fired[z][tt][i]; pretr[z][tt][i] = tr; }
             }
         }
-        let bump = |z: usize, tt: usize, j: usize| (PSI_GAMMA * (1.0 - (pots[z][tt][j] as f32 - effs[z][tt][j] as f32).abs() / PSI_WIDTH)).max(0.0);
+        let bump = |z: usize, tt: usize, j: usize| (PSI_GAMMA * (1.0 - (pots[z][tt][j] as f32 - effs[z][tt][j] as f32).abs() / cfg.elig_psi_width.max(1.0))).max(0.0);
         let rho = 1.0 - (2.0f32).powi(-(cfg.adapt_decay as i32));
         // L2 (z=2): forward (+1 -> L3) and recurrent (0 -> L2). Compare e under fired-ψ vs bump-ψ+εᵃ.
         for &(level, count, radius, tgtz) in &[(1i32, uc, ur, 3usize), (0i32, n, r, 2usize)] {
