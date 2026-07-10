@@ -1862,7 +1862,7 @@ mod tests {
             c.seed = s;
             c.task_seed = s;
             c.size = 32;
-            c.up_count = 32; // denser forward drive (starvation test)
+            c.up_count = 64; // denser forward drive (starvation test)
             c.delay = 8;
             c.trials = 1500;
             c.rate_reg = 5.0;
