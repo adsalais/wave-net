@@ -210,6 +210,7 @@ impl RsnnConfig {
                 TopologyLevel { level: 1, radius: r, count: n }, // L2 → L3
             ]),
             mk(vec![
+                TopologyLevel { level: 0, radius: r, count: n },  // L3 self-recurse (holds state, like L2)
                 TopologyLevel { level: 1, radius: r, count: n },  // L3 → L4 (side-car writes back to forward)
                 TopologyLevel { level: -1, radius: r, count: n }, // L3 → L2 (loop back)
             ]),
@@ -1251,7 +1252,7 @@ pub fn train_sidecar_deep_task(cfg: &RsnnConfig, task: impl Fn(u64, usize) -> (V
         vec![(1i32, uc, ur)],              // L0: +1 → L1
         vec![(3i32, uc, ur)],              // L1: +3 skip → L4
         vec![(0i32, n, r), (1i32, n, r)],  // L2: self, +1 → L3
-        vec![(1i32, n, r), (-1i32, n, r)], // L3: +1 → L4 (write back), -1 → L2 (loop)
+        vec![(0i32, n, r), (1i32, n, r), (-1i32, n, r)], // L3: self, +1 → L4 (write back), -1 → L2 (loop)
         vec![(1i32, uc, ur), (-2i32, n, r)], // L4: +1 → L5, -2 → L2 (drive side-car)
         vec![],                            // L5: read
     ];
