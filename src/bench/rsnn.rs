@@ -1856,37 +1856,33 @@ mod tests {
     fn sidecar_deep_parity() {
         // The deeper 6-layer side-car (forward L1→L4→L5, 2-layer side-car L2↔L3) vs FF and the plain 4-layer
         // side-car, on parity N=4, size 32, 3 seeds. Does deepening the side-car improve over 837/952/897?
-        let seeds = [0xE9_0B_0A17u64]; // worst seed only (fast iteration)
-        let base = |s: u64| {
+        let s = 0xE9_0B_0A17u64; // worst seed only (fast iteration)
+        let base = || {
             let mut c = RsnnConfig::demo();
             c.seed = s;
             c.task_seed = s;
             c.size = 32;
-            c.up_count = 64; // denser forward drive (starvation test)
+            c.up_count = 64;
             c.delay = 8;
             c.trials = 1500;
             c.rate_reg = 5.0;
             c.rate_target_permille = 100;
-            c.rec_radius = 4;
             c.rec_tau = 20.0;
             c.rec_stab = 5.0;
-            c.rec_count = 32;
             c.elig_beta = 0.4;
             c
         };
-        let (mut wf, mut ws, mut wd) = (1000u64, 1000u64, 1000u64);
-        for &s in &seeds {
-            let mut ff = base(s);
-            ff.rec_count = 0;
-            let fa = train_hidden_rec_task(&ff, |seed, t| task_parity(seed, t, 4));
-            let sa = train_sidecar_task(&base(s), |seed, t| task_parity(seed, t, 4));
-            let da = train_sidecar_deep_task(&base(s), |seed, t| task_parity(seed, t, 4));
-            eprintln!("seed {s:#x}  FF {fa}  sidecar {sa}  sidecar-deep {da}");
-            wf = wf.min(fa);
-            ws = ws.min(sa);
-            wd = wd.min(da);
+        let mut ff = base();
+        ff.rec_count = 0;
+        eprintln!("FF {}", train_hidden_rec_task(&ff, |seed, t| task_parity(seed, t, 4)));
+        for (rc, rr) in [(16u32, 3u32), (32, 5), (32, 6)] {
+            let mut c = base();
+            c.rec_count = rc;
+            c.rec_radius = rr;
+            let sa = train_sidecar_task(&c, |seed, t| task_parity(seed, t, 4));
+            let da = train_sidecar_deep_task(&c, |seed, t| task_parity(seed, t, 4));
+            eprintln!("rec {rc}/r{rr}  sidecar {sa}  sidecar-deep {da}");
         }
-        eprintln!("WORST:  FF {wf}  sidecar {ws}  sidecar-deep {wd}");
     }
 
     #[test]
