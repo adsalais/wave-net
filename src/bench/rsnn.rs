@@ -1078,7 +1078,7 @@ pub fn train_recurrent(cfg: &RsnnConfig) -> u64 {
 /// with `out_weights`. Trains every trainable weight (forward, backward, lateral, skip) via the factored
 /// temporal eligibility × (symmetric-top / DFA-deep) signal. Returns held-out permille. Used for custom
 /// topologies like the side-car; `train_recurrent` keeps its own uniform loop.
-fn train_multilayer(cfg: &RsnnConfig, mut net: Network, layer_entries: &[Vec<(i32, usize, u32)>], task: impl Fn(u64, usize) -> (Vec<usize>, usize)) -> u64 {
+fn train_multilayer(cfg: &RsnnConfig, mut net: Network, layer_entries: &[Vec<(i32, usize, u32)>], task: impl Fn(u64, usize) -> (Vec<usize>, usize)) -> (u64, Network) {
     let l = net.layer_count();
     let ls = (cfg.size * cfg.size) as usize;
     let top = l - 1;
@@ -1220,7 +1220,7 @@ fn train_multilayer(cfg: &RsnnConfig, mut net: Network, layer_entries: &[Vec<(i3
             correct += 1;
         }
     }
-    (correct as u64 * 1000) / holdout as u64
+    ((correct as u64 * 1000) / holdout as u64, net)
 }
 
 /// Train the backward-fed recurrent side-car (see `engine_config_sidecar`) on temporal XOR; held-out permille.
@@ -1231,6 +1231,12 @@ pub fn train_sidecar(cfg: &RsnnConfig) -> u64 {
 /// The backward-fed recurrent side-car (L1 skips to L3 via +2; L2 is a recurrent scratchpad; L3↔L2 loop, L3
 /// read) on an arbitrary binary-labelled sequence task.
 pub fn train_sidecar_task(cfg: &RsnnConfig, task: impl Fn(u64, usize) -> (Vec<usize>, usize)) -> u64 {
+    train_sidecar_task_net(cfg, task).0
+}
+
+/// Same as `train_sidecar_task` but also returns the trained net — for post-training probes (e.g. the σ
+/// criticality measurement, which only shows the recurrence collapse once the recurrent weights have grown).
+pub fn train_sidecar_task_net(cfg: &RsnnConfig, task: impl Fn(u64, usize) -> (Vec<usize>, usize)) -> (u64, Network) {
     let mut net = Network::new(cfg.engine_config_sidecar());
     net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
     let (uc, ur) = (cfg.up_count as usize, cfg.up_radius);
@@ -1261,7 +1267,7 @@ pub fn train_sidecar_deep_task(cfg: &RsnnConfig, task: impl Fn(u64, usize) -> (V
         vec![(1i32, uc, ur), (-1i32, n, r)], // L4: +1 → L5, -1 → L3 (drive side-car top)
         vec![],                            // L5: read
     ];
-    train_multilayer(cfg, net, &layer_entries, task)
+    train_multilayer(cfg, net, &layer_entries, task).0
 }
 
 /// Train the clean hidden-recurrent stack (see `engine_config_hidden_rec`) on temporal XOR; permille.
@@ -1294,7 +1300,7 @@ pub fn train_hidden_rec_task(cfg: &RsnnConfig, task: impl Fn(u64, usize) -> (Vec
             }
         })
         .collect();
-    train_multilayer(cfg, net, &layer_entries, task)
+    train_multilayer(cfg, net, &layer_entries, task).0
 }
 
 /// Train the L0→L1→L2 stack with the L2↔L3 loop (see `engine_config_l2l3loop`) on temporal XOR; permille.
@@ -1310,7 +1316,7 @@ pub fn train_l2l3loop(cfg: &RsnnConfig) -> u64 {
         vec![(0i32, n, r), (1i32, n, r)], // L2: self + forward
         vec![(-1i32, n, r)],              // L3: backward
     ];
-    train_multilayer(cfg, net, &layer_entries, xor_task)
+    train_multilayer(cfg, net, &layer_entries, xor_task).0
 }
 
 /// σ criticality diagnostic — single-spike **damage spreading** (MEASUREMENT ONLY, no control). Under a
@@ -1455,6 +1461,38 @@ mod tests {
                 let t: Vec<f64> = traj_r.iter().map(|x| (x * 10.0).round() / 10.0).collect();
                 eprintln!("rc {rc:>2} up {up:>2}  σ_L0 {sig_l0:.3}  σ_rec(L2) {sig_rec:.3}  rec-avalanche {t:?}");
             }
+        }
+    }
+
+    #[test]
+    #[ignore] // expensive (trains several nets); run manually in --release
+    fn sigma_post_training() {
+        // Does σ measured on the TRAINED side-car track the rec_count collapse? The collapse is
+        // training-induced (±1 recurrence dies at init, but the recurrent weights grow during training → the
+        // recurrent gain rises → σ>1). Train the side-car on parity N=4 (size 32, up 32) across rec_count,
+        // then probe σ_rec (force a spike in the L2 scratchpad) on the *trained* net. Expect σ_rec ≈ 1 where
+        // parity works, σ_rec > 1 where it collapses.
+        let s = 0xE9_0B_0A17u64;
+        for rc in [8u32, 16, 24, 32, 48] {
+            let mut c = RsnnConfig::demo();
+            c.seed = s;
+            c.task_seed = s;
+            c.size = 32;
+            c.up_count = 32;
+            c.up_radius = 3;
+            c.delay = 8;
+            c.trials = 1500;
+            c.rate_reg = 5.0;
+            c.rate_target_permille = 100;
+            c.rec_count = rc;
+            c.rec_radius = 4;
+            c.rec_tau = 20.0;
+            c.rec_stab = 5.0;
+            c.elig_beta = 0.4;
+            let (acc, mut net) = train_sidecar_task_net(&c, |seed, t| task_parity(seed, t, 4));
+            let (traj, sig_rec) = sigma_probe(&mut net, &c, 32, 8, 8, Some(2));
+            let t: Vec<f64> = traj.iter().map(|x| (x * 10.0).round() / 10.0).collect();
+            eprintln!("rc {rc:>2}  parity {acc}  σ_rec(trained) {sig_rec:.3}  avalanche {t:?}");
         }
     }
 
