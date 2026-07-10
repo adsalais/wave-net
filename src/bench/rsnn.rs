@@ -1542,6 +1542,66 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // temp diagnostic
+    fn _diag_fair_elig_magnitude() {
+        // Why is the fair hidden-rec +rec test byte-identical across β? Compare the eligibility e_ij under the
+        // OLD rule (fired-ψ) vs the COMPLETED rule (bump-ψ + εᵃ) for L2's forward (+1) and recurrent (0)
+        // synapses over one calibrated (untrained) trial. If both are ~0, there's nothing to train and β is
+        // inert here (an uninformative config); if they differ substantially, the byte-identical training
+        // result is convergence-to-the-same-collapse instead.
+        let mut cfg = RsnnConfig::demo();
+        cfg.seed = 0xE9_0B_0A17;
+        cfg.task_seed = 0xE9_0B_0A17;
+        cfg.size = 16;
+        cfg.up_count = 16;
+        cfg.delay = 20;
+        cfg.rate_reg = 5.0;
+        cfg.rec_count = 24;
+        cfg.rec_radius = 4;
+        cfg.rec_tau = 20.0;
+        cfg.rec_stab = 5.0;
+        let mut net = Network::new(cfg.engine_config_hidden_rec());
+        net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
+        let l = net.layer_count();
+        let ls = (cfg.size * cfg.size) as usize;
+        let (uc, ur) = (cfg.up_count as usize, cfg.up_radius);
+        let (n, r) = (cfg.rec_count as usize, cfg.rec_radius);
+        let (_, spikes, pots, effs) = xor_trial_layers(&mut net, &cfg, 1, 0, 0);
+        let ttot = spikes[l - 1].len();
+        let mut fired = vec![vec![vec![0f32; ls]; ttot]; l];
+        let mut pretr = vec![vec![vec![0f32; ls]; ttot]; l];
+        let decay = 1.0 - 1.0 / cfg.rec_tau.max(1.0);
+        for z in 1..l {
+            for (tt, wv) in spikes[z].iter().enumerate() {
+                for &loc in wv { fired[z][tt][loc as usize] = 1.0; }
+            }
+            for i in 0..ls {
+                let mut tr = 0.0;
+                for tt in 0..ttot { tr = tr * decay + fired[z][tt][i]; pretr[z][tt][i] = tr; }
+            }
+        }
+        let bump = |z: usize, tt: usize, j: usize| (PSI_GAMMA * (1.0 - (pots[z][tt][j] as f32 - effs[z][tt][j] as f32).abs() / PSI_WIDTH)).max(0.0);
+        let rho = 1.0 - (2.0f32).powi(-(cfg.adapt_decay as i32));
+        // L2 (z=2): forward (+1 -> L3) and recurrent (0 -> L2). Compare e under fired-ψ vs bump-ψ+εᵃ.
+        for &(level, count, radius, tgtz) in &[(1i32, uc, ur, 3usize), (0i32, n, r, 2usize)] {
+            let (mut e_fired, mut e_full, mut n_nz_fired, mut n_nz_full) = (0f64, 0f64, 0usize, 0usize);
+            for i in 0..ls {
+                let sg = (2 * ls + i) as u32;
+                for k in 0..count {
+                    let j = target_of(cfg.seed, sg, i as u32, level, k as u32, radius, cfg.size) as usize;
+                    let ef: f32 = (0..ttot).map(|tt| pretr[2][tt][i] * fired[tgtz][tt][j]).sum();
+                    let eb = elig_adapt_sum(ttot, 0.4, rho, |tt| bump(tgtz, tt, j), |tt| pretr[2][tt][i]);
+                    e_fired += ef.abs() as f64; e_full += eb.abs() as f64;
+                    if ef != 0.0 { n_nz_fired += 1; }
+                    if eb != 0.0 { n_nz_full += 1; }
+                }
+            }
+            let tag = if level > 0 { "L2 forward +1" } else { "L2 recurrent 0" };
+            eprintln!("{tag}: fired-ψ Σ|e| {e_fired:.1} nz {n_nz_fired}   bump+εᵃ Σ|e| {e_full:.1} nz {n_nz_full}");
+        }
+    }
+
+    #[test]
     #[ignore] // expensive; run manually in --release
     fn fair_recurrence_eprop_complete() {
         // THE headline re-run: the airtight fair recurrence test (deep-FF ~986 vs +hidden-rec ~498/chance),
