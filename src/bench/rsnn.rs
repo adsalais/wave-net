@@ -1542,6 +1542,81 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // expensive; run manually in --release
+    fn parity_fixed_vs_trained_recurrence() {
+        // The informative parity test (size 16, alive read layer). Four columns: FF (no recurrence, trained
+        // forward); FIXED-rec (±1 recurrence, readout only — classic LSM); CRUDE-rec (trained via spike-ψ);
+        // COMPLETED-rec (trained via the ALIF εᵃ eligibility). Worst-seed over 3 seeds. Tests whether the
+        // completed credit rule lets *trained* recurrence beat the *fixed* recurrence reservoir.
+        let seeds = [0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF];
+        for n in [3usize, 4] {
+            let mk = || {
+                let mut c = RsnnConfig::demo();
+                c.size = 16;
+                c.up_count = 16;
+                c.delay = 8;
+                c.trials = 1500;
+                c.rate_reg = 5.0;
+                c.rate_target_permille = 100;
+                c
+            };
+            let (mut wff, mut wfix, mut wcru, mut wcom) = (1000u64, 1000u64, 1000u64, 1000u64);
+            for &s in &seeds {
+                let run = |c: &RsnnConfig| train_sequence(c, |seed, t| task_parity(seed, t, n));
+                let mut ff = mk();
+                ff.seed = s; ff.task_seed = s; ff.rec_count = 0;
+                let mut rec = mk();
+                rec.seed = s; rec.task_seed = s; rec.rec_count = 24; rec.rec_radius = 4; rec.rec_tau = 20.0;
+                let mut fix = rec.clone(); fix.hidden_lr = 0.0;             // fixed recurrence, readout only
+                let mut cru = rec.clone(); cru.elig_beta = 0.0;            // crude spike-ψ eligibility
+                let mut com = rec.clone(); com.elig_beta = 0.4;           // completed ALIF εᵃ eligibility
+                let (fa, xa, ca, ma) = (run(&ff), run(&fix), run(&cru), run(&com));
+                eprintln!("parity N={n} seed {s:#x}  FF {fa}  fixed-rec {xa}  crude-rec {ca}  completed-rec {ma}");
+                wff = wff.min(fa); wfix = wfix.min(xa); wcru = wcru.min(ca); wcom = wcom.min(ma);
+            }
+            eprintln!("parity N={n} WORST:  FF {wff}  fixed-rec {wfix}  crude-rec {wcru}  completed-rec {wcom}");
+        }
+    }
+
+    #[test]
+    #[ignore] // temp diagnostic
+    fn _diag_fair_hidden_lr_sensitivity() {
+        // Is the fair +rec held-out sensitive to hidden training AT ALL? If (hidden_lr 0) == (hidden_lr>0) and
+        // every β gives the same number, the config is INERT to hidden weights (collapse masks them) — which
+        // fully explains byte-identical-across-β without a bug. If hidden_lr moves it but β doesn't, that would
+        // point at a β bug. Positive control: parity (known β-sensitive) must move.
+        let mk = |up: u32, delay: usize| {
+            let mut c = RsnnConfig::demo();
+            c.seed = 0xE9_0B_0A17;
+            c.task_seed = 0xE9_0B_0A17;
+            c.size = 16;
+            c.up_count = up;
+            c.delay = delay;
+            c.trials = 1500;
+            c.rate_reg = 5.0;
+            c.rec_count = 24;
+            c.rec_radius = 4;
+            c.rec_tau = 20.0;
+            c.rec_stab = 5.0;
+            c
+        };
+        eprintln!("--- FAIR hidden-rec (up16, delay20) ---");
+        for (hl, b) in [(0.0f32, 0.0f32), (0.004, 0.0), (0.004, 0.4), (0.004, 2.0), (0.02, 0.4)] {
+            let mut c = mk(16, 20);
+            c.hidden_lr = hl;
+            c.elig_beta = b;
+            eprintln!("hidden_lr {hl}  elig_beta {b}  ->  {}", train_hidden_rec(&c));
+        }
+        eprintln!("--- parity control (up16, delay8, N=3) positive control ---");
+        for (hl, b) in [(0.0f32, 0.0f32), (0.004, 0.0), (0.004, 0.4)] {
+            let mut c = mk(16, 8);
+            c.hidden_lr = hl;
+            c.elig_beta = b;
+            eprintln!("hidden_lr {hl}  elig_beta {b}  ->  {}", train_sequence(&c, |seed, t| task_parity(seed, t, 3)));
+        }
+    }
+
+    #[test]
     #[ignore] // temp diagnostic
     fn _diag_fair_elig_magnitude() {
         // Why is the fair hidden-rec +rec test byte-identical across β? Compare the eligibility e_ij under the
