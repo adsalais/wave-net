@@ -5,7 +5,7 @@
 use std::sync::{Arc, Mutex};
 
 use crate::wave_net::config::Config;
-use crate::wave_net::neurons::{Layer, ADAPT_SHIFT};
+use crate::wave_net::neurons::{Layer, WeightQuant, ADAPT_SHIFT};
 use crate::wave_net::synapse::Synapse;
 use crate::wave_net::wave::process_layer;
 
@@ -44,6 +44,21 @@ impl Network {
     /// it integrates its input into potential and never fires. Mirrors L0's input-transducer role.
     pub fn new_with_readout(config: Config) -> Network {
         Network::build(config, true)
+    }
+
+    /// Set the shadow→weight quantizer on every layer and requantise once. On a fresh ±1 net → `Ternary`
+    /// this is a no-op (per-row γ = 1 → ±1); on a trained net it re-derives `out_weights` under the new mode.
+    pub fn set_weight_quant(&mut self, q: WeightQuant) {
+        for layer in self.layers.iter_mut() {
+            layer.weight_quant = q;
+            if layer.total_slots == 0 {
+                continue;
+            }
+            let rows = layer.out_shadow.len() / layer.total_slots;
+            for i in 0..rows {
+                layer.requantize_row(i);
+            }
+        }
     }
 
     fn build(config: Config, readout_last: bool) -> Network {
@@ -494,5 +509,27 @@ mod tests {
         *hits.lock().unwrap() = 0; // reset, then one wave must still hit the user listener
         net.wave(&[0]);
         assert_eq!(*hits.lock().unwrap(), 1, "user listener must survive measurement");
+    }
+
+    #[test]
+    fn set_weight_quant_flips_mode_and_is_noop_on_fresh_net() {
+        use crate::wave_net::neurons::WeightQuant;
+        use crate::wave_net::synapse::TopologyLevel;
+        let lc = LayerConfig {
+            topology: vec![TopologyLevel { level: 1, radius: 1, count: 4 }],
+            leak: (3, 5),
+            cooldown_base: 2,
+            inhibitor_ratio: 0,
+            threshold_jitter: 0,
+            baseline_init: 6,
+            adapt_bump: 0,
+            adapt_decay: 5,
+        };
+        let mut net = Network::new(Config { seed: 5, size: 4, layers: vec![lc; 2] });
+        let before = net.with_layer(0, |l| l.out_weights.clone()); // fresh ±1
+        net.set_weight_quant(WeightQuant::Ternary);
+        let after = net.with_layer(0, |l| l.out_weights.clone());
+        assert_eq!(before, after, "fresh ±1 net stays ±1 under ternary (γ=1)");
+        assert_eq!(net.with_layer(0, |l| l.weight_quant), WeightQuant::Ternary);
     }
 }
