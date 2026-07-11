@@ -488,6 +488,19 @@ pub(crate) mod harness {
         }
         if n == 0 { 0.0 } else { (logsum / n as f64).exp() }
     }
+
+    /// Fraction of stored weights that are 0, over the computational layers `1..L` (BitNet sparsity).
+    pub(crate) fn weight_sparsity(net: &Network) -> f64 {
+        let l = net.layer_count();
+        let (mut zeros, mut total) = (0usize, 0usize);
+        for z in 1..l {
+            net.with_layer(z, |lz| {
+                zeros += lz.out_weights.iter().filter(|&&w| w == 0).count();
+                total += lz.out_weights.len();
+            });
+        }
+        if total == 0 { 0.0 } else { zeros as f64 / total as f64 }
+    }
 }
 
 #[cfg(test)]
@@ -671,5 +684,21 @@ mod tests {
         let _acc = train_and_eval(&mut net, &entries, seed, seed, &cfg, single_task);
         let after = rec_shadow(&net);
         assert_ne!(before, after, "the level-0 recurrent edge on the active layer must train (non-FF path)");
+    }
+
+    #[test]
+    fn ternary_net_trains_above_chance() {
+        use crate::wave_net::neurons::WeightQuant;
+        // Ternary weights must still train a separable 2-class task above chance (generous fan-in).
+        let seed = 0xE9_0B_0A17u64;
+        let (mut net, entries) = make_ff(seed, 16, 4, 32, 3, 20, 6);
+        net.set_weight_quant(WeightQuant::Ternary);
+        let mut cfg = ff_cfg(400, 0.004, 0.0);
+        cfg.size = 16;
+        let acc = train_and_eval(&mut net, &entries, seed, seed, &cfg, single_task);
+        // ternary keeps weights in {−1,0,+1} the whole run
+        let ternary = net.with_layer(1, |l| l.out_weights.iter().all(|&w| w == -1 || w == 0 || w == 1));
+        assert!(ternary, "weights must stay ternary during training");
+        assert!(acc > 600, "ternary net should train above chance: {acc}");
     }
 }
