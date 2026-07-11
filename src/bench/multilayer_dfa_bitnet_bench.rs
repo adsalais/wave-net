@@ -132,4 +132,35 @@ mod tests {
             eprintln!("{rr}/{rc:<3}  {:<16}  {:<16}  {:<16}  {:.1}/{:.1}", cells[0], cells[1], cells[2], sp[1] * 100.0, sp[2] * 100.0);
         }
     }
+
+    #[test]
+    #[ignore] // expensive; run manually in --release
+    fn bitnet_ff_depth_fanin() {
+        // Ternary needs more fan-in than int8 (the XOR r4/c32→c64 jump). Sweep forward (radius, count) at
+        // depths 8 & 12 to see how much fan-in each quantizer needs to train deep. SINGLE seed (fast; noisy).
+        // Reports best@trials-to-peak per quantizer + ternary sparsity.
+        let seed = 0xE9_0B_0A17u64;
+        let (ee, pat, max) = (300usize, 3usize, 3000usize);
+        eprintln!("== BitNet A/B/C: FF depth × fan-in (size 32, read top; seed {seed:#x}; best@trials) ==");
+        eprintln!("depth  r/c      int8            pure            scaled          sp pure/scaled%");
+        for &depth in &[8usize, 12] {
+            for &(ur, uc) in &[(3u32, 48u32), (4, 64), (5, 96), (5, 128)] {
+                let (mut cells, mut sp) = (Vec::new(), Vec::new());
+                for &(_name, q) in &QUANTS {
+                    let (mut net, entries) = make_ff(seed, 32, depth, uc, ur, 20, 6);
+                    if let Some(qq) = q {
+                        net.set_weight_quant(qq);
+                    }
+                    let mut cfg = ff_cfg(0, 0.004, 0.0);
+                    cfg.size = 32;
+                    cfg.present = depth.max(6);
+                    cfg.read = depth.max(6);
+                    let (best, at) = train_and_eval_best(&mut net, &entries, seed, seed, &cfg, single_task, ee, pat, max);
+                    cells.push(format!("{best}@{at}"));
+                    sp.push(weight_sparsity(&net));
+                }
+                eprintln!("{depth:>4}  {ur}/{uc:<3}   {:<14}  {:<14}  {:<14}  {:.1}/{:.1}", cells[0], cells[1], cells[2], sp[1] * 100.0, sp[2] * 100.0);
+            }
+        }
+    }
 }
