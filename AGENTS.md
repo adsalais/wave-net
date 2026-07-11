@@ -152,9 +152,11 @@ across every benchmark and seed (a strict improvement, no downside).** Headline 
 - **`rate_reg` is a *conclusive* liveness rescue for feed-forward depth.** A soft per-neuron term
   `c_reg·(rate − target)` folded into the e-prop learning signal — the LSNN/e-prop mechanism,
   `RsnnConfig.rate_reg` — reliably revives a *liveness-starved* deep FF stack: chance → ~980 on temporal
-  XOR, 5-seed robust. Two hard rules: it **requires ALIF** (a LIF deep stack cannot be revived — adaptation
-  is load-bearing), and it belongs on the **forward path only** — on recurrent weights the same term
-  homogenizes the class signal and *hurts* (use the per-layer, class-preserving `rec_stab` there instead).
+  XOR, 5-seed robust. Hard rule: it **requires ALIF** (a LIF deep stack cannot be revived — adaptation is
+  load-bearing). **Apply it across all layer types — `rate_reg` everywhere (2026-07-11).** This supersedes
+  the earlier "forward-path-only, use the per-layer class-preserving `rec_stab` on recurrent weights" rule:
+  `rec_stab` was not carrying its weight, so it is **set aside** (its code stays in `rsnn.rs`; resurrect only
+  if a recurrent config is shown to need it). See `docs/experiments_results.md` (2026-07-11).
 - **ALIF adaptation is both a working memory *and* load-bearing for liveness.** It is a strong ~64-wave
   held-category memory (store-recall); it does **not** help linear echo (MC) or nonlinear temporal
   computation (XOR) feed-forward — LIF wins those short tasks — **but it is *necessary* for deep-FF
@@ -302,12 +304,13 @@ src/
     neurons.rs           # Layer — per-neuron SoA state + inbox/outbox + stored out_weights/out_shadow + elig_pre/elig_post + decide_potential
     wave.rs              # process_layer — the per-layer wave step (decide accrues eligibility; generate reads stored weights)
     network.rs           # Network — orchestration, routing, deferred swap, listeners, readout layer, force_spike
-    eprop.rs             # the e-prop update primitive (eprop_update, windowed_eligibility) + train_ff driver
+    eprop.rs             # e-prop update primitives (eprop_update factored, eprop_update_synaptic non-factored per-synapse, windowed_eligibility) + train_ff driver
     critical_init.rs     # default init tools: critical_init (σ≈1), rate_match_init, forward_avalanche σ diagnostic, random_l0_input, layer_rates
   bench/                 # experiment harness (public-API only) — the learning rules + tasks live here (NO calibration)
     rsnn.rs              # trained readout (LSM) + feed-forward e-prop + multi-layer DFA (train_recurrent/train_multilayer) + FfInit {None,Sigma,RateMatch}
-                         #   + rate_reg (FF liveness rescue) + rec_stab (per-layer recurrent stabilizer) + sequence tasks
+                         #   + rate_reg (liveness rescue, used on ALL layer types) + rec_stab (per-layer recurrent stabilizer; SET ASIDE — see experiments_results.md) + sequence tasks
                          #   (train_sequence: parity/distractor/flip-flop) + the exhaustive recurrence-null benchmark suite
+    multilayer_dfa.rs    # staged self-contained multi-layer temporal-DFA training engine (→ wave_net later); built on eprop_update_synaptic; depends only on wave_net; rsnn.rs untouched
     eprop.rs             # v1 threshold-only e-prop (historical; the approach the pivot moved past)
     readout.rs, linalg.rs # spike-count features / integer nearest-centroid; f64 ridge + LU solve
     store_recall.rs, memory_capacity.rs, temporal_xor.rs, stream.rs # the ALIF-vs-LIF task suite

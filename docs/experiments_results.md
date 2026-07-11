@@ -271,3 +271,39 @@ replacement. Recurrent criticality (the side-car *loop gain* — a separate quan
 measures) is **not yet handled**: the greedy-FF structure doesn't map to the cyclic (L2↔L3) topology. That
 extension + validation on the recurrent benchmarks is required before it replaces calibration for recurrent
 configs; calibration is retained (downgraded to a bench tool) as the fallback until then.
+
+## Multi-layer temporal-DFA training engine + the `rate_reg`-everywhere decision (2026-07-11)
+
+**A reusable training engine, staged in `bench`.** `src/bench/multilayer_dfa.rs` extracts the temporal
+multi-topology multi-layer-DFA rule (the core of `rsnn.rs`'s `train_multilayer`/`train_recurrent`) into a
+**self-contained, task-agnostic** module: `temporal_eligibility` (decaying pre-trace × ψ × optional ALIF εᵃ)
++ `multilayer_dfa_step`, built on a new engine primitive `Network::eprop_update_synaptic` — a **non-factored**
+per-synapse update. (The temporal eligibility `e_ij = Σ_t pretr_i(t)·ψ_j(t)` is *not* separable into
+`pre_i·ψ_j`, so the factored `eprop_update` cannot apply it; `eprop_update` is left byte-identical, since f32
+multiplication is not associative.) The engine owns the update + eligibility; the caller owns the trial,
+readout, and learning signal — seam: `TrialRecords{spikes,pots,effs}` in, `signal[layer][j]` in. It depends
+**only on `wave_net`** (helpers `elig_adapt_sum`/`dfa_weight`/`PSI_*` are *copied*, not imported) so it lifts
+into the engine wholesale once proven; **`bench/rsnn.rs` and its benchmarks are untouched**. Design + TDD plan
+under `docs/superpowers/{specs,plans}/2026-07-11-multilayer-dfa-engine*`. Verified: trains temporal XOR
+(held-out > 640, ignored/`--release`), a 2-class task to ceiling in the generous-fan-in regime (size 16,
+`up_count` 32; 4 layers at size 8 is fan-in-starved → chance), trains recurrent (level-0) edges, and is
+deterministic for both the membrane (β=0) and ALIF-εᵃ (β>0) eligibility flavors.
+
+**`rate_reg` everywhere; `rec_stab` set aside — supersedes the AGENTS.md "forward-path-only" hard rule.**
+The earlier rule (AGENTS.md) held that `rate_reg` (per-neuron `c_reg·(rate − target)`) belongs on the forward
+path *only*, and that on recurrent weights it homogenizes the class signal and *hurts* — with the per-layer,
+class-preserving `rec_stab` as the recurrent substitute. **Current position: `rate_reg` is better across all
+layer types; `rec_stab` was not carrying its weight.** So `rate_reg` is now applied to every edge type
+(forward `+1`, lateral `0`, backward `−1/−2`) and `rec_stab` is dropped from the training signal — its code
+remains in `rsnn.rs` and can be resurrected if a recurrent config is shown to need it. The new engine's
+signal builder uses per-neuron `rate_reg` on all layers, no `rec_stab`.
+
+**Eligibility note — bump-ψ collapses under strong forward drive.** The bump pseudo-derivative
+`ψ = γ·max(0, 1 − |v − eff|/W)` (the β>0 path; `elig_psi_width` = W, default 16) goes to ~0 when a neuron's
+decide-time potential overshoots its effective threshold by more than W. Under strong drive (e.g. `up_count`
+32 at size 8) integer ±1 inputs push potentials well past `eff` (overshoot O(2–26)), so a *well-driven*
+layer's bump-ψ is frequently zero → its eligibility (hence its weight updates) is starved. Spike-ψ (β = 0)
+has no such gap and stays robust. Practical consequence: on strongly-driven layers, either widen
+`elig_psi_width` to match the potential-overshoot scale or use spike-ψ; the fixed W = 16 is tuned for
+near-threshold operation, not saturated drive. (This is why the engine's recurrent-edge training test uses
+spike-ψ; the eligibility-β path itself is covered by the `temporal_eligibility` unit tests.)
