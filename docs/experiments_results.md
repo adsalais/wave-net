@@ -253,6 +253,19 @@ regularization and treat init as a warm-start (our uc16/32); deep-FF signal-prop
 (Poole/Schoenholz, Pennington) says criticality enables depth but normalization can substitute — all three
 consistent with the regimes above.
 
+**Final decision (2026-07-11) — calibration removed *entirely* (clean slate; supersedes "calibration stays
+the default" above).** Calibration had caused recurring headaches in the recurrent experiments, and the
+study above shows it only ever *bootstraps* a marginal-fan-in stack. So it was dropped wholesale from
+`wave_net`/`bench` (`Network::calibrate`, `CalibrateParams`, `bench/calibrate.rs`, `FfInit::Calibrate`, and
+every call site) — the **frozen `wave_state_machine` keeps its own `calibrate`, untouched**. The standing
+discipline (see `AGENTS.md` → *Initialization*): **feed-forward nets train from raw weights** under a
+contract of **generous fan-in + a liveness assert** (target the `up_count ≥ 16` regime where even raw
+`FfInit::None` trains to ceiling); `Network::critical_init` (σ≈1) is the **rescue** for forced-starved
+substrates and the operating-point setter for *untrained forward measurement* (throughput bench,
+`profile_wave`); `rate_match_init` is a documented dead end. Benchmarks that depended on a calibrated
+substrate (two e-prop learning tests, one characterization value) are `#[ignore]`d pending re-analysis from
+the calibration-free baseline.
+
 **Status.** FF-validated; **`sigma_eprop_init` (rate-free, σ≈1) is the keeper** and the intended calibration
 replacement. Recurrent criticality (the side-car *loop gain* — a separate quantity `sigma_probe(Some(z))`
 measures) is **not yet handled**: the greedy-FF structure doesn't map to the cyclic (L2↔L3) topology. That

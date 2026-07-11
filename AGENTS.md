@@ -100,29 +100,38 @@ from adaptation. The boots-hot ALIF dynamics apply to the computational layers `
 non-spiking, drain-only integrator (`Layer.readout`): it folds its input into potential and never
 fires, giving a clean cumulative signal for a trained readout — the mirror of L0's transducer role.
 
-## Calibration
+## Initialization — train from raw, no calibration
 
-`Network::calibrate(params, input)` tunes per-layer **baselines** until each layer fires near a target
-rate on a driven input, **with adaptation live** — bottom-up (each layer tuned once its feeder fires)
-then a few **global-refine** passes for the recurrent coupling. The step is symmetric (raises a
-too-hot layer, lowers a too-cold one), converging the baseline to where the self-regulated rate meets
-target. Calibration is **layer-owned**: each `Layer` tunes its own thresholds (`shift_threshold`,
-`calibrate_step`); the `Network` only measures rates (`measure_layer_rates`, which saves/restores the
-caller's listeners) and delegates. Deterministic.
+**There is no calibration.** The old `Network::calibrate` (per-layer baseline tuning to a target firing
+rate) was **removed** from `wave_net`/`bench` — it caused recurring headaches and, per the `None`-init
+ablation (`docs/experiments_results.md`), only ever *bootstrapped* a marginal-fan-in stack; training's
+`rate_reg` does the same job. (The **frozen** `wave_state_machine` keeps its own `calibrate` for its
+pinned historical benches — do not touch it.)
 
-**Calibration is a *sensible initialization*, not a runtime target.** It runs **once**, before training, to
-boot the net into a live, propagating regime — the literature's "initialize sensibly" — and is then left
-alone; **training + adaptation own the operating point from there.** The calibrated *rate does not need to
-transfer to the task*: `calibrate` measures ~10% on a *sparse random* drive, but a denser task cue runs the
-net at 20–40%, and that is fine (more propagation, ALIF-quenched). So **do not read the calibrated rate as
-the task operating point, and do not re-calibrate to chase a rate during a run.** (e-prop/LSNN uses a soft
-firing-rate *regularizer* in the loss, never a separate proxy-drive calibration — see `docs/related-work.md`,
-2026-07-09.)
+**Feed-forward nets train from raw weights** (init to the procedural `±1` sign). The contract is:
+**generous fan-in + a liveness check**. The init study (deep 5-layer, width 32) gives a clean
+three-regime picture by substrate richness:
 
-**Known limitation:** because it is only an init, calibration targets a *sustained random* drive at one
-operating point; it does **not** guarantee a *transient, sparse, task-specific* cue propagates through a
-deep stack (a sub-critical net lets the cue die with depth). A principled generic (per-layer gain /
-criticality) calibration is unsolved — see the recurrence null in `docs/experiments_results.md`.
+- **Generous fan-in** (e.g. `up_count ≥ 16` at width 32): the init is irrelevant — even raw (`FfInit::None`)
+  trains to ceiling; `rate_reg` + ALIF bring every layer to life. **This is the target regime — size the
+  fan-in here.**
+- **Marginal fan-in:** raw training can sit at *chance* (a layer never bootstraps). This is the only place
+  calibration ever helped; the fix now is **more fan-in**, verified by a **liveness assert** (every
+  computational layer must fire above a floor after training — *fail loud*, then bump fan-in).
+- **Severe starvation:** even a live init limps; `Network::critical_init` (σ≈1, edge of chaos) is the
+  **rescue** — it uniquely hands training a trainable substrate. Not a default; a tool for forced-starved
+  configs.
+
+**Engine init tools (`wave_net::critical_init`):** `Network::critical_init(seed, frac, params)` drives each
+forward hop's branching ratio σ→1 via the e-prop update (rate-free, edge-of-chaos) — the *rescue* init and
+the operating-point setter for **untrained forward measurement** (`benches/throughput.rs`, `profile_wave`,
+which have no training to bring layers alive). `forward_avalanche` is the per-hop σ diagnostic;
+`rate_match_init` (flat rate) is a **documented dead end** for trained accuracy (a denser top trains
+*worse* — density is not the lever, σ≈1/information is). Full study in `docs/experiments_results.md`.
+
+**Do not re-introduce a rate set-point / calibration.** e-prop/LSNN uses a soft firing-rate *regularizer*
+(`rate_reg`) folded into the learning signal, never a separate proxy-drive calibration — see
+`docs/related-work.md` (2026-07-09).
 
 ## Learning: what is built, and what it found
 
@@ -149,8 +158,8 @@ across every benchmark and seed (a strict improvement, no downside).** Headline 
 - **ALIF adaptation is both a working memory *and* load-bearing for liveness.** It is a strong ~64-wave
   held-category memory (store-recall); it does **not** help linear echo (MC) or nonlinear temporal
   computation (XOR) feed-forward — LIF wins those short tasks — **but it is *necessary* for deep-FF
-  propagation** (removing it kills the deep stack; `rate_reg` can't revive LIF). Calibration = a one-time
-  sensible init; ALIF owns the operating point during a run.
+  propagation** (removing it kills the deep stack; `rate_reg` can't revive LIF). There is no calibration —
+  nets train from raw weights; ALIF + `rate_reg` own the operating point during a run (see Initialization).
 - **Recurrence robustly beats feed-forward — with the completed ALIF credit rule AND a topology that isolates
   the recurrent layer from the forward path.** The winner is the backward-fed **side-car**
   (`train_sidecar_task`, `engine_config_sidecar`): the forward signal *skips past* the recurrent layer
@@ -198,8 +207,8 @@ so `cargo test` stays fast and the experiments are reproducible on demand.
 ## Profiling
 
 Baseline throughput lives in `benches/throughput.rs` (`cargo bench --bench throughput`, ~waves/s on a
-calibrated 32×32×5 FF net). To find *where* time goes, sample the forward pass with `perf`:
-`examples/profile_wave.rs` is a ready harness (same calibrated net, eligibility off, tight wave loop).
+32×32×5 FF net at a σ≈1 `critical_init` operating point). To find *where* time goes, sample the forward
+pass with `perf`: `examples/profile_wave.rs` is a ready harness (same net, eligibility off, tight wave loop).
 
 ```bash
 # perf needs kernel.perf_event_paranoid <= 1 for user-space sampling. ALWAYS CHECK IT FIRST:
@@ -288,14 +297,15 @@ src/
   wave_state_machine/    # FROZEN reference: pure procedural, never-stored ±1 LSM (do not modify)
     {mod,config,synapse,neurons,wave,network,calibrate}.rs
   wave_net/              # ACTIVE engine — stored int8 weights + e-prop hooks
-    synapse.rs           # hash mixer, square-grid index, TopologyLevel/Synapse/SynapseGroup, generate_into (weight looked up)
+    synapse.rs           # hash mixer, square-grid index, TopologyLevel/Synapse/SynapseGroup, target_of, generate_into (weight looked up)
     config.rs            # Config, LayerConfig (leak, cooldown, inhibitor_ratio, adapt_bump/decay, …), demo, validate
     neurons.rs           # Layer — per-neuron SoA state + inbox/outbox + stored out_weights/out_shadow + elig_pre/elig_post + decide_potential
     wave.rs              # process_layer — the per-layer wave step (decide accrues eligibility; generate reads stored weights)
-    network.rs           # Network — orchestration, routing, deferred swap, listeners, readout layer, measurement
-    calibrate.rs         # firing-rate calibration (bottom-up + refine)
-  bench/                 # experiment harness (public-API only) — the learning rules live here
-    rsnn.rs              # trained readout (LSM) + feed-forward e-prop + multi-layer DFA (train_recurrent/train_multilayer)
+    network.rs           # Network — orchestration, routing, deferred swap, listeners, readout layer, force_spike
+    eprop.rs             # the e-prop update primitive (eprop_update, windowed_eligibility) + train_ff driver
+    critical_init.rs     # default init tools: critical_init (σ≈1), rate_match_init, forward_avalanche σ diagnostic, random_l0_input, layer_rates
+  bench/                 # experiment harness (public-API only) — the learning rules + tasks live here (NO calibration)
+    rsnn.rs              # trained readout (LSM) + feed-forward e-prop + multi-layer DFA (train_recurrent/train_multilayer) + FfInit {None,Sigma,RateMatch}
                          #   + rate_reg (FF liveness rescue) + rec_stab (per-layer recurrent stabilizer) + sequence tasks
                          #   (train_sequence: parity/distractor/flip-flop) + the exhaustive recurrence-null benchmark suite
     eprop.rs             # v1 threshold-only e-prop (historical; the approach the pivot moved past)
@@ -313,8 +323,8 @@ index is `y*size + x`, global neuron id is `layer*size*size + local`; per-layer 
 struct-of-arrays; in `wave_net` the synapse **address** is procedural (hash) but the **weight** is
 stored int8 (init to the `±1` sign, trained via the f32 shadow) — in `wave_state_machine` the weight is
 derived `±1`, nothing stored; baselines init low (`baseline_init + jitter`, clamped to `[1, i16::MAX]`)
-so the net boots hot and self-regulates via per-neuron adaptation, with calibration tuning the
-baselines; `adapt` is Q12 fixed point so its geometric decay stays exponential (no dead-zone ratchet),
+so the net boots hot and self-regulates via per-neuron adaptation (no calibration — nets train from raw;
+see Initialization); `adapt` is Q12 fixed point so its geometric decay stays exponential (no dead-zone ratchet),
 valid only while `adapt_decay <= ADAPT_SHIFT` (`Config::validate` enforces it); a `Layer` is a
 self-contained, persistable unit (owns its structure, thresholds, and stored weights) — serialization
 itself is not yet built.
