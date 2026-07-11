@@ -575,14 +575,14 @@ fn train_eprop_inner(cfg: &RsnnConfig) -> (Network, Vec<Vec<f32>>) {
                 if cfg.rate_reg != 0.0 {
                     let n_waves = (cfg.present_waves + cfg.delay + cfg.read_waves) as f32;
                     let r_target = cfg.rate_target_permille as f32 / 1000.0;
-                    let post_pre = net.with_layer_mut(tgt, |x| x.elig_pre.clone());
+                    let post_pre = net.with_layer(tgt, |x| x.elig_pre.clone());
                     for j in 0..ls {
                         let r_j = post_pre[j] as f32 / n_waves;
                         l_sig[j] += cfg.rate_reg * (r_j - r_target);
                     }
                 }
-                let pre = net.with_layer_mut(z, |x| x.elig_pre.clone());
-                let psi = net.with_layer_mut(tgt, |x| x.elig_post.clone());
+                let pre = net.with_layer(z, |x| x.elig_pre.clone());
+                let psi = net.with_layer(tgt, |x| x.elig_post.clone());
                 net.with_layer_mut(z, |lz| {
                     for i in 0..ls {
                         let pre_i = pre[i] as f32;

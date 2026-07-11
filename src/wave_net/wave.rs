@@ -6,7 +6,7 @@
 //! geometrically each wave, like the leak.
 
 use crate::wave_net::neurons::{Layer, ADAPT_MAX, ADAPT_SHIFT};
-use crate::wave_net::synapse::{generate_into, SynapseGroup};
+use crate::wave_net::synapse::{generate_into, Synapse};
 
 pub fn process_layer(
     layer: &mut Layer,
@@ -15,7 +15,7 @@ pub fn process_layer(
     size: u32,
     input: &[u32],
     acc: &mut [i32],
-    out: &mut [SynapseGroup],
+    deliveries: &mut [Vec<Synapse>],
     fired: &mut Vec<u32>,
 ) {
     let ls = (size as usize) * (size as usize);
@@ -76,7 +76,8 @@ pub fn process_layer(
         }
     }
 
-    // 5. generate outgoing synapses, aggregated by relative level into `out`
+    // 5. generate outgoing synapses, scattered directly into the per-layer `deliveries` buffers
+    // (resolved to absolute target layers) — no intermediate per-level grouping, no second copy.
     let base = layer_index as usize * ls;
     for &local in fired.iter() {
         generate_into(
@@ -84,10 +85,11 @@ pub fn process_layer(
             (base + local as usize) as u32,
             local,
             size,
+            layer_index as usize,
             &layer.topology,
             &layer.out_weights,
             layer.total_slots,
-            out,
+            deliveries,
         );
     }
 
@@ -114,7 +116,7 @@ mod tests {
     use super::*;
     use crate::wave_net::config::LayerConfig;
     use crate::wave_net::neurons::Layer;
-    use crate::wave_net::synapse::{Synapse, SynapseGroup, TopologyLevel};
+    use crate::wave_net::synapse::{Synapse, TopologyLevel};
 
     // A layer with hand-set LOW thresholds so integration can actually cause firing.
     fn low_layer(size: u32, threshold: i16, cooldown_base: u8, topo: Vec<TopologyLevel>) -> Layer {
@@ -135,8 +137,9 @@ mod tests {
         l
     }
 
-    fn groups_for(l: &Layer) -> Vec<SynapseGroup> {
-        l.topology.iter().map(|e| SynapseGroup { level: e.level, synapses: Vec::new() }).collect()
+    /// `n` empty per-layer delivery buffers (the Network-owned scatter target).
+    fn deliv(n: usize) -> Vec<Vec<Synapse>> {
+        (0..n).map(|_| Vec::new()).collect()
     }
 
     #[test]
@@ -148,9 +151,9 @@ mod tests {
         l.potential[0] = 8; // fires (>= 5)
         l.potential[1] = 3; // sub-threshold (< 5)
         let mut acc = vec![0i32; 16];
-        let mut out: Vec<SynapseGroup> = Vec::new();
+        let mut deliveries = deliv(1);
         let mut fired = Vec::new();
-        process_layer(&mut l, 0, 0, 4, &[], &mut acc, &mut out, &mut fired);
+        process_layer(&mut l, 0, 0, 4, &[], &mut acc, &mut deliveries, &mut fired);
         assert_eq!(l.decide_potential[0], 8, "fired neuron's decide_potential is the pre-reset value");
         assert_eq!(l.potential[0], 0, "fired neuron's potential reset post-wave");
         assert_eq!(l.decide_potential[1], 3, "sub-threshold neuron's decide_potential is its charge");
@@ -170,9 +173,9 @@ mod tests {
         }
         l.potential[0] = 10; // >= eff (8) -> fires, which then bumps adapt by 40
         let mut acc = vec![0i32; 16];
-        let mut out = groups_for(&l);
+        let mut deliveries = deliv(2);
         let mut fired = Vec::new();
-        process_layer(&mut l, 0, 0, 4, &[], &mut acc, &mut out, &mut fired);
+        process_layer(&mut l, 0, 0, 4, &[], &mut acc, &mut deliveries, &mut fired);
         assert_eq!(fired, vec![0]);
         assert_eq!(l.decide_eff[0], 8, "decide_eff is the PRE-bump effective threshold (5 + 3)");
         // post-wave adapt is bumped (~40) and decayed once, so the current eff is far higher — the bug we fixed
@@ -188,9 +191,9 @@ mod tests {
             l.inbox.push(Synapse { target: 0, weight: 1 });
         }
         let mut acc = vec![0i32; 16];
-        let mut out = groups_for(&l);
+        let mut deliveries = deliv(2);
         let mut fired = Vec::new();
-        process_layer(&mut l, 0, 0, 4, &[], &mut acc, &mut out, &mut fired);
+        process_layer(&mut l, 0, 0, 4, &[], &mut acc, &mut deliveries, &mut fired);
         assert_eq!(fired, vec![0]);
         // a fire adds bump<<SHIFT in Q-fixed-point, then step 7 decays it once
         let bumped = 8i32 << ADAPT_SHIFT;
@@ -203,9 +206,9 @@ mod tests {
         l.adapt_decay = 3;
         l.adapt[0] = 100;
         let mut acc = vec![0i32; 1];
-        let mut out: Vec<SynapseGroup> = Vec::new();
+        let mut deliveries = deliv(1);
         let mut fired = Vec::new();
-        process_layer(&mut l, 0, 0, 1, &[], &mut acc, &mut out, &mut fired);
+        process_layer(&mut l, 0, 0, 1, &[], &mut acc, &mut deliveries, &mut fired);
         // 100 - (100 >> 3) = 100 - 12 = 88
         assert_eq!(l.adapt[0], 88);
         assert!(fired.is_empty());
@@ -221,9 +224,9 @@ mod tests {
                 l.inbox.push(Synapse { target: 0, weight: 1 });
             }
             let mut acc = vec![0i32; 1];
-            let mut out: Vec<SynapseGroup> = Vec::new();
+            let mut deliveries = deliv(1);
             let mut fired = Vec::new();
-            process_layer(&mut l, 0, 0, 1, &[], &mut acc, &mut out, &mut fired);
+            process_layer(&mut l, 0, 0, 1, &[], &mut acc, &mut deliveries, &mut fired);
             fired
         };
         assert_eq!(drive(0), vec![0], "baseline 5, potential 10 -> fires with no adaptation");
@@ -235,14 +238,14 @@ mod tests {
         let mut l = low_layer(4, 3, 1, vec![TopologyLevel { level: 1, radius: 0, count: 1 }]);
         l.adapt_bump = 0; // plain LIF
         let mut acc = vec![0i32; 16];
-        let mut out = groups_for(&l);
+        let mut deliveries = deliv(2);
         let mut fired = Vec::new();
         for _ in 0..3 {
             l.inbox.clear();
             for _ in 0..3 {
                 l.inbox.push(Synapse { target: 0, weight: 1 });
             }
-            process_layer(&mut l, 0, 0, 4, &[], &mut acc, &mut out, &mut fired);
+            process_layer(&mut l, 0, 0, 4, &[], &mut acc, &mut deliveries, &mut fired);
             assert_eq!(l.adapt[0], 0, "adapt must stay 0 when adapt_bump is 0");
         }
     }
@@ -255,9 +258,9 @@ mod tests {
         }
         l.potential[0] = 1; // at threshold 1 -> within the ψ band AND fires
         let mut acc = vec![0i32; 16];
-        let mut out = groups_for(&l);
+        let mut deliveries = deliv(2);
         let mut fired = Vec::new();
-        process_layer(&mut l, 0, 0, 4, &[], &mut acc, &mut out, &mut fired);
+        process_layer(&mut l, 0, 0, 4, &[], &mut acc, &mut deliveries, &mut fired);
         assert_eq!(l.elig_pre[0], 1, "a spike bumps the pre-trace");
         assert!(l.elig_post[0] >= 1, "near-threshold bumps the post pseudo-derivative");
     }
@@ -272,11 +275,11 @@ mod tests {
         }
         l.potential[0] = 1; // fires (threshold 1)
         let mut acc = vec![0i32; 16];
-        let mut out = groups_for(&l);
+        let mut deliveries = deliv(2);
         let mut fired = Vec::new();
-        process_layer(&mut l, 0, 0, 4, &[], &mut acc, &mut out, &mut fired);
+        process_layer(&mut l, 0, 0, 4, &[], &mut acc, &mut deliveries, &mut fired);
         assert_eq!(fired, vec![0]);
-        assert_eq!(out[0].synapses[0].weight, 7, "delivered weight = stored out_weight");
+        assert_eq!(deliveries[1][0].weight, 7, "delivered weight = stored out_weight");
     }
 
     #[test]
@@ -323,13 +326,13 @@ mod tests {
             l.inbox.push(Synapse { target: 0, weight: 1 });
         }
         let mut acc = vec![0i32; 16];
-        let mut out = groups_for(&l);
+        let mut deliveries = deliv(2);
         let mut fired = Vec::new();
-        process_layer(&mut l, 0, 0, 4, &[], &mut acc, &mut out, &mut fired);
+        process_layer(&mut l, 0, 0, 4, &[], &mut acc, &mut deliveries, &mut fired);
         assert_eq!(fired, vec![0]);
         assert_eq!(l.potential[0], 0);
         assert_eq!(l.cooldown[0], 2);
-        assert_eq!(out[0].synapses.len(), 1);
+        assert_eq!(deliveries[1].len(), 1);
         assert!(l.inbox.is_empty());
     }
 
@@ -337,16 +340,16 @@ mod tests {
     fn refractory_blocks_refire() {
         let mut l = low_layer(1, 3, 2, vec![]);
         let mut acc = vec![0i32; 1];
-        let mut out: Vec<SynapseGroup> = Vec::new();
+        let mut deliveries = deliv(1);
         let mut fired = Vec::new();
         // wave A: force fire via injection (potential=i16::MAX, cooldown=0)
-        process_layer(&mut l, 0, 0, 1, &[0], &mut acc, &mut out, &mut fired);
+        process_layer(&mut l, 0, 0, 1, &[0], &mut acc, &mut deliveries, &mut fired);
         assert_eq!(fired, vec![0]);
         // wave B: strong drive but still refractory (cooldown 2 -> 1)
         for _ in 0..100 {
             l.inbox.push(Synapse { target: 0, weight: 1 });
         }
-        process_layer(&mut l, 0, 0, 1, &[], &mut acc, &mut out, &mut fired);
+        process_layer(&mut l, 0, 0, 1, &[], &mut acc, &mut deliveries, &mut fired);
         assert!(fired.is_empty(), "must not fire while refractory");
     }
 
@@ -355,9 +358,9 @@ mod tests {
         let mut l = low_layer(1, 20_000, 2, vec![]);
         l.potential[0] = 1000;
         let mut acc = vec![0i32; 1];
-        let mut out: Vec<SynapseGroup> = Vec::new();
+        let mut deliveries = deliv(1);
         let mut fired = Vec::new();
-        process_layer(&mut l, 0, 0, 1, &[], &mut acc, &mut out, &mut fired);
+        process_layer(&mut l, 0, 0, 1, &[], &mut acc, &mut deliveries, &mut fired);
         // leak (3,5): 1000 - 125 - 31 = 844
         assert_eq!(l.potential[0], 844);
     }
@@ -369,10 +372,10 @@ mod tests {
         let mut l = low_layer(1, 20_000, 2, vec![]); // high threshold: never fires
         l.potential[0] = 5;
         let mut acc = vec![0i32; 1];
-        let mut out: Vec<SynapseGroup> = Vec::new();
+        let mut deliveries = deliv(1);
         let mut fired = Vec::new();
         for _ in 0..6 {
-            process_layer(&mut l, 0, 0, 1, &[], &mut acc, &mut out, &mut fired);
+            process_layer(&mut l, 0, 0, 1, &[], &mut acc, &mut deliveries, &mut fired);
         }
         assert_eq!(l.potential[0], 0, "small potential must leak to 0, not freeze in the dead zone");
     }
@@ -392,9 +395,9 @@ mod tests {
                 for _ in 0..100 { l.inbox.push(Synapse { target: 0, weight: 1 }); }
             }
             let mut acc = vec![0i32; 1];
-            let mut out: Vec<SynapseGroup> = Vec::new();
+            let mut deliveries = deliv(1);
             let mut fired = Vec::new();
-            process_layer(&mut l, 0, 0, 1, &[], &mut acc, &mut out, &mut fired);
+            process_layer(&mut l, 0, 0, 1, &[], &mut acc, &mut deliveries, &mut fired);
             l.potential[0]
         };
         // 40 + 90 = 130 (no clamp), then leak (3,5): 130 - 16 - 4 = 110

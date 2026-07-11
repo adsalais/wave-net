@@ -26,8 +26,8 @@ pub struct Layer {
     pub potential: Vec<i16>,
     pub cooldown: Vec<u8>,
     pub adapt: Vec<i32>,      // ALIF adaptation (Q12 fixed point): rest 0, >= 0; bumped on fire, decayed each wave
-    pub inbox: Vec<Synapse>,  // drained THIS wave (filled last wave)
-    pub outbox: Vec<Synapse>, // filled for NEXT wave; swapped with inbox at wave end
+    pub inbox: Vec<Synapse>,  // drained THIS wave (filled last wave). The next-wave deliveries accumulate
+                              // in the Network's scratch buffer and are swapped in here at wave end.
 
     // tunable params (calibration/training will rewrite these between phases)
     pub threshold: Vec<i16>, // ALIF baseline; effective threshold is threshold + (adapt >> ADAPT_SHIFT)
@@ -82,7 +82,6 @@ impl Layer {
             cooldown: vec![0; ls],
             adapt: vec![0; ls],
             inbox: Vec::new(),
-            outbox: Vec::new(),
             threshold,
             leak: cfg.leak,
             cooldown_base: cfg.cooldown_base,
@@ -180,7 +179,7 @@ mod tests {
         assert_eq!(l.cooldown.len(), 64);
         assert_eq!(l.threshold.len(), 64);
         assert!(l.potential.iter().all(|&p| p == 0));
-        assert!(l.inbox.is_empty() && l.outbox.is_empty());
+        assert!(l.inbox.is_empty());
     }
 
     #[test]

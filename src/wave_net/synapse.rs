@@ -16,14 +16,6 @@ pub struct Synapse {
     pub weight: i16,
 }
 
-/// A firing neuron's outgoing synapses for one topology entry, tagged with the entry's
-/// **relative** layer offset. The `Network` resolves the absolute target layer.
-#[derive(Debug)]
-pub struct SynapseGroup {
-    pub level: i32,
-    pub synapses: Vec<Synapse>,
-}
-
 /// Hash purpose tags (keep stable — they seed distinct hash streams).
 /// (`wave_state_machine` also defines `P_WEIGHT` for its fire-time magnitude draw; `wave_net`
 /// stores weights instead of hashing them, so it has no `P_WEIGHT`.)
@@ -93,32 +85,44 @@ pub fn wrap(base: u32, off: i32, size: u32) -> u32 {
     ((base as i32 + off) as u32) & (size - 1)
 }
 
-/// Append one firing neuron's synapses into `groups` (one per topology entry, same order).
-/// Emits **relative** levels only; the caller (Network) resolves absolute target layers.
-/// Contract: `groups.len() == topology.len()` and `groups[i].level == topology[i].level`.
-/// Appends (does not clear), so a whole layer's firers aggregate into one `groups` set.
+/// Append one firing neuron's outgoing synapses **directly** into the per-layer `deliveries`
+/// buffers, resolved to the **absolute** target layer (`source_layer + entry.level`). Relative
+/// levels landing outside `[0, deliveries.len())` are dropped (as the toroidal-in-depth boundary).
+/// Reads the source layer's stored `weights`; addresses stay hash-generated. Appends (does not
+/// clear), so a whole layer's firers aggregate into `deliveries` in one pass — no intermediate
+/// per-level grouping and no second copy into an outbox.
+///
+/// The `slot` cursor advances for every `(entry, k)` regardless of whether the target is in range,
+/// so weight indexing stays identical to construction (`Layer::new`); the hash for a dropped target
+/// is simply skipped (it only fed the discarded address, so this is observation-preserving).
 pub fn generate_into(
     seed: u64,
     source_global: u32,
     src_local: u32,
     size: u32,
+    source_layer: usize,
     topology: &[TopologyLevel],
     weights: &[i8],
     total_slots: usize,
-    groups: &mut [SynapseGroup],
+    deliveries: &mut [Vec<Synapse>],
 ) {
     let (sx, sy) = xy_of(src_local, size);
+    let layer_count = deliveries.len() as i32;
     let mut slot = 0usize;
-    for (entry, group) in topology.iter().zip(groups.iter_mut()) {
+    for entry in topology.iter() {
+        let tl = source_layer as i32 + entry.level;
+        let in_range = tl >= 0 && tl < layer_count;
         let span = 2 * entry.radius + 1;
         for k in 0..entry.count {
-            let h = mix(key(seed, source_global, entry.level, k, P_TARGET));
-            let dx = map_range24((h >> 40) as u32, span) as i32 - entry.radius as i32;
-            let dy = map_range24(((h >> 16) as u32) & 0x00FF_FFFF, span) as i32 - entry.radius as i32;
-            let tx = wrap(sx, dx, size);
-            let ty = wrap(sy, dy, size);
-            let w = weights[src_local as usize * total_slots + slot] as i16;
-            group.synapses.push(Synapse { target: local_of(tx, ty, size), weight: w });
+            if in_range {
+                let h = mix(key(seed, source_global, entry.level, k, P_TARGET));
+                let dx = map_range24((h >> 40) as u32, span) as i32 - entry.radius as i32;
+                let dy = map_range24(((h >> 16) as u32) & 0x00FF_FFFF, span) as i32 - entry.radius as i32;
+                let tx = wrap(sx, dx, size);
+                let ty = wrap(sy, dy, size);
+                let w = weights[src_local as usize * total_slots + slot] as i16;
+                deliveries[tl as usize].push(Synapse { target: local_of(tx, ty, size), weight: w });
+            }
             slot += 1;
         }
     }
@@ -135,8 +139,8 @@ mod tests {
         ]
     }
 
-    fn empty_groups(t: &[TopologyLevel]) -> Vec<SynapseGroup> {
-        t.iter().map(|e| SynapseGroup { level: e.level, synapses: Vec::new() }).collect()
+    fn empty_deliveries(layer_count: usize) -> Vec<Vec<Synapse>> {
+        (0..layer_count).map(|_| Vec::new()).collect()
     }
 
     /// All-+1 stored weights for a size-8 layer, sized to index any src_local·total_slots + slot.
@@ -146,25 +150,39 @@ mod tests {
     }
 
     #[test]
-    fn generate_counts_per_level() {
+    fn generate_scatters_by_absolute_layer() {
+        // source layer 1 of 3: level +1 -> layer 2 (6 synapses), level -1 -> layer 0 (1 synapse).
         let t = topo();
         let (w, tot) = ones(&t);
-        let mut g = empty_groups(&t);
-        generate_into(42, 0, 0, 8, &t, &w, tot, &mut g);
-        assert_eq!(g[0].synapses.len(), 6);
-        assert_eq!(g[1].synapses.len(), 1);
-        // radius 0 targets the source cell itself
-        assert_eq!(g[1].synapses[0].target, local_of(0, 0, 8));
+        let mut d = empty_deliveries(3);
+        generate_into(42, 64, 0, 8, 1, &t, &w, tot, &mut d);
+        assert_eq!(d[2].len(), 6, "level +1 lands in layer source+1 = 2");
+        assert_eq!(d[0].len(), 1, "level -1 lands in layer source-1 = 0");
+        assert_eq!(d[1].len(), 0, "the source layer gets nothing (no level-0 entry)");
+        // radius 0 (the level -1 entry) targets the source cell itself
+        assert_eq!(d[0][0].target, local_of(0, 0, 8));
+    }
+
+    #[test]
+    fn generate_drops_out_of_range_levels() {
+        // source layer 0: level -1 -> layer -1 (out of range, dropped); level +1 -> layer 1.
+        let t = topo();
+        let (w, tot) = ones(&t);
+        let mut d = empty_deliveries(2);
+        generate_into(42, 0, 0, 8, 0, &t, &w, tot, &mut d);
+        assert_eq!(d[1].len(), 6, "level +1 lands in layer 1");
+        assert_eq!(d[0].len(), 0, "level -1 from layer 0 is out of range and dropped");
     }
 
     #[test]
     fn generate_targets_within_radius() {
         let t = topo();
         let (w, tot) = ones(&t);
-        let mut g = empty_groups(&t);
+        let mut d = empty_deliveries(3);
         let (sx, sy) = (3u32, 5u32);
-        generate_into(7, 100, local_of(sx, sy, 8), 8, &t, &w, tot, &mut g);
-        for s in &g[0].synapses {
+        generate_into(7, 100, local_of(sx, sy, 8), 8, 1, &t, &w, tot, &mut d);
+        for s in &d[2] {
+            // the level +1 (radius 2) group
             let (tx, ty) = xy_of(s.target, 8);
             let dx = ((tx + 8 - sx) & 7).min((sx + 8 - tx) & 7);
             let dy = ((ty + 8 - sy) & 7).min((sy + 8 - ty) & 7);
@@ -176,17 +194,17 @@ mod tests {
     fn generate_is_deterministic_and_appends() {
         let t = topo();
         let (w, tot) = ones(&t);
-        let mut a = empty_groups(&t);
-        let mut b = empty_groups(&t);
-        generate_into(1, 9, 9, 8, &t, &w, tot, &mut a);
-        generate_into(1, 9, 9, 8, &t, &w, tot, &mut b);
-        assert_eq!(a[0].synapses.len(), b[0].synapses.len());
-        for (x, y) in a[0].synapses.iter().zip(&b[0].synapses) {
+        let mut a = empty_deliveries(3);
+        let mut b = empty_deliveries(3);
+        generate_into(1, 64 + 9, 9, 8, 1, &t, &w, tot, &mut a);
+        generate_into(1, 64 + 9, 9, 8, 1, &t, &w, tot, &mut b);
+        assert_eq!(a[2].len(), b[2].len());
+        for (x, y) in a[2].iter().zip(&b[2]) {
             assert_eq!((x.target, x.weight), (y.target, y.weight));
         }
         // second call appends (aggregation across firers)
-        generate_into(1, 9, 9, 8, &t, &w, tot, &mut a);
-        assert_eq!(a[0].synapses.len(), 12);
+        generate_into(1, 64 + 9, 9, 8, 1, &t, &w, tot, &mut a);
+        assert_eq!(a[2].len(), 12);
     }
 
     #[test]

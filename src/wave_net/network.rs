@@ -1,21 +1,33 @@
 //! `network` — owns the layer stack, drives each wave, and routes each layer's
 //! generated synapses into the target layers' inboxes for the next wave.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::wave_net::config::Config;
 use crate::wave_net::neurons::{Layer, ADAPT_SHIFT};
-use crate::wave_net::synapse::SynapseGroup;
+use crate::wave_net::synapse::Synapse;
 use crate::wave_net::wave::process_layer;
 
 pub struct Network {
     seed: u64,
     size: u32,
-    layers: Vec<Mutex<Layer>>,
-    wave_id: AtomicUsize,
+    layers: Vec<Layer>,
+    wave_id: usize,
+    scratch: Scratch,
     #[allow(clippy::type_complexity)]
     listeners: Vec<Option<Box<dyn Fn(usize, &[u32]) + Send + Sync>>>,
+}
+
+/// Reusable per-wave scratch owned by the `Network` — cleared/overwritten each wave, never
+/// reallocated on the hot path. `deliveries[z]` accumulates the synapses bound for layer `z` on the
+/// *next* wave (the old per-layer outbox, hoisted here so generation can scatter directly by
+/// absolute target layer — no intermediate per-level grouping, no second copy). It is disjoint from
+/// every layer's `inbox`, so pending deliveries are never overwritten; at wave end each layer's
+/// (now drained) `inbox` is swapped with its `deliveries` buffer.
+struct Scratch {
+    acc: Vec<i32>,
+    fired: Vec<u32>,
+    deliveries: Vec<Vec<Synapse>>,
 }
 
 impl Network {
@@ -33,6 +45,7 @@ impl Network {
         config.validate().expect("invalid config");
         let size = config.size;
         let l = config.layers.len();
+        let ls = (size as usize) * (size as usize);
         let mut layers = Vec::with_capacity(l);
         for (z, lc) in config.layers.iter().enumerate() {
             let mut layer = Layer::new(lc, config.seed, z as u32, size);
@@ -47,54 +60,47 @@ impl Network {
             if readout_last && z == l - 1 {
                 layer.readout = true;
             }
-            layers.push(Mutex::new(layer));
+            layers.push(layer);
         }
         Network {
             seed: config.seed,
             size,
             layers,
-            wave_id: AtomicUsize::new(0),
+            wave_id: 0,
+            scratch: Scratch {
+                acc: vec![0i32; ls],
+                fired: Vec::new(),
+                deliveries: (0..l).map(|_| Vec::new()).collect(),
+            },
             listeners: (0..l).map(|_| None).collect(),
         }
     }
 
-    pub fn wave(&self, input: &[u32]) {
-        let w = self.wave_id.fetch_add(1, Ordering::Relaxed);
+    pub fn wave(&mut self, input: &[u32]) {
+        let w = self.wave_id;
+        self.wave_id += 1;
         let l = self.layers.len();
-        let ls = (self.size as usize) * (self.size as usize);
-        let mut acc = vec![0i32; ls];
-        let mut fired: Vec<u32> = Vec::new();
+        let seed = self.seed;
+        let size = self.size;
+        // Disjoint mutable borrows: each layer is processed while generation scatters into the
+        // separate `deliveries` buffer, so a source layer's level-0 self-connections and its own
+        // in-flight state never alias.
+        let Self { layers, scratch, listeners, .. } = self;
+        let Scratch { acc, fired, deliveries } = scratch;
 
         for z in 0..l {
-            let mut out: Vec<SynapseGroup>;
-            {
-                let mut g = self.layers[z].lock().unwrap();
-                out = g
-                    .topology
-                    .iter()
-                    .map(|e| SynapseGroup { level: e.level, synapses: Vec::new() })
-                    .collect();
-                let inp: &[u32] = if z == 0 { input } else { &[] };
-                process_layer(&mut g, z as u32, self.seed, self.size, inp, &mut acc, &mut out, &mut fired);
-            }
-            // route: Network resolves absolute target layers and feeds their outboxes
-            for grp in out.iter() {
-                let tl = z as i32 + grp.level;
-                if tl >= 0 && (tl as usize) < l {
-                    self.layers[tl as usize].lock().unwrap().outbox.extend(grp.synapses.iter().copied());
-                }
-            }
-            if let Some(listener) = &self.listeners[z] {
-                listener(w, &fired);
+            let inp: &[u32] = if z == 0 { input } else { &[] };
+            process_layer(&mut layers[z], z as u32, seed, size, inp, acc, deliveries, fired);
+            if let Some(listener) = &listeners[z] {
+                listener(w, fired);
             }
         }
 
-        // swap inbox <- outbox so this wave's deliveries drain next wave
-        for layer in self.layers.iter() {
-            let mut guard = layer.lock().unwrap();
-            let g = &mut *guard; // deref once so inbox/outbox borrow disjointly
-            std::mem::swap(&mut g.inbox, &mut g.outbox);
-            g.outbox.clear();
+        // Swap each layer's now-drained `inbox` with its accumulated `deliveries` (the next inbox).
+        // `deliveries` is disjoint from every `inbox`, so nothing pending was overwritten during the
+        // wave; after the swap `deliveries[i]` holds the emptied inbox, ready to reaccumulate.
+        for i in 0..l {
+            std::mem::swap(&mut layers[i].inbox, &mut deliveries[i]);
         }
     }
 
@@ -108,9 +114,8 @@ impl Network {
         }
     }
 
-    pub fn reset_state(&self) {
-        for layer in self.layers.iter() {
-            let mut g = layer.lock().unwrap();
+    pub fn reset_state(&mut self) {
+        for g in self.layers.iter_mut() {
             g.potential.iter_mut().for_each(|p| *p = 0);
             g.cooldown.iter_mut().for_each(|c| *c = 0);
             g.adapt.iter_mut().for_each(|a| *a = 0);
@@ -118,26 +123,28 @@ impl Network {
             g.elig_post.iter_mut().for_each(|e| *e = 0);
             g.decide_potential.iter_mut().for_each(|p| *p = 0);
             g.inbox.clear();
-            g.outbox.clear();
         }
-        self.wave_id.store(0, Ordering::Relaxed);
+        for d in self.scratch.deliveries.iter_mut() {
+            d.clear();
+        }
+        self.wave_id = 0;
     }
 
     pub fn potential(&self, layer: usize, local: usize) -> i16 {
-        self.layers[layer].lock().unwrap().potential[local]
+        self.layers[layer].potential[local]
     }
 
     /// Raw Q12 fixed-point adaptation state (effective threshold contribution is `>> ADAPT_SHIFT`).
     pub fn adaptation(&self, layer: usize, local: usize) -> i32 {
-        self.layers[layer].lock().unwrap().adapt[local]
+        self.layers[layer].adapt[local]
     }
 
     /// Force neuron `local` in layer `z` to fire on the *next* `wave()` — sets its potential to `i16::MAX`
     /// and clears its cooldown, so the decide step fires it (the effective threshold of the low-baseline
     /// computational layers is well under `i16::MAX`). Also zeroes its adaptation so the fire is guaranteed
     /// even if the neuron was heavily adapted. For criticality perturbation probes; no effect unless called.
-    pub fn force_spike(&self, z: usize, local: usize) {
-        let mut l = self.layers[z].lock().unwrap();
+    pub fn force_spike(&mut self, z: usize, local: usize) {
+        let l = &mut self.layers[z];
         l.potential[local] = i16::MAX;
         l.cooldown[local] = 0;
         l.adapt[local] = 0;
@@ -155,20 +162,24 @@ impl Network {
         self.layers.len() * (self.size as usize) * (self.size as usize)
     }
 
-    /// Locked mutable access to one layer (how calibration reaches Layer methods).
-    pub(crate) fn with_layer_mut<R>(&self, z: usize, f: impl FnOnce(&mut Layer) -> R) -> R {
-        let mut g = self.layers[z].lock().unwrap();
-        f(&mut g)
+    /// Mutable access to one layer (how calibration/training reach `Layer` methods and state).
+    pub(crate) fn with_layer_mut<R>(&mut self, z: usize, f: impl FnOnce(&mut Layer) -> R) -> R {
+        f(&mut self.layers[z])
+    }
+
+    /// Read-only access to one layer (introspection that must not require `&mut`).
+    pub(crate) fn with_layer<R>(&self, z: usize, f: impl FnOnce(&Layer) -> R) -> R {
+        f(&self.layers[z])
     }
 
     /// A copy of a layer's per-neuron thresholds (introspection / determinism tests).
     pub fn layer_thresholds(&self, z: usize) -> Vec<i16> {
-        self.with_layer_mut(z, |l| l.thresholds().to_vec())
+        self.with_layer(z, |l| l.thresholds().to_vec())
     }
 
     /// Per-neuron membrane potential captured at the last decide step (pre fire-reset/leak).
     pub fn layer_decide_potential(&self, z: usize) -> Vec<i16> {
-        self.layers[z].lock().unwrap().decide_potential.clone()
+        self.layers[z].decide_potential.clone()
     }
 
     /// Per-neuron effective ALIF firing threshold `baseline + (adapt >> ADAPT_SHIFT)` from the CURRENT
@@ -176,7 +187,7 @@ impl Network {
     /// `layer_decide_potential`, use `layer_decide_effective_threshold` — the current adapt has already
     /// been fire-bumped and decayed by the time a wave returns.)
     pub fn layer_effective_threshold(&self, z: usize) -> Vec<i32> {
-        let l = self.layers[z].lock().unwrap();
+        let l = &self.layers[z];
         l.threshold
             .iter()
             .zip(l.adapt.iter())
@@ -188,7 +199,7 @@ impl Network {
     /// mutated adapt) — the value actually compared against `layer_decide_potential`. This is the correct
     /// reference for a pseudo-derivative ψ = f(decide_potential − decide_eff).
     pub fn layer_decide_effective_threshold(&self, z: usize) -> Vec<i32> {
-        self.layers[z].lock().unwrap().decide_eff.clone()
+        self.layers[z].decide_eff.clone()
     }
 
     /// Reset, run `warmup` waves (discarded), then `waves` counted; per-layer firing rate =
@@ -234,7 +245,7 @@ mod tests {
 
     #[test]
     fn effective_threshold_is_baseline_plus_adapt_shifted() {
-        let net = Network::new(two_layer());
+        let mut net = Network::new(two_layer());
         // baseline with zero adaptation == the threshold itself
         let base = net.layer_thresholds(1);
         let eff0 = net.layer_effective_threshold(1);
@@ -293,7 +304,7 @@ mod tests {
 
     #[test]
     fn adaptation_accessor_and_reset() {
-        let net = Network::new(alif_two_layer());
+        let mut net = Network::new(alif_two_layer());
         let all_l0 = (0..16u32).collect::<Vec<u32>>();
         for _ in 0..5 {
             net.wave(&all_l0); // injection drives L0 (transducer, no adapt) -> L1 fires and adapts
@@ -313,7 +324,7 @@ mod tests {
     fn determinism_includes_adaptation() {
         let inputs: [&[u32]; 4] = [&[0, 1, 2, 3], &[4, 5], &[], &[6, 7, 8]];
         let run = || {
-            let net = Network::new(Config::demo());
+            let mut net = Network::new(Config::demo());
             for _ in 0..6 {
                 for inp in inputs {
                     net.wave(inp);
@@ -405,7 +416,7 @@ mod tests {
     fn deterministic_across_runs() {
         let inputs: [&[u32]; 3] = [&[0, 1, 2], &[], &[3]];
         let run = || {
-            let net = Network::new(Config::demo());
+            let mut net = Network::new(Config::demo());
             for inp in inputs {
                 net.wave(inp);
             }
@@ -419,7 +430,7 @@ mod tests {
 
     #[test]
     fn reset_state_zeros_everything() {
-        let net = Network::new(Config::demo());
+        let mut net = Network::new(Config::demo());
         for _ in 0..5 {
             net.wave(&[0, 1, 2, 3]);
         }
