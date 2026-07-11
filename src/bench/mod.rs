@@ -9,6 +9,7 @@ pub mod rsnn;
 pub mod memory_capacity;
 pub mod multilayer_dfa;
 pub mod multilayer_dfa_bench;
+pub mod multilayer_dfa_bitnet_bench;
 pub mod readout;
 pub mod store_recall;
 pub mod stream;
