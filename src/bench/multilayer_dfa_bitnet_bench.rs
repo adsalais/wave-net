@@ -223,4 +223,77 @@ mod tests {
             eprintln!("4/{rc:<3}   {:<14}  {:<14}  {:<14}  {:.1}/{:.1}", cells[0], cells[1], cells[2], sp[1] * 100.0, sp[2] * 100.0);
         }
     }
+
+    #[test]
+    #[ignore] // expensive; run manually in --release
+    fn bitnet_ff_depth8_threshold() {
+        // Raise the prune threshold (more zeros/sparsity) — does it help/hurt ternary at depth 8? Configs
+        // 4/56, 4/64, 4/80; threshold 0.5/0.7/0.9; pure + scaled (int8 baseline, threshold-independent).
+        // single seed. Cell = best@trials(sparsity%).
+        let seed = 0xE9_0B_0A17u64;
+        let (ee, pat, max) = (300usize, 3usize, 3000usize);
+        eprintln!("== BitNet: FF depth-8 prune-threshold sweep (size 32, read top; seed {seed:#x}) ==");
+        eprintln!("r/c    thr   int8       pure                scaled");
+        for &(ur, uc) in &[(4u32, 56u32), (4, 64), (4, 80)] {
+            let (i8b, i8a) = {
+                let (mut net, entries) = make_ff(seed, 32, 8, uc, ur, 20, 6);
+                let mut cfg = ff_cfg(0, 0.004, 0.0);
+                cfg.size = 32;
+                cfg.present = 8;
+                cfg.read = 8;
+                train_and_eval_best(&mut net, &entries, seed, seed, &cfg, single_task, ee, pat, max)
+            };
+            for &thr in &[0.5f32, 0.7, 0.9] {
+                let mut cell = Vec::new();
+                for q in [WeightQuant::Ternary, WeightQuant::TernaryScaled] {
+                    let (mut net, entries) = make_ff(seed, 32, 8, uc, ur, 20, 6);
+                    net.set_weight_quant(q);
+                    net.set_ternary_threshold(thr);
+                    let mut cfg = ff_cfg(0, 0.004, 0.0);
+                    cfg.size = 32;
+                    cfg.present = 8;
+                    cfg.read = 8;
+                    let (best, at) = train_and_eval_best(&mut net, &entries, seed, seed, &cfg, single_task, ee, pat, max);
+                    cell.push(format!("{best}@{at}({:.0}%)", weight_sparsity(&net) * 100.0));
+                }
+                eprintln!("{ur}/{uc:<3}  {thr}   {i8b}@{i8a}   {:<19}  {:<19}", cell[0], cell[1]);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore] // expensive; run manually in --release
+    fn bitnet_sidecar_threshold() {
+        // Prune-threshold sweep on the recurrent parity task (rec 4/24, forward r4/c48): does more sparsity
+        // help/hurt where scaled trains and pure fails? threshold 0.5/0.7/0.9; pure + scaled + int8. 1 seed.
+        let (fur, fuc) = (4u32, 48u32);
+        let seed = 0xE9_0B_0A17u64;
+        let (ee, pat, max) = (500usize, 3usize, 5000usize);
+        eprintln!("== BitNet: side-car parity N=3 prune-threshold sweep (rec 4/24, forward r{fur}/c{fuc}; seed {seed:#x}) ==");
+        eprintln!("thr   int8       pure                scaled");
+        let base_cfg = || {
+            let mut c = ff_cfg(0, 0.004, 0.4);
+            c.size = 32;
+            c.delay = 8;
+            c.read = 8;
+            c.holdout = 300;
+            c.elig.rec_tau = 20.0;
+            c
+        };
+        let (i8b, i8a) = {
+            let (mut net, entries) = make_sidecar(seed, 32, fuc, fur, 24, 4, 20, 6);
+            train_and_eval_best(&mut net, &entries, seed, seed, &base_cfg(), |sd, t| task_parity(sd, t, 3), ee, pat, max)
+        };
+        for &thr in &[0.5f32, 0.7, 0.9] {
+            let mut cell = Vec::new();
+            for q in [WeightQuant::Ternary, WeightQuant::TernaryScaled] {
+                let (mut net, entries) = make_sidecar(seed, 32, fuc, fur, 24, 4, 20, 6);
+                net.set_weight_quant(q);
+                net.set_ternary_threshold(thr);
+                let (best, at) = train_and_eval_best(&mut net, &entries, seed, seed, &base_cfg(), |sd, t| task_parity(sd, t, 3), ee, pat, max);
+                cell.push(format!("{best}@{at}({:.0}%)", weight_sparsity(&net) * 100.0));
+            }
+            eprintln!("{thr}   {i8b}@{i8a}   {:<19}  {:<19}", cell[0], cell[1]);
+        }
+    }
 }
