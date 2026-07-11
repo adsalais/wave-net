@@ -28,11 +28,12 @@ pub struct CriticalInitParams {
     pub warmup: usize,        // waves discarded per measurement (let adaptation settle)
     pub waves: usize,         // waves the eligibility/rate window integrates over
     pub tol_permille: u64,    // stop an edge when |rate - target| <= tol
+    pub use_psi: bool,        // gate the update by ψ (e-prop) or not (pure activity-driven scaling)
 }
 
 impl Default for CriticalInitParams {
     fn default() -> CriticalInitParams {
-        CriticalInitParams { target_permille: 100, lr: 0.02, rounds: 80, warmup: 32, waves: 96, tol_permille: 15 }
+        CriticalInitParams { target_permille: 100, lr: 0.02, rounds: 80, warmup: 32, waves: 96, tol_permille: 15, use_psi: true }
     }
 }
 
@@ -98,7 +99,8 @@ pub fn rate_reg_init(net: &mut Network, seed: u64, params: &CriticalInitParams, 
                     for kk in 0..up {
                         let j = target_of(seed, sg, i as u32, 1, kk as u32, up_radius, size) as usize;
                         // too-quiet target (l_sig<0) -> weights rise (fires more); mirrors rsnn rate_reg.
-                        lz.out_shadow[i * up + kk] += -params.lr * l_sig[j] * pre_i * psi[z][j] as f32;
+                        let pf = if params.use_psi { psi[z][j] as f32 } else { 1.0 };
+                        lz.out_shadow[i * up + kk] += -params.lr * l_sig[j] * pre_i * pf;
                     }
                 }
                 for (wq, s) in lz.out_weights.iter_mut().zip(&lz.out_shadow) {
@@ -432,6 +434,31 @@ mod tests {
                 })
                 .collect();
             println!("uc={up_count:<2}: rates={:?} σ_hop{:?} neg%(L0..)={:?}", pct(&r), hops(&f), neg);
+        }
+    }
+
+    /// Experiment (run manually): the FLAT-RATE init retested with the fixes — ψ dropped (pure
+    /// activity-driven scaling, the stability/revival fix from the σ-eprop work) and σ read with the
+    /// clean burst estimate. Question: does hitting a fixed 10% rate now still leave σ super-critical
+    /// at high density, or does the improved rule change that?
+    ///   cargo test --release rate_init_fixed_vs_density -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn rate_init_fixed_vs_density() {
+        let hops = |f: &[f64]| -> Vec<f64> {
+            (1..f.len()).map(|z| if f[z - 1] > 0.0 { (f[z] / f[z - 1] * 100.0).round() / 100.0 } else { 0.0 }).collect()
+        };
+        for use_psi in [true, false] {
+            println!("== flat-rate init, use_psi={use_psi} (clean burst σ) ==");
+            let params = CriticalInitParams { use_psi, ..CriticalInitParams::default() };
+            for up_count in [8u32, 16, 24, 32, 48] {
+                let mut net = Network::new(ff_config(up_count, 3, 5));
+                let input = random_l0_input(SEED, 32, 20000);
+                rate_reg_init(&mut net, SEED, &params, &input);
+                let r = net.measure_layer_rates(32, 128, &input);
+                let f = forward_avalanche(&mut net, SEED ^ 0xABCD, 20000, 32, 32, 16);
+                println!("uc={up_count:<2}: rates={:?} σ_hop{:?}", pct(&r), hops(&f));
+            }
         }
     }
 }
