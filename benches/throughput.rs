@@ -108,16 +108,23 @@ fn assert_operating_point(net: &mut Network) {
 }
 
 fn bench_throughput(c: &mut Criterion) {
+    // Setup (not measured): build, calibrate to 10%, assert the regime is live.
     let mut net = setup_net();
     assert_operating_point(&mut net);
-    let input = random_l0_input(SEED, SIZE, NOISE_FRACTION_Q16);
 
+    // Pre-generate the fixed noise ring OUTSIDE the timed loop so we measure the pure engine,
+    // not the input-hash RNG.
+    let input = random_l0_input(SEED, SIZE, NOISE_FRACTION_Q16);
+    let noise: Vec<Vec<u32>> = (0..WAVES_PER_ITER as usize).map(&input).collect();
+
+    // Measured region: replay the ring continuously (no per-iteration reset). ALIF adaptation stays
+    // in its self-regulated ~10% regime across iterations, so each batch reflects steady state.
     let mut group = c.benchmark_group("throughput");
     group.throughput(Throughput::Elements(WAVES_PER_ITER));
     group.bench_function("ff_32x32x5", |b| {
         b.iter(|| {
-            for w in 0..WAVES_PER_ITER as usize {
-                net.wave(&input(w));
+            for v in &noise {
+                net.wave(v);
             }
         })
     });
