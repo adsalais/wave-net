@@ -1,8 +1,9 @@
-//! Int8-vs-ternary (BitNet) A/B benchmarks for `multilayer_dfa` — `#[ignore]`d, run manually in `--release`.
-//! Same net/task/seeds trained under Int8 vs Ternary (per-row γ, pure ±1/0). Per the benchmark convention:
-//! sweep fan-in × duration × seeds, read the top spiking layer, report accuracy, and (for ternary) the
-//! weight-sparsity. Compare at the PEAK of the duration curve (the rate_reg over-training collapse is
-//! documented). Question: does per-row pure-ternary reach the int8 baseline, and at what sparsity?
+//! Int8 vs ternary (BitNet) A/B/C benchmarks for `multilayer_dfa` — `#[ignore]`d, run manually in
+//! `--release`. Three quantizers on the SAME net/task/seeds: **int8**, **pure ternary** (±1/0), and
+//! **scaled ternary** (±g/0, per-row integer gain). Uses early-exit best-checkpoint reporting
+//! (`train_and_eval_best`), so each cell is `meanBest/worstBest@meanTrials` — the readable PEAK accuracy
+//! (immune to the rate_reg over-training collapse) and the training SPEED (trials to reach it). Plus the
+//! ternary weight-sparsity. Per the benchmark convention: fan-in/depth × seeds, read the top spiking layer.
 
 #[cfg(test)]
 mod tests {
@@ -10,119 +11,108 @@ mod tests {
     use crate::wave_net::neurons::WeightQuant;
 
     const SEEDS: [u64; 3] = [0xE9_0B_0A17, 0x1234_5678, 0xDEAD_BEEF];
+    const QUANTS: [(&str, Option<WeightQuant>); 3] = [
+        ("int8", None),
+        ("pure", Some(WeightQuant::Ternary)),
+        ("scaled", Some(WeightQuant::TernaryScaled)),
+    ];
 
-    fn fmt_accs(a: &[u64]) -> String {
-        a.iter().map(|x| x.to_string()).collect::<Vec<_>>().join("/")
+    /// (meanBest, worstBest, meanTrialsToBest) over per-seed (best, trials) pairs.
+    fn agg(b: &[(u64, usize)]) -> (u64, u64, usize) {
+        let n = b.len();
+        let mean_best = b.iter().map(|x| x.0).sum::<u64>() / n as u64;
+        let worst_best = b.iter().map(|x| x.0).min().unwrap();
+        let mean_at = b.iter().map(|x| x.1).sum::<usize>() / n;
+        (mean_best, worst_best, mean_at)
     }
-    fn fmt_rates(r: &[f64]) -> String {
-        r.iter().map(|x| format!("{:.1}", x * 100.0)).collect::<Vec<_>>().join("/")
-    }
-    fn mean_curve(c: &[Vec<u64>]) -> Vec<u64> {
-        (0..c[0].len()).map(|k| c.iter().map(|r| r[k]).sum::<u64>() / c.len() as u64).collect()
-    }
-    fn worst_curve(c: &[Vec<u64>]) -> Vec<u64> {
-        (0..c[0].len()).map(|k| c.iter().map(|r| r[k]).min().unwrap()).collect()
+    fn cell(a: (u64, u64, usize)) -> String {
+        format!("{}/{}@{}", a.0, a.1, a.2)
     }
 
     #[test]
     #[ignore] // expensive; run manually in --release
     fn bitnet_ff_xor() {
-        // FF temporal XOR (4 layers, size 32), Int8 vs Ternary, fan-in × duration × seeds. Reports each
-        // quantizer's mean/worst acc curve; for ternary also the final weight-sparsity (% pruned to 0).
-        let ckpts = [800usize, 2500];
-        eprintln!("== BitNet A/B: FF temporal XOR (4L, size 32, read top; {} seeds) ==", SEEDS.len());
-        eprintln!("r/c     int8 mean|worst @{ckpts:?}    ternary mean|worst @{ckpts:?}   tern.sparsity%");
+        // FF temporal XOR (4 layers, size 32). int8 vs pure vs scaled ternary × fan-in × seeds.
+        let (ee, pat, max) = (400usize, 3usize, 5000usize);
+        eprintln!("== BitNet A/B/C: FF temporal XOR (4L, size 32, read top; {} seeds; best/worst@trials) ==", SEEDS.len());
+        eprintln!("r/c     int8              pure              scaled            sp pure/scaled%");
         for &(ur, uc) in &[(4u32, 32u32), (4, 64)] {
-            let run = |ternary: bool| -> (Vec<Vec<u64>>, f64) {
-                let (mut curves, mut sparsity0) = (Vec::new(), 0.0);
+            let (mut cells, mut sp) = (Vec::new(), Vec::new());
+            for &(_name, q) in &QUANTS {
+                let (mut bests, mut sp0) = (Vec::new(), 0.0);
                 for (si, &s) in SEEDS.iter().enumerate() {
                     let (mut net, entries) = make_ff(s, 32, 4, uc, ur, 20, 6);
-                    if ternary {
-                        net.set_weight_quant(WeightQuant::Ternary);
+                    if let Some(qq) = q {
+                        net.set_weight_quant(qq);
                     }
                     let mut cfg = ff_cfg(0, 0.004, 0.4);
                     cfg.size = 32;
                     cfg.delay = 8;
                     cfg.holdout = 300;
-                    let accs = train_and_eval_curve(&mut net, &entries, s, s, &cfg, xor_task, &ckpts);
+                    let bt = train_and_eval_best(&mut net, &entries, s, s, &cfg, xor_task, ee, pat, max);
                     if si == 0 {
-                        sparsity0 = weight_sparsity(&net);
+                        sp0 = weight_sparsity(&net);
                     }
-                    curves.push(accs);
+                    bests.push(bt);
                 }
-                (curves, sparsity0)
-            };
-            let (i8c, _) = run(false);
-            let (tc, tsp) = run(true);
-            eprintln!(
-                "{ur}/{uc:<3}   {:>9} | {:<9}   {:>9} | {:<9}   {:.1}",
-                fmt_accs(&mean_curve(&i8c)),
-                fmt_accs(&worst_curve(&i8c)),
-                fmt_accs(&mean_curve(&tc)),
-                fmt_accs(&worst_curve(&tc)),
-                tsp * 100.0
-            );
+                cells.push(cell(agg(&bests)));
+                sp.push(sp0);
+            }
+            eprintln!("{ur}/{uc:<3}   {:<16}  {:<16}  {:<16}  {:.1}/{:.1}", cells[0], cells[1], cells[2], sp[1] * 100.0, sp[2] * 100.0);
         }
     }
 
     #[test]
     #[ignore] // expensive; run manually in --release
     fn bitnet_ff_depth() {
-        // Int8 vs Ternary depth revival: does ternary train as deep as int8? Fan-in held at the reviving
-        // r4/c48; sweep depth × duration × seeds (present/read scaled to depth). Reports int8 vs ternary acc,
-        // ternary sparsity, and ternary per-layer firing (seed 0) so we can see whether ternary keeps deep
-        // layers alive.
-        let ckpts = [300usize, 1500];
+        // FF depth revival (size 32, reviving fan-in r4/c48). Does scaled ternary revive as deep as int8?
         let (ur, uc) = (4u32, 48u32);
-        eprintln!("== BitNet A/B: FF depth revival (size 32, r{ur}/c{uc}, read top; {} seeds) ==", SEEDS.len());
-        eprintln!("depth  int8 mean|worst @{ckpts:?}   ternary mean|worst @{ckpts:?}  tern.sp%  tern.rates(seed0)");
+        let (ee, pat, max) = (300usize, 3usize, 3000usize);
+        eprintln!("== BitNet A/B/C: FF depth revival (size 32, r{ur}/c{uc}, read top; {} seeds; best/worst@trials) ==", SEEDS.len());
+        eprintln!("depth  int8              pure              scaled            sp pure/scaled%");
         for &depth in &[4usize, 8, 12] {
-            let run = |ternary: bool| -> (Vec<Vec<u64>>, f64, Vec<f64>) {
-                let (mut curves, mut sp0, mut rates0) = (Vec::new(), 0.0, Vec::new());
+            let (mut cells, mut sp) = (Vec::new(), Vec::new());
+            for &(_name, q) in &QUANTS {
+                let (mut bests, mut sp0) = (Vec::new(), 0.0);
                 for (si, &s) in SEEDS.iter().enumerate() {
                     let (mut net, entries) = make_ff(s, 32, depth, uc, ur, 20, 6);
-                    if ternary {
-                        net.set_weight_quant(WeightQuant::Ternary);
+                    if let Some(qq) = q {
+                        net.set_weight_quant(qq);
                     }
                     let mut cfg = ff_cfg(0, 0.004, 0.0);
                     cfg.size = 32;
                     cfg.present = depth.max(6);
                     cfg.read = depth.max(6);
-                    let accs = train_and_eval_curve(&mut net, &entries, s, s, &cfg, single_task, &ckpts);
+                    let bt = train_and_eval_best(&mut net, &entries, s, s, &cfg, single_task, ee, pat, max);
                     if si == 0 {
                         sp0 = weight_sparsity(&net);
-                        rates0 = per_layer_rates(&mut net, s ^ 0x5A5A);
                     }
-                    curves.push(accs);
+                    bests.push(bt);
                 }
-                (curves, sp0, rates0)
-            };
-            let (i8c, _, _) = run(false);
-            let (tc, tsp, trates) = run(true);
-            eprintln!(
-                "{depth:>4}   {:>9} | {:<9}   {:>9} | {:<9}  {:>5.1}   {}",
-                fmt_accs(&mean_curve(&i8c)), fmt_accs(&worst_curve(&i8c)),
-                fmt_accs(&mean_curve(&tc)), fmt_accs(&worst_curve(&tc)), tsp * 100.0, fmt_rates(&trates)
-            );
+                cells.push(cell(agg(&bests)));
+                sp.push(sp0);
+            }
+            eprintln!("{depth:>4}   {:<16}  {:<16}  {:<16}  {:.1}/{:.1}", cells[0], cells[1], cells[2], sp[1] * 100.0, sp[2] * 100.0);
         }
     }
 
     #[test]
     #[ignore] // expensive; run manually in --release
     fn bitnet_sidecar_parity() {
-        // Int8 vs Ternary on the side-car parity N=3 (size 32, forward r4/c48). Sweep recurrent fan-in ×
-        // duration × seeds. Does the ternary recurrence still train the non-monotone parity task?
+        // Side-car parity N=3 (size 32, forward r4/c48). Does scaled ternary's per-row gain let the
+        // recurrent loop train where pure ternary failed?
         let (fur, fuc) = (4u32, 48u32);
-        let ckpts = [500usize, 2000];
-        eprintln!("== BitNet A/B: side-car parity N=3 (size 32, forward r{fur}/c{fuc}, read top; {} seeds) ==", SEEDS.len());
-        eprintln!("rec r/c  int8 mean|worst @{ckpts:?}   ternary mean|worst @{ckpts:?}  tern.sp%");
+        let (ee, pat, max) = (500usize, 3usize, 5000usize);
+        eprintln!("== BitNet A/B/C: side-car parity N=3 (size 32, forward r{fur}/c{fuc}, read top; {} seeds; best/worst@trials) ==", SEEDS.len());
+        eprintln!("rec r/c  int8              pure              scaled            sp pure/scaled%");
         for &(rr, rc) in &[(4u32, 16u32), (4, 24)] {
-            let run = |ternary: bool| -> (Vec<Vec<u64>>, f64) {
-                let (mut curves, mut sp0) = (Vec::new(), 0.0);
+            let (mut cells, mut sp) = (Vec::new(), Vec::new());
+            for &(_name, q) in &QUANTS {
+                let (mut bests, mut sp0) = (Vec::new(), 0.0);
                 for (si, &s) in SEEDS.iter().enumerate() {
                     let (mut net, entries) = make_sidecar(s, 32, fuc, fur, rc, rr, 20, 6);
-                    if ternary {
-                        net.set_weight_quant(WeightQuant::Ternary);
+                    if let Some(qq) = q {
+                        net.set_weight_quant(qq);
                     }
                     let mut cfg = ff_cfg(0, 0.004, 0.4);
                     cfg.size = 32;
@@ -130,21 +120,16 @@ mod tests {
                     cfg.read = 8;
                     cfg.holdout = 300;
                     cfg.elig.rec_tau = 20.0;
-                    let accs = train_and_eval_curve(&mut net, &entries, s, s, &cfg, |sd, t| task_parity(sd, t, 3), &ckpts);
+                    let bt = train_and_eval_best(&mut net, &entries, s, s, &cfg, |sd, t| task_parity(sd, t, 3), ee, pat, max);
                     if si == 0 {
                         sp0 = weight_sparsity(&net);
                     }
-                    curves.push(accs);
+                    bests.push(bt);
                 }
-                (curves, sp0)
-            };
-            let (i8c, _) = run(false);
-            let (tc, tsp) = run(true);
-            eprintln!(
-                "{rr}/{rc:<3}  {:>9} | {:<9}   {:>9} | {:<9}  {:>5.1}",
-                fmt_accs(&mean_curve(&i8c)), fmt_accs(&worst_curve(&i8c)),
-                fmt_accs(&mean_curve(&tc)), fmt_accs(&worst_curve(&tc)), tsp * 100.0
-            );
+                cells.push(cell(agg(&bests)));
+                sp.push(sp0);
+            }
+            eprintln!("{rr}/{rc:<3}  {:<16}  {:<16}  {:<16}  {:.1}/{:.1}", cells[0], cells[1], cells[2], sp[1] * 100.0, sp[2] * 100.0);
         }
     }
 }
