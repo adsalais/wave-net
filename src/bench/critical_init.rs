@@ -292,8 +292,65 @@ pub fn sigma_gain_init(net: &mut Network, drive_seed: u64, drive_frac_q16: u32, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bench::readout::NearestCentroid;
+    use crate::bench::regime::{as_f64, effective_dim};
     use crate::wave_net::config::{Config, LayerConfig};
     use crate::wave_net::synapse::TopologyLevel;
+
+    /// Top-computational-layer spike-count feature for one (class, trial): drive a noisy class cue
+    /// (template = a fixed random ~`base` subset of L0, flipped per-trial with prob ~`noise`), warm up,
+    /// then count the top layer's spikes over a read window. Feature length = layer size.
+    fn top_features(net: &mut Network, class_seed: u64, class: usize, trial: usize, present: usize, read: usize, base_q16: u32, noise_q16: u32) -> Vec<u32> {
+        let l = net.layer_count();
+        let ls = (net.size() * net.size()) as usize;
+        let top = l - 1;
+        let cue = |w: usize| -> Vec<u32> {
+            (0..ls as u32)
+                .filter(|&local| {
+                    let tmpl = (mix(key(class_seed, local, class as i32, 0, 0xC0E)) & 0xFFFF) < base_q16 as u64;
+                    let nz = (mix(key(class_seed, local, class as i32, (trial * 131 + w + 1) as u32, 0xC0F)) & 0xFFFF) < noise_q16 as u64;
+                    tmpl ^ nz
+                })
+                .collect()
+        };
+        net.reset_state();
+        let warm = present.saturating_sub(read);
+        for w in 0..warm {
+            net.wave(&cue(w));
+        }
+        let counts = Arc::new(Mutex::new(vec![0u32; ls]));
+        {
+            let c = counts.clone();
+            net.on_layer(top, Box::new(move |_w, fired: &[u32]| {
+                let mut g = c.lock().unwrap();
+                for &loc in fired {
+                    g[loc as usize] += 1;
+                }
+            }));
+        }
+        for w in 0..read {
+            net.wave(&cue(warm + w));
+        }
+        net.clear_listeners();
+        std::mem::take(&mut *counts.lock().unwrap())
+    }
+
+    /// Intrinsic computational quality of the (untrained) reservoir: held-out nearest-centroid accuracy
+    /// (permille) on top-layer states over `k` noisy-cue classes, plus the effective dimensionality.
+    fn computational_quality(net: &mut Network, class_seed: u64, k: usize, trials: usize, present: usize, read: usize, base_q16: u32, noise_q16: u32) -> (u64, f64) {
+        let mut features: Vec<Vec<u32>> = Vec::with_capacity(trials);
+        let mut labels: Vec<usize> = Vec::with_capacity(trials);
+        for t in 0..trials {
+            let class = t % k;
+            features.push(top_features(net, class_seed, class, t, present, read, base_q16, noise_q16));
+            labels.push(class);
+        }
+        let half = trials / 2;
+        let nc = NearestCentroid::fit(&features[..half], &labels[..half], k);
+        let test = trials - half;
+        let correct = (half..trials).filter(|&i| nc.predict(&features[i]) == labels[i]).count();
+        ((correct * 1000 / test) as u64, effective_dim(&as_f64(&features)))
+    }
 
     const SEED: u64 = 0xC0FFEE_1234_5678;
 
@@ -459,6 +516,34 @@ mod tests {
                 let f = forward_avalanche(&mut net, SEED ^ 0xABCD, 20000, 32, 32, 16);
                 println!("uc={up_count:<2}: rates={:?} σ_hop{:?}", pct(&r), hops(&f));
             }
+        }
+    }
+
+    /// Experiment (run manually): **computational** effect of the two inits. For each density, init
+    /// the FF net two ways (flat-rate with ψ; rate-free σ-eprop), then measure the intrinsic quality of
+    /// the top-layer representation — held-out nearest-centroid accuracy (separability) + effective-dim
+    /// on a 4-class noisy-cue task. Answers: does σ≈1 (rate-decaying) actually compute better than a
+    /// flat rate (super-critical off the critical density), or not, under ALIF?
+    ///   cargo test --release computation_vs_density -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn computation_vs_density() {
+        let rate_params = CriticalInitParams::default(); // with ψ (the good flat-rate init)
+        let sigma_params = SigmaEpropParams::default();
+        let class_seed = SEED ^ 0x5EED;
+        let (k, trials, present, read, base, noise) = (4usize, 200usize, 16usize, 8usize, 13107u32, 3277u32);
+        println!("(chance = {}‰)", 1000 / k);
+        for up_count in [8u32, 16, 24, 32, 48] {
+            let input = random_l0_input(SEED, 32, 20000);
+            let mut a = Network::new(ff_config(up_count, 3, 5));
+            rate_reg_init(&mut a, SEED, &rate_params, &input);
+            let (acc_a, dim_a) = computational_quality(&mut a, class_seed, k, trials, present, read, base, noise);
+
+            let mut b = Network::new(ff_config(up_count, 3, 5));
+            sigma_eprop_init(&mut b, SEED ^ 0xABCD, 20000, &sigma_params);
+            let (acc_b, dim_b) = computational_quality(&mut b, class_seed, k, trials, present, read, base, noise);
+
+            println!("uc={up_count:<2}: flat-rate acc={acc_a}‰ dim={dim_a:.1}  |  σ-eprop acc={acc_b}‰ dim={dim_b:.1}");
         }
     }
 }
