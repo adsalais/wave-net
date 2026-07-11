@@ -17,6 +17,7 @@ pub fn process_layer(
     acc: &mut [i32],
     deliveries: &mut [Vec<Synapse>],
     fired: &mut Vec<u32>,
+    record_elig: bool,
 ) {
     let ls = (size as usize) * (size as usize);
 
@@ -70,10 +71,14 @@ pub fn process_layer(
         let pi = p as i32;
         let eff = layer.threshold[i] as i32 + (layer.adapt[i] >> ADAPT_SHIFT);
 
-        layer.decide_potential[i] = p; // snapshot pre fire-reset/leak
-        layer.decide_eff[i] = eff; // pre-bump effective threshold; pairs with decide_potential
-        if (pi - eff).abs() <= PSI_BAND {
-            layer.elig_post[i] += 1;
+        // e-prop eligibility is training-only state; skip it on the pure forward path (`record_elig
+        // == false`), where these are ~3 dead array writes per neuron per wave.
+        if record_elig {
+            layer.decide_potential[i] = p; // snapshot pre fire-reset/leak
+            layer.decide_eff[i] = eff; // pre-bump effective threshold; pairs with decide_potential
+            if (pi - eff).abs() <= PSI_BAND {
+                layer.elig_post[i] += 1;
+            }
         }
 
         let mut pot = p;
@@ -82,7 +87,9 @@ pub fn process_layer(
             layer.cooldown[i] = cooldown_base;
             let bumped = layer.adapt[i] + (adapt_bump << ADAPT_SHIFT);
             layer.adapt[i] = bumped.clamp(0, ADAPT_MAX);
-            layer.elig_pre[i] += 1;
+            if record_elig {
+                layer.elig_pre[i] += 1;
+            }
             fired.push(i as u32);
         } else {
             layer.cooldown[i] = c;
@@ -159,7 +166,7 @@ mod tests {
         let mut acc = vec![0i32; 16];
         let mut deliveries = deliv(1);
         let mut fired = Vec::new();
-        process_layer(&mut l, 0, 0, 4, &[], &mut acc, &mut deliveries, &mut fired);
+        process_layer(&mut l, 0, 0, 4, &[], &mut acc, &mut deliveries, &mut fired, true);
         assert_eq!(l.decide_potential[0], 8, "fired neuron's decide_potential is the pre-reset value");
         assert_eq!(l.potential[0], 0, "fired neuron's potential reset post-wave");
         assert_eq!(l.decide_potential[1], 3, "sub-threshold neuron's decide_potential is its charge");
@@ -181,7 +188,7 @@ mod tests {
         let mut acc = vec![0i32; 16];
         let mut deliveries = deliv(2);
         let mut fired = Vec::new();
-        process_layer(&mut l, 0, 0, 4, &[], &mut acc, &mut deliveries, &mut fired);
+        process_layer(&mut l, 0, 0, 4, &[], &mut acc, &mut deliveries, &mut fired, true);
         assert_eq!(fired, vec![0]);
         assert_eq!(l.decide_eff[0], 8, "decide_eff is the PRE-bump effective threshold (5 + 3)");
         // post-wave adapt is bumped (~40) and decayed once, so the current eff is far higher — the bug we fixed
@@ -199,7 +206,7 @@ mod tests {
         let mut acc = vec![0i32; 16];
         let mut deliveries = deliv(2);
         let mut fired = Vec::new();
-        process_layer(&mut l, 0, 0, 4, &[], &mut acc, &mut deliveries, &mut fired);
+        process_layer(&mut l, 0, 0, 4, &[], &mut acc, &mut deliveries, &mut fired, true);
         assert_eq!(fired, vec![0]);
         // a fire adds bump<<SHIFT in Q-fixed-point, then step 7 decays it once
         let bumped = 8i32 << ADAPT_SHIFT;
@@ -214,7 +221,7 @@ mod tests {
         let mut acc = vec![0i32; 1];
         let mut deliveries = deliv(1);
         let mut fired = Vec::new();
-        process_layer(&mut l, 0, 0, 1, &[], &mut acc, &mut deliveries, &mut fired);
+        process_layer(&mut l, 0, 0, 1, &[], &mut acc, &mut deliveries, &mut fired, true);
         // 100 - (100 >> 3) = 100 - 12 = 88
         assert_eq!(l.adapt[0], 88);
         assert!(fired.is_empty());
@@ -232,7 +239,7 @@ mod tests {
             let mut acc = vec![0i32; 1];
             let mut deliveries = deliv(1);
             let mut fired = Vec::new();
-            process_layer(&mut l, 0, 0, 1, &[], &mut acc, &mut deliveries, &mut fired);
+            process_layer(&mut l, 0, 0, 1, &[], &mut acc, &mut deliveries, &mut fired, true);
             fired
         };
         assert_eq!(drive(0), vec![0], "baseline 5, potential 10 -> fires with no adaptation");
@@ -251,9 +258,38 @@ mod tests {
             for _ in 0..3 {
                 l.inbox.push(Synapse { target: 0, weight: 1 });
             }
-            process_layer(&mut l, 0, 0, 4, &[], &mut acc, &mut deliveries, &mut fired);
+            process_layer(&mut l, 0, 0, 4, &[], &mut acc, &mut deliveries, &mut fired, true);
             assert_eq!(l.adapt[0], 0, "adapt must stay 0 when adapt_bump is 0");
         }
+    }
+
+    #[test]
+    fn record_elig_false_skips_eligibility_but_fires_identically() {
+        // Same drive, recording on vs off: firing must be identical, but with recording off the
+        // eligibility accumulators and the decide snapshots must stay at rest.
+        let run = |record: bool| {
+            let mut l = low_layer(4, 1, 2, vec![TopologyLevel { level: 1, radius: 0, count: 1 }]);
+            for c in l.cooldown.iter_mut() {
+                *c = 0;
+            }
+            l.potential[0] = 1; // fires (threshold 1) and sits within the ψ band
+            let mut acc = vec![0i32; 16];
+            let mut deliveries = deliv(2);
+            let mut fired = Vec::new();
+            process_layer(&mut l, 0, 0, 4, &[], &mut acc, &mut deliveries, &mut fired, record);
+            (fired.clone(), l.elig_pre[0], l.elig_post[0], l.decide_potential[0], l.decide_eff[0])
+        };
+        let (fired_on, pre_on, post_on, dp_on, de_on) = run(true);
+        let (fired_off, pre_off, post_off, dp_off, de_off) = run(false);
+        assert_eq!(fired_on, vec![0]);
+        assert_eq!(fired_on, fired_off, "firing is identical regardless of eligibility recording");
+        assert!(pre_on >= 1 && post_on >= 1, "recording on accrues eligibility");
+        assert_eq!((dp_on, de_on), (1, 1), "recording on snapshots decide_potential/decide_eff");
+        assert_eq!(
+            (pre_off, post_off, dp_off, de_off),
+            (0, 0, 0, 0),
+            "recording off leaves eligibility and decide snapshots at rest"
+        );
     }
 
     #[test]
@@ -266,7 +302,7 @@ mod tests {
         let mut acc = vec![0i32; 16];
         let mut deliveries = deliv(2);
         let mut fired = Vec::new();
-        process_layer(&mut l, 0, 0, 4, &[], &mut acc, &mut deliveries, &mut fired);
+        process_layer(&mut l, 0, 0, 4, &[], &mut acc, &mut deliveries, &mut fired, true);
         assert_eq!(l.elig_pre[0], 1, "a spike bumps the pre-trace");
         assert!(l.elig_post[0] >= 1, "near-threshold bumps the post pseudo-derivative");
     }
@@ -283,7 +319,7 @@ mod tests {
         let mut acc = vec![0i32; 16];
         let mut deliveries = deliv(2);
         let mut fired = Vec::new();
-        process_layer(&mut l, 0, 0, 4, &[], &mut acc, &mut deliveries, &mut fired);
+        process_layer(&mut l, 0, 0, 4, &[], &mut acc, &mut deliveries, &mut fired, true);
         assert_eq!(fired, vec![0]);
         assert_eq!(deliveries[1][0].weight, 7, "delivered weight = stored out_weight");
     }
@@ -334,7 +370,7 @@ mod tests {
         let mut acc = vec![0i32; 16];
         let mut deliveries = deliv(2);
         let mut fired = Vec::new();
-        process_layer(&mut l, 0, 0, 4, &[], &mut acc, &mut deliveries, &mut fired);
+        process_layer(&mut l, 0, 0, 4, &[], &mut acc, &mut deliveries, &mut fired, true);
         assert_eq!(fired, vec![0]);
         assert_eq!(l.potential[0], 0);
         assert_eq!(l.cooldown[0], 2);
@@ -349,13 +385,13 @@ mod tests {
         let mut deliveries = deliv(1);
         let mut fired = Vec::new();
         // wave A: force fire via injection (potential=i16::MAX, cooldown=0)
-        process_layer(&mut l, 0, 0, 1, &[0], &mut acc, &mut deliveries, &mut fired);
+        process_layer(&mut l, 0, 0, 1, &[0], &mut acc, &mut deliveries, &mut fired, true);
         assert_eq!(fired, vec![0]);
         // wave B: strong drive but still refractory (cooldown 2 -> 1)
         for _ in 0..100 {
             l.inbox.push(Synapse { target: 0, weight: 1 });
         }
-        process_layer(&mut l, 0, 0, 1, &[], &mut acc, &mut deliveries, &mut fired);
+        process_layer(&mut l, 0, 0, 1, &[], &mut acc, &mut deliveries, &mut fired, true);
         assert!(fired.is_empty(), "must not fire while refractory");
     }
 
@@ -366,7 +402,7 @@ mod tests {
         let mut acc = vec![0i32; 1];
         let mut deliveries = deliv(1);
         let mut fired = Vec::new();
-        process_layer(&mut l, 0, 0, 1, &[], &mut acc, &mut deliveries, &mut fired);
+        process_layer(&mut l, 0, 0, 1, &[], &mut acc, &mut deliveries, &mut fired, true);
         // leak (3,5): 1000 - 125 - 31 = 844
         assert_eq!(l.potential[0], 844);
     }
@@ -381,7 +417,7 @@ mod tests {
         let mut deliveries = deliv(1);
         let mut fired = Vec::new();
         for _ in 0..6 {
-            process_layer(&mut l, 0, 0, 1, &[], &mut acc, &mut deliveries, &mut fired);
+            process_layer(&mut l, 0, 0, 1, &[], &mut acc, &mut deliveries, &mut fired, true);
         }
         assert_eq!(l.potential[0], 0, "small potential must leak to 0, not freeze in the dead zone");
     }
@@ -403,7 +439,7 @@ mod tests {
             let mut acc = vec![0i32; 1];
             let mut deliveries = deliv(1);
             let mut fired = Vec::new();
-            process_layer(&mut l, 0, 0, 1, &[], &mut acc, &mut deliveries, &mut fired);
+            process_layer(&mut l, 0, 0, 1, &[], &mut acc, &mut deliveries, &mut fired, true);
             l.potential[0]
         };
         // 40 + 90 = 130 (no clamp), then leak (3,5): 130 - 16 - 4 = 110

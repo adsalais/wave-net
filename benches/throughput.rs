@@ -56,6 +56,8 @@ fn setup_net() -> Network {
     let input = random_l0_input(SEED, SIZE, NOISE_FRACTION_Q16);
     let params = CalibrateParams { target_permille: 100, ..CalibrateParams::default() };
     net.calibrate(&params, &input);
+    // Pure forward-throughput measurement: no training reads the eligibility, so skip accruing it.
+    net.set_record_eligibility(false);
     net
 }
 

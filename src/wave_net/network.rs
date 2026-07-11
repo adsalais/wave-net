@@ -14,6 +14,10 @@ pub struct Network {
     layers: Vec<Layer>,
     wave_id: usize,
     scratch: Scratch,
+    /// Whether each wave accrues the e-prop eligibility (per-neuron `decide_potential`/`decide_eff`
+    /// snapshots and `elig_pre`/`elig_post` traces). Training needs it (default `true`); a pure
+    /// forward pass (inference, throughput) turns it off to skip that per-neuron write traffic.
+    record_eligibility: bool,
     #[allow(clippy::type_complexity)]
     listeners: Vec<Option<Box<dyn Fn(usize, &[u32]) + Send + Sync>>>,
 }
@@ -72,6 +76,7 @@ impl Network {
                 fired: Vec::new(),
                 deliveries: (0..l).map(|_| Vec::new()).collect(),
             },
+            record_eligibility: true,
             listeners: (0..l).map(|_| None).collect(),
         }
     }
@@ -82,6 +87,7 @@ impl Network {
         let l = self.layers.len();
         let seed = self.seed;
         let size = self.size;
+        let record_elig = self.record_eligibility;
         // Disjoint mutable borrows: each layer is processed while generation scatters into the
         // separate `deliveries` buffer, so a source layer's level-0 self-connections and its own
         // in-flight state never alias.
@@ -90,7 +96,7 @@ impl Network {
 
         for z in 0..l {
             let inp: &[u32] = if z == 0 { input } else { &[] };
-            process_layer(&mut layers[z], z as u32, seed, size, inp, acc, deliveries, fired);
+            process_layer(&mut layers[z], z as u32, seed, size, inp, acc, deliveries, fired, record_elig);
             if let Some(listener) = &listeners[z] {
                 listener(w, fired);
             }
@@ -112,6 +118,13 @@ impl Network {
         for l in self.listeners.iter_mut() {
             *l = None;
         }
+    }
+
+    /// Toggle e-prop eligibility recording (default on). Turn it off for a pure forward pass
+    /// (inference / throughput) to skip the per-neuron `decide_potential`/`decide_eff` snapshots and
+    /// `elig_pre`/`elig_post` traces; turn it back on before a training pass that reads them.
+    pub fn set_record_eligibility(&mut self, on: bool) {
+        self.record_eligibility = on;
     }
 
     pub fn reset_state(&mut self) {
