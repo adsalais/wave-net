@@ -154,14 +154,64 @@ pub fn forward_avalanche(net: &mut Network, drive_seed: u64, drive_frac_q16: u32
             guard += 1;
         }
         let pert = run(net, Some(p));
-        for z in 1..l {
-            let wv = warmup + z; // wave the avalanche front reaches layer z
+        for z in 0..l {
+            let wv = warmup + z; // wave the avalanche front reaches layer z (z=0: the extra spike itself)
             let a: HashSet<u32> = refr[z][wv].iter().copied().collect();
             let b: HashSet<u32> = pert[z][wv].iter().copied().collect();
             footprint[z] += a.symmetric_difference(&b).count() as f64 / np as f64;
         }
     }
-    footprint
+    footprint // footprint[0] ≈ 1 (the injected spike); σ_hop(z-1→z) = footprint[z]/footprint[z-1]
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SigmaInitParams {
+    pub rounds: usize,   // max gain-scaling rounds per layer edge
+    pub alpha: f32,      // damped step: g = (1/σ)^alpha (0<alpha<=1)
+    pub tol: f32,        // stop an edge when |σ_hop - 1| <= tol
+    pub warmup: usize,   // avalanche measurement warmup
+    pub n_perturb: usize, // perturbation sites averaged per σ measurement
+}
+
+impl Default for SigmaInitParams {
+    fn default() -> SigmaInitParams {
+        SigmaInitParams { rounds: 30, alpha: 0.5, tol: 0.15, warmup: 32, n_perturb: 24 }
+    }
+}
+
+/// Multiply layer `z`'s out-weights (via the f32 shadow, then requantize) by gain `g`. Rescales the
+/// random projection uniformly — changes the effective gain (hence σ) while preserving its structure.
+fn scale_layer(net: &mut Network, z: usize, g: f32) {
+    net.with_layer_mut(z, |lz| {
+        for s in lz.out_shadow.iter_mut() {
+            *s *= g;
+        }
+        for (wq, s) in lz.out_weights.iter_mut().zip(&lz.out_shadow) {
+            *wq = s.round().clamp(-127.0, 127.0) as i8;
+        }
+    });
+}
+
+/// **Rate-free criticality init.** Drive each forward hop's branching ratio σ_hop → 1 by scaling the
+/// source layer's weight *gain* (no firing-rate target — the rate is whatever criticality produces),
+/// layer-wise greedy bottom-up. σ_hop is measured by `forward_avalanche` (per-hop damage spreading);
+/// σ>1 → shrink the gain, σ<1 (or a dead target) → grow it, until |σ-1|≤tol, then freeze and move up.
+pub fn sigma_gain_init(net: &mut Network, drive_seed: u64, drive_frac_q16: u32, params: &SigmaInitParams) {
+    let l = net.layer_count();
+    for z in 1..l {
+        for _ in 0..params.rounds {
+            let fp = forward_avalanche(net, drive_seed, drive_frac_q16, params.warmup, params.n_perturb);
+            let denom = fp[z - 1];
+            let sigma = if denom > 0.0 { fp[z] / denom } else { 0.0 };
+            if denom > 0.0 && (sigma - 1.0).abs() <= params.tol as f64 {
+                break;
+            }
+            // σ<1 or a dead target → grow the gain; σ>1 → shrink it. Damped by `alpha` for stability.
+            let alpha = params.alpha as f64;
+            let g = if sigma <= 0.0 { 1.0 + alpha } else { (1.0 / sigma).powf(alpha) };
+            scale_layer(net, z - 1, g as f32);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -259,6 +309,28 @@ mod tests {
         for uc in [16u32, 32] {
             run(uc, 3, 5);
             run(uc, 3, 0);
+        }
+    }
+
+    /// Experiment (run manually): the **rate-free σ-gain init** across the density sweep. Targets
+    /// σ_hop≈1 by scaling gain (no rate set-point); the rate is emergent. Expect σ_hop≈1 at every
+    /// density, with the rate self-selecting (high density → lower rate, low density → higher).
+    ///   cargo test --release sigma_gain_init_vs_density -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn sigma_gain_init_vs_density() {
+        let params = SigmaInitParams::default();
+        let hops = |f: &[f64]| -> Vec<f64> {
+            (1..f.len()).map(|z| if f[z - 1] > 0.0 { (f[z] / f[z - 1] * 100.0).round() / 100.0 } else { 0.0 }).collect()
+        };
+        let fp = |f: &[f64]| f.iter().map(|x| (x * 10.0).round() / 10.0).collect::<Vec<_>>();
+        for up_count in [8u32, 16, 24, 32, 48] {
+            let mut net = Network::new(ff_config(up_count, 3, 5));
+            sigma_gain_init(&mut net, SEED ^ 0xABCD, 20000, &params);
+            let input = random_l0_input(SEED, 32, 20000);
+            let r = net.measure_layer_rates(32, 128, &input);
+            let f = forward_avalanche(&mut net, SEED ^ 0xABCD, 20000, 32, 32);
+            println!("uc={up_count:<2}: rates(emergent)={:?} footprint(L0..){:?} σ_hop{:?}", pct(&r), fp(&f), hops(&f));
         }
     }
 }
