@@ -501,6 +501,63 @@ pub(crate) mod harness {
         }
         if total == 0 { 0.0 } else { zeros as f64 / total as f64 }
     }
+
+    /// Train with periodic held-out eval; return `(best held-out permille, trials at which it was reached)` —
+    /// i.e. early-stopping / best-checkpoint (the readable PEAK, immune to the rate_reg over-training
+    /// collapse) plus a training-SPEED proxy. Evaluates every `eval_every` trials against a FIXED held-out
+    /// set (disjoint from training); stops after `patience` consecutive non-improving evals or at `max_trials`.
+    pub(crate) fn train_and_eval_best(net: &mut Network, entries: &[Vec<Edge>], seed: u64, task_seed: u64, cfg: &TaskCfg, task: impl Fn(u64, usize) -> (Vec<usize>, usize), eval_every: usize, patience: usize, max_trials: usize) -> (u64, usize) {
+        const EVAL_OFFSET: usize = 10_000_000;
+        let l = net.layer_count();
+        let ls = (cfg.size * cfg.size) as usize;
+        let top = l - 1;
+        let mut w = vec![vec![0f32; ls]; 2];
+        let score = |w: &[Vec<f32>], a: &[f32]| -> (f32, f32) {
+            (w[0].iter().zip(a).map(|(x, y)| x * y).sum(), w[1].iter().zip(a).map(|(x, y)| x * y).sum())
+        };
+        let (mut best, mut best_at, mut stale, mut t) = (0u64, 0usize, 0usize, 0usize);
+        while t < max_trials {
+            let stop = (t + eval_every).min(max_trials);
+            while t < stop {
+                let (classes, label) = task(task_seed, t);
+                let (act, rec) = run_trial(net, cfg.size, &classes, task_seed, cfg.present, cfg.delay, cfg.read);
+                let (s0, s1) = score(&w, &act);
+                let (p0, p1) = softmax2(s0, s1);
+                let err = [p0 - if label == 0 { 1.0 } else { 0.0 }, p1 - if label == 1 { 1.0 } else { 0.0 }];
+                for c in 0..2 {
+                    for j in 0..ls {
+                        w[c][j] -= cfg.readout_lr * err[c] * act[j];
+                    }
+                }
+                if cfg.hidden_lr != 0.0 {
+                    let signal = build_signal(&rec, &w, &err, seed, l, ls, top, cfg);
+                    multilayer_dfa_step(net, entries, &rec, &signal, cfg.hidden_lr, &cfg.elig);
+                }
+                t += 1;
+            }
+            let mut correct = 0usize;
+            for i in 0..cfg.holdout {
+                let (classes, label) = task(task_seed, EVAL_OFFSET + i);
+                let (act, _) = run_trial(net, cfg.size, &classes, task_seed, cfg.present, cfg.delay, cfg.read);
+                let (s0, s1) = score(&w, &act);
+                if ((s1 > s0) as usize) == label {
+                    correct += 1;
+                }
+            }
+            let acc = (correct as u64 * 1000) / cfg.holdout as u64;
+            if acc > best {
+                best = acc;
+                best_at = t;
+                stale = 0;
+            } else {
+                stale += 1;
+                if stale >= patience {
+                    break;
+                }
+            }
+        }
+        (best, best_at)
+    }
 }
 
 #[cfg(test)]
@@ -700,5 +757,16 @@ mod tests {
         let ternary = net.with_layer(1, |l| l.out_weights.iter().all(|&w| w == -1 || w == 0 || w == 1));
         assert!(ternary, "weights must stay ternary during training");
         assert!(acc > 600, "ternary net should train above chance: {acc}");
+    }
+
+    #[test]
+    fn train_and_eval_best_returns_peak_and_speed() {
+        let seed = 0xE9_0B_0A17u64;
+        let (mut net, entries) = make_ff(seed, 16, 4, 32, 3, 20, 6);
+        let mut cfg = ff_cfg(0, 0.004, 0.0);
+        cfg.size = 16;
+        let (best, at) = train_and_eval_best(&mut net, &entries, seed, seed, &cfg, single_task, 100, 3, 1000);
+        assert!(best > 600, "best held-out should beat chance: {best}");
+        assert!(at > 0 && at <= 1000, "trials-to-best in range: {at}");
     }
 }
