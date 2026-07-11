@@ -167,6 +167,11 @@ impl Network {
         self.size
     }
 
+    /// The construction seed (learning rules need it to recover synapse targets via `target_of`).
+    pub(crate) fn seed_val(&self) -> u64 {
+        self.seed
+    }
+
     pub fn layer_count(&self) -> usize {
         self.layers.len()
     }
