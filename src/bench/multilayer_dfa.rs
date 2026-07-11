@@ -488,4 +488,67 @@ mod tests {
         let acc = train_and_eval(&mut net, &entries, seed, seed, &cfg, xor_task);
         assert!(acc > 640, "temporal XOR should train above chance: {acc}");
     }
+
+    /// Multi-topology stack (3 layers) with a LEVEL-0 self-recurrence on the ACTIVE middle layer L1:
+    /// L0→L1(+1); L1 self(0) + →L2(+1); L2 read. L1 sits on the forward path (driven by L0), so — unlike the
+    /// side-car's backward-only-fed scratchpad — its recurrent edge reliably gets real eligibility. The
+    /// `entries` order mirrors each layer's built topology so slots line up with `out_weights`.
+    fn make_hidden_rec(seed: u64, size: u32, uc: u32, ur: u32, n: u32, r: u32, adapt_bump: i16, adapt_decay: u8) -> (Network, Vec<Vec<Edge>>) {
+        let mk = |topology| LayerConfig {
+            topology,
+            leak: (3, 5),
+            cooldown_base: 2,
+            inhibitor_ratio: 0,
+            threshold_jitter: 32,
+            baseline_init: 6,
+            adapt_bump,
+            adapt_decay,
+        };
+        let layers = vec![
+            mk(vec![TopologyLevel { level: 1, radius: ur, count: uc }]),
+            mk(vec![TopologyLevel { level: 1, radius: ur, count: uc }, TopologyLevel { level: 0, radius: r, count: n }]),
+            mk(vec![]),
+        ];
+        let net = Network::new(Config { seed, size, layers });
+        let entries = vec![
+            vec![Edge { level: 1, count: uc as usize, radius: ur }],
+            vec![Edge { level: 1, count: uc as usize, radius: ur }, Edge { level: 0, count: n as usize, radius: r }],
+            vec![],
+        ];
+        (net, entries)
+    }
+
+    #[test]
+    fn multilayer_dfa_trains_recurrent_edge() {
+        // Multi-topology: the LEVEL-0 self-recurrence on the active middle layer must be trained, not just the
+        // forward path. Assert the recurrent-edge trainable accumulator (out_shadow) on L1 moves from its ±1
+        // init — the shadow is the precise "did this edge receive updates" signal (the quantised i8 weight
+        // only flips once the shadow crosses ±0.5, which the small DFA signal need not do in a short run).
+        let seed = 0xE9_0B_0A17u64;
+        let (uc, n) = (32u32, 12u32);
+        let (mut net, entries) = make_hidden_rec(seed, 8, uc, 3, n, 3, 20, 6);
+        // L1 out_shadow layout: total_slots = uc + n; the level-0 (recurrent) slots are [uc .. uc+n) per source.
+        let rec_shadow = |net: &Network| -> Vec<f32> {
+            net.with_layer(1, |lz| {
+                let ts = lz.total_slots;
+                let ls = lz.out_shadow.len() / ts;
+                let mut v = Vec::new();
+                for i in 0..ls {
+                    for k in 0..(n as usize) {
+                        v.push(lz.out_shadow[i * ts + uc as usize + k]);
+                    }
+                }
+                v
+            })
+        };
+        let before = rec_shadow(&net);
+        // spike-ψ (beta 0): robust eligibility. (bump-ψ collapses to ~0 under strong drive when the potential
+        // overshoots eff by more than PSI_WIDTH — see the PSI_WIDTH note; the ALIF-εᵃ path is covered by the
+        // eligibility unit tests.)
+        let mut cfg = ff_cfg(400, 0.004, 0.0);
+        cfg.size = 8;
+        let _acc = train_and_eval(&mut net, &entries, seed, seed, &cfg, single_task);
+        let after = rec_shadow(&net);
+        assert_ne!(before, after, "the level-0 recurrent edge on the active layer must train (non-FF path)");
+    }
 }
