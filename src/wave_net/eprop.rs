@@ -71,13 +71,19 @@ impl Network {
         self.with_layer_mut(source_z, |lz| {
             for i in 0..ls {
                 let sg = (base + i) as u32;
+                let mut touched = false;
                 for kk in 0..count {
+                    let e = elig[i * count + kk];
+                    if e == 0.0 {
+                        continue; // shadow += ∓0.0 is a no-op → byte-identical
+                    }
+                    touched = true;
                     let j = target_of(seed, sg, i as u32, level, kk as u32, radius, size) as usize;
-                    lz.out_shadow[i * total_slots + slot_base + kk] += -lr * signal[j] * elig[i * count + kk];
+                    lz.out_shadow[i * total_slots + slot_base + kk] += -lr * signal[j] * e;
                 }
-            }
-            for (wq, s) in lz.out_weights.iter_mut().zip(&lz.out_shadow) {
-                *wq = s.round().clamp(-127.0, 127.0) as i8;
+                if touched {
+                    lz.requantize_row(i); // per-row: int8 byte-identical, ternary-capable
+                }
             }
         });
     }
@@ -201,5 +207,29 @@ mod tests {
         let after = net.with_layer(0, |l| l.out_shadow[0]);
         // Δ = -lr·signal[0]·elig[0] = -0.1·0.5·2 = -0.1
         assert!((after - before + 0.1).abs() < 1e-4, "{before} -> {after}");
+    }
+
+    #[test]
+    fn eprop_update_synaptic_ternary_keeps_weights_ternary() {
+        use crate::wave_net::neurons::WeightQuant;
+        let lc = LayerConfig {
+            topology: vec![TopologyLevel { level: 1, radius: 1, count: 4 }],
+            leak: (3, 5),
+            cooldown_base: 2,
+            inhibitor_ratio: 0,
+            threshold_jitter: 0,
+            baseline_init: 6,
+            adapt_bump: 0,
+            adapt_decay: 5,
+        };
+        let mut net = Network::new(Config { seed: 9, size: 8, layers: vec![lc; 2] });
+        net.set_weight_quant(WeightQuant::Ternary);
+        let ls = 64;
+        // large mixed eligibility + signal → shadows move a lot; weights must stay in {−1,0,+1}
+        let elig: Vec<f32> = (0..ls * 4).map(|k| if k % 3 == 0 { 5.0 } else { 0.2 }).collect();
+        let signal = vec![0.5f32; ls];
+        net.eprop_update_synaptic(0, 0, &elig, &signal, 0.5);
+        let ok = net.with_layer(0, |l| l.out_weights.iter().all(|&w| w == -1 || w == 0 || w == 1));
+        assert!(ok, "ternary mode must keep every out_weight in {{-1,0,1}}");
     }
 }
