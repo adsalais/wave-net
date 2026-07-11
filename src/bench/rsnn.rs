@@ -518,7 +518,7 @@ fn elig_adapt_sum(ttot: usize, beta: f32, rho: f32, psi: impl Fn(usize) -> f32, 
     e
 }
 
-fn target_of(seed: u64, source_global: u32, src_local: u32, level: i32, k: u32, radius: u32, size: u32) -> u32 {
+pub(crate) fn target_of(seed: u64, source_global: u32, src_local: u32, level: i32, k: u32, radius: u32, size: u32) -> u32 {
     let (sx, sy) = xy_of(src_local, size);
     let h = mix(key(seed, source_global, level, k, P_TARGET));
     let span = 2 * radius + 1;
