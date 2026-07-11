@@ -156,7 +156,181 @@ mod tests {
     use super::*;
     use crate::wave_net::config::{Config, LayerConfig};
     use crate::wave_net::network::Network;
-    use crate::wave_net::synapse::TopologyLevel;
+    use crate::wave_net::synapse::{key, mix, TopologyLevel};
+    use std::sync::{Arc, Mutex};
+
+    const CUE_P: u64 = 0xC0E;
+    const P_DFA: u64 = 61; // fixed random DFA feedback (copied from rsnn — this file has no rsnn dep)
+
+    /// Deterministic, class-distinct L0 spike pattern (~25% density), stable across waves.
+    fn cue_sites(task_seed: u64, size: u32, class: usize) -> Vec<u32> {
+        let ls = (size * size) as u32;
+        (0..ls).filter(|&loc| mix(key(task_seed, loc, class as i32, 0, CUE_P)) & 3 == 0).collect()
+    }
+
+    fn softmax2(z0: f32, z1: f32) -> (f32, f32) {
+        let m = z0.max(z1);
+        let (e0, e1) = ((z0 - m).exp(), (z1 - m).exp());
+        let s = (e0 + e1).max(1e-30);
+        (e0 / s, e1 / s)
+    }
+
+    fn dfa_weight(seed: u64, neuron_global: u32, class: usize) -> f32 {
+        if mix(key(seed, neuron_global, class as i32, 0, P_DFA)) & 1 == 1 { 1.0 } else { -1.0 }
+    }
+
+    /// Drive a cue sequence and record per-wave fired-sets + decide potential/eff for EVERY layer.
+    /// Returns (top-layer read-window spike counts, records). Bench owns the trial.
+    fn run_trial(net: &mut Network, size: u32, classes: &[usize], task_seed: u64, present: usize, delay: usize, read: usize) -> (Vec<f32>, TrialRecords) {
+        let l = net.layer_count();
+        let ls = (size * size) as usize;
+        let top = l - 1;
+        let spikes_acc: Arc<Mutex<Vec<Vec<Vec<u32>>>>> = Arc::new(Mutex::new(vec![Vec::new(); l]));
+        for z in 0..l {
+            let acc = spikes_acc.clone();
+            net.on_layer(z, Box::new(move |_w, fired: &[u32]| acc.lock().unwrap()[z].push(fired.to_vec())));
+        }
+        net.reset_state();
+        let mut pots: Vec<Vec<Vec<i16>>> = vec![Vec::new(); l];
+        let mut effs: Vec<Vec<Vec<i32>>> = vec![Vec::new(); l];
+        let snapshot = |net: &Network, pots: &mut Vec<Vec<Vec<i16>>>, effs: &mut Vec<Vec<Vec<i32>>>| {
+            for z in 0..l {
+                pots[z].push(net.layer_decide_potential(z));
+                effs[z].push(net.layer_decide_effective_threshold(z));
+            }
+        };
+        for (pos, &class) in classes.iter().enumerate() {
+            if pos > 0 {
+                for _ in 0..delay {
+                    net.wave(&[]);
+                    snapshot(net, &mut pots, &mut effs);
+                }
+            }
+            for _ in 0..present {
+                let sites = cue_sites(task_seed, size, class);
+                net.wave(&sites);
+                snapshot(net, &mut pots, &mut effs);
+            }
+        }
+        let read_start = spikes_acc.lock().unwrap()[top].len();
+        for _ in 0..read {
+            net.wave(&[]);
+            snapshot(net, &mut pots, &mut effs);
+        }
+        net.clear_listeners();
+        let spikes = spikes_acc.lock().unwrap().clone();
+        let mut act = vec![0f32; ls];
+        for wv in spikes[top].iter().skip(read_start) {
+            for &loc in wv {
+                act[loc as usize] += 1.0;
+            }
+        }
+        (act, TrialRecords { spikes, pots, effs })
+    }
+
+    struct TaskCfg {
+        size: u32,
+        present: usize,
+        delay: usize,
+        read: usize,
+        trials: usize,
+        holdout: usize,
+        readout_lr: f32,
+        hidden_lr: f32,
+        rate_reg: f32,
+        rate_target: f32,
+        elig: EligParams,
+    }
+
+    /// Bench readout + DFA + rate_reg → `signal[tz][j]` (symmetric readout on top, random DFA deeper;
+    /// per-neuron rate_reg on ALL layers — no rec_stab, per spec).
+    fn build_signal(rec: &TrialRecords, w: &[Vec<f32>], err: &[f32], seed: u64, l: usize, ls: usize, top: usize, cfg: &TaskCfg) -> Vec<Vec<f32>> {
+        let ttot = rec.spikes[top].len().max(1) as f32;
+        let mut signal = vec![vec![0f32; ls]; l];
+        for tz in 1..l {
+            for j in 0..ls {
+                let task_sig: f32 = (0..2)
+                    .map(|c| {
+                        let b = if tz == top { w[c][j] } else { dfa_weight(seed, (tz * ls + j) as u32, c) };
+                        b * err[c]
+                    })
+                    .sum();
+                let fired_j = rec.spikes[tz].iter().filter(|wv| wv.contains(&(j as u32))).count() as f32;
+                let rate = fired_j / ttot;
+                signal[tz][j] = task_sig + cfg.rate_reg * (rate - cfg.rate_target);
+            }
+        }
+        signal
+    }
+
+    /// Full training loop (bench-owned) over the engine step. Returns held-out accuracy permille.
+    fn train_and_eval(net: &mut Network, entries: &[Vec<Edge>], seed: u64, task_seed: u64, cfg: &TaskCfg, task: impl Fn(u64, usize) -> (Vec<usize>, usize)) -> u64 {
+        let l = net.layer_count();
+        let ls = (cfg.size * cfg.size) as usize;
+        let top = l - 1;
+        let mut w = vec![vec![0f32; ls]; 2];
+        let score = |w: &[Vec<f32>], a: &[f32]| -> (f32, f32) {
+            (w[0].iter().zip(a).map(|(x, y)| x * y).sum(), w[1].iter().zip(a).map(|(x, y)| x * y).sum())
+        };
+        for t in 0..cfg.trials {
+            let (classes, label) = task(task_seed, t);
+            let (act, rec) = run_trial(net, cfg.size, &classes, task_seed, cfg.present, cfg.delay, cfg.read);
+            let (s0, s1) = score(&w, &act);
+            let (p0, p1) = softmax2(s0, s1);
+            let err = [p0 - if label == 0 { 1.0 } else { 0.0 }, p1 - if label == 1 { 1.0 } else { 0.0 }];
+            for c in 0..2 {
+                for j in 0..ls {
+                    w[c][j] -= cfg.readout_lr * err[c] * act[j];
+                }
+            }
+            if cfg.hidden_lr != 0.0 {
+                let signal = build_signal(&rec, &w, &err, seed, l, ls, top, cfg);
+                multilayer_dfa_step(net, entries, &rec, &signal, cfg.hidden_lr, &cfg.elig);
+            }
+        }
+        let mut correct = 0usize;
+        for t in cfg.trials..cfg.trials + cfg.holdout {
+            let (classes, label) = task(task_seed, t);
+            let (act, _) = run_trial(net, cfg.size, &classes, task_seed, cfg.present, cfg.delay, cfg.read);
+            let (s0, s1) = score(&w, &act);
+            if ((s1 > s0) as usize) == label {
+                correct += 1;
+            }
+        }
+        (correct as u64 * 1000) / cfg.holdout as u64
+    }
+
+    /// Feed-forward net of `layers` layers + matching `entries` (each layer but the top has one +1 edge).
+    fn make_ff(seed: u64, size: u32, layers: usize, up_count: u32, up_radius: u32, adapt_bump: i16, adapt_decay: u8) -> (Network, Vec<Vec<Edge>>) {
+        let lc = LayerConfig {
+            topology: vec![TopologyLevel { level: 1, radius: up_radius, count: up_count }],
+            leak: (3, 5),
+            cooldown_base: 2,
+            inhibitor_ratio: 0,
+            threshold_jitter: 32,
+            baseline_init: 6,
+            adapt_bump,
+            adapt_decay,
+        };
+        let net = Network::new(Config { seed, size, layers: vec![lc; layers] });
+        let entries = (0..layers)
+            .map(|z| if z == layers - 1 { vec![] } else { vec![Edge { level: 1, count: up_count as usize, radius: up_radius }] })
+            .collect();
+        (net, entries)
+    }
+
+    /// Single-cue 2-class task: present class c, label = c. Immediately separable (fast learning check).
+    fn single_task(seed: u64, t: usize) -> (Vec<usize>, usize) {
+        let c = (mix(key(seed, t as u32, 0, 0, 71)) & 1) as usize;
+        (vec![c], c)
+    }
+
+    /// Temporal XOR: two cue bits (a, b), label = a XOR b.
+    fn xor_task(seed: u64, t: usize) -> (Vec<usize>, usize) {
+        let a = (mix(key(seed, t as u32, 0, 0, 51)) & 1) as usize;
+        let b = (mix(key(seed, t as u32, 0, 0, 53)) & 1) as usize;
+        (vec![a, b], a ^ b)
+    }
 
     // A 2-layer, radius-0, count-1 up net: target of source local i is local i above.
     fn tiny_net() -> Network {
@@ -230,5 +404,29 @@ mod tests {
         let after: f32 = net.with_layer(0, |lz| lz.out_shadow.iter().sum());
         // Δ per synapse = -lr·signal·e = -0.02·(-1)·5.0625 > 0
         assert!(after > before + 1.0, "negative signal + positive eligibility must raise layer-0 weights: {before} -> {after}");
+    }
+
+    #[test]
+    fn run_trial_records_are_shaped_and_deterministic() {
+        let (mut net1, _e) = make_ff(7, 8, 3, 12, 3, 20, 6);
+        let (mut net2, _e2) = make_ff(7, 8, 3, 12, 3, 20, 6);
+        let (act1, rec1) = run_trial(&mut net1, 8, &[0, 1], 7, 4, 2, 4);
+        let (act2, rec2) = run_trial(&mut net2, 8, &[0, 1], 7, 4, 2, 4);
+        let l = 3;
+        let ls = 64;
+        // every layer recorded the same number of waves for spikes/pots/effs
+        let ttot = rec1.spikes[l - 1].len();
+        assert!(ttot > 0);
+        for z in 0..l {
+            assert_eq!(rec1.spikes[z].len(), ttot);
+            assert_eq!(rec1.pots[z].len(), ttot);
+            assert_eq!(rec1.effs[z].len(), ttot);
+            assert_eq!(rec1.pots[z][0].len(), ls);
+        }
+        // determinism: same (seed, config, input) → identical records + activity
+        assert_eq!(act1, act2);
+        assert_eq!(rec1.spikes, rec2.spikes);
+        assert_eq!(rec1.pots, rec2.pots);
+        assert_eq!(rec1.effs, rec2.effs);
     }
 }
