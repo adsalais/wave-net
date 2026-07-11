@@ -297,22 +297,12 @@ mod tests {
     use crate::wave_net::config::{Config, LayerConfig};
     use crate::wave_net::synapse::TopologyLevel;
 
-    /// Top-computational-layer spike-count feature for one (class, trial): drive a noisy class cue
-    /// (template = a fixed random ~`base` subset of L0, flipped per-trial with prob ~`noise`), warm up,
-    /// then count the top layer's spikes over a read window. Feature length = layer size.
-    fn top_features(net: &mut Network, class_seed: u64, class: usize, trial: usize, present: usize, read: usize, base_q16: u32, noise_q16: u32) -> Vec<u32> {
+    /// Top-computational-layer spike-count feature over a read window, given a per-wave input `cue`.
+    /// Warm up (present − read waves, uncounted), then count the top layer's spikes over `read` waves.
+    fn top_features(net: &mut Network, cue: impl Fn(usize) -> Vec<u32>, present: usize, read: usize) -> Vec<u32> {
         let l = net.layer_count();
         let ls = (net.size() * net.size()) as usize;
         let top = l - 1;
-        let cue = |w: usize| -> Vec<u32> {
-            (0..ls as u32)
-                .filter(|&local| {
-                    let tmpl = (mix(key(class_seed, local, class as i32, 0, 0xC0E)) & 0xFFFF) < base_q16 as u64;
-                    let nz = (mix(key(class_seed, local, class as i32, (trial * 131 + w + 1) as u32, 0xC0F)) & 0xFFFF) < noise_q16 as u64;
-                    tmpl ^ nz
-                })
-                .collect()
-        };
         net.reset_state();
         let warm = present.saturating_sub(read);
         for w in 0..warm {
@@ -335,21 +325,71 @@ mod tests {
         std::mem::take(&mut *counts.lock().unwrap())
     }
 
-    /// Intrinsic computational quality of the (untrained) reservoir: held-out nearest-centroid accuracy
-    /// (permille) on top-layer states over `k` noisy-cue classes, plus the effective dimensionality.
-    fn computational_quality(net: &mut Network, class_seed: u64, k: usize, trials: usize, present: usize, read: usize, base_q16: u32, noise_q16: u32) -> (u64, f64) {
-        let mut features: Vec<Vec<u32>> = Vec::with_capacity(trials);
-        let mut labels: Vec<usize> = Vec::with_capacity(trials);
+    /// Class-`class` noisy cue: template = fixed ~`base` subset of L0 for that class, flipped per (trial,wave).
+    fn pattern_cue(class_seed: u64, ls: usize, class: usize, trial: usize, base: u32, noise: u32) -> impl Fn(usize) -> Vec<u32> {
+        move |w| {
+            (0..ls as u32)
+                .filter(|&local| {
+                    let tmpl = (mix(key(class_seed, local, class as i32, 0, 0xC0E)) & 0xFFFF) < base as u64;
+                    let nz = (mix(key(class_seed, local, class as i32, (trial * 131 + w + 1) as u32, 0xC0F)) & 0xFFFF) < noise as u64;
+                    tmpl ^ nz
+                })
+                .collect()
+        }
+    }
+
+    /// Spatial-XOR cue: region A (first half of L0) active iff `f1`, region B iff `f2`; label = f1^f2.
+    /// Linear-inseparable ({00,11} vs {01,10}), so top-layer NC accuracy > chance requires the reservoir
+    /// to mix the two regions nonlinearly — a stronger test than the linear pattern task.
+    fn xor_cue(class_seed: u64, ls: usize, f1: bool, f2: bool, trial: usize, base: u32, noise: u32) -> impl Fn(usize) -> Vec<u32> {
+        let half = (ls / 2) as u32;
+        move |w| {
+            (0..ls as u32)
+                .filter(|&local| {
+                    let region_a = local < half;
+                    let active = if region_a { f1 } else { f2 };
+                    let tmpl = active && (mix(key(class_seed, local, region_a as i32, 0, 0xD0E)) & 0xFFFF) < base as u64;
+                    let nz = (mix(key(class_seed, local, 2, (trial * 131 + w + 1) as u32, 0xD0F)) & 0xFFFF) < noise as u64;
+                    tmpl ^ nz
+                })
+                .collect()
+        }
+    }
+
+    /// Held-out nearest-centroid accuracy (permille) + effective-dim from labelled features.
+    fn score(feats: &[Vec<u32>], labels: &[usize], k: usize) -> (u64, f64) {
+        let trials = feats.len();
+        let half = trials / 2;
+        let nc = NearestCentroid::fit(&feats[..half], &labels[..half], k);
+        let test = (trials - half).max(1);
+        let correct = (half..trials).filter(|&i| nc.predict(&feats[i]) == labels[i]).count();
+        ((correct * 1000 / test) as u64, effective_dim(&as_f64(feats)))
+    }
+
+    /// K-class linear pattern classification on the top layer.
+    fn quality_pattern(net: &mut Network, class_seed: u64, k: usize, trials: usize, present: usize, read: usize, base: u32, noise: u32) -> (u64, f64) {
+        let ls = (net.size() * net.size()) as usize;
+        let mut feats = Vec::with_capacity(trials);
+        let mut labels = Vec::with_capacity(trials);
         for t in 0..trials {
             let class = t % k;
-            features.push(top_features(net, class_seed, class, t, present, read, base_q16, noise_q16));
+            feats.push(top_features(net, pattern_cue(class_seed, ls, class, t, base, noise), present, read));
             labels.push(class);
         }
-        let half = trials / 2;
-        let nc = NearestCentroid::fit(&features[..half], &labels[..half], k);
-        let test = trials - half;
-        let correct = (half..trials).filter(|&i| nc.predict(&features[i]) == labels[i]).count();
-        ((correct * 1000 / test) as u64, effective_dim(&as_f64(&features)))
+        score(&feats, &labels, k)
+    }
+
+    /// 2-class nonlinear spatial-XOR on the top layer.
+    fn quality_xor(net: &mut Network, class_seed: u64, trials: usize, present: usize, read: usize, base: u32, noise: u32) -> (u64, f64) {
+        let ls = (net.size() * net.size()) as usize;
+        let mut feats = Vec::with_capacity(trials);
+        let mut labels = Vec::with_capacity(trials);
+        for t in 0..trials {
+            let (f1, f2) = ((t & 1) == 1, (t & 2) == 2);
+            feats.push(top_features(net, xor_cue(class_seed, ls, f1, f2, t, base, noise), present, read));
+            labels.push((f1 ^ f2) as usize);
+        }
+        score(&feats, &labels, 2)
     }
 
     const SEED: u64 = 0xC0FFEE_1234_5678;
@@ -537,13 +577,57 @@ mod tests {
             let input = random_l0_input(SEED, 32, 20000);
             let mut a = Network::new(ff_config(up_count, 3, 5));
             rate_reg_init(&mut a, SEED, &rate_params, &input);
-            let (acc_a, dim_a) = computational_quality(&mut a, class_seed, k, trials, present, read, base, noise);
+            let (acc_a, dim_a) = quality_pattern(&mut a, class_seed, k, trials, present, read, base, noise);
 
             let mut b = Network::new(ff_config(up_count, 3, 5));
             sigma_eprop_init(&mut b, SEED ^ 0xABCD, 20000, &sigma_params);
-            let (acc_b, dim_b) = computational_quality(&mut b, class_seed, k, trials, present, read, base, noise);
+            let (acc_b, dim_b) = quality_pattern(&mut b, class_seed, k, trials, present, read, base, noise);
 
             println!("uc={up_count:<2}: flat-rate acc={acc_a}‰ dim={dim_a:.1}  |  σ-eprop acc={acc_b}‰ dim={dim_b:.1}");
+        }
+    }
+
+    /// Experiment (run manually): multi-seed × two-task confirmation of the computational verdict.
+    /// Averages held-out accuracy over several reservoir/task seeds, on both the linear PATTERN task
+    /// (4-class, chance 250‰) and the nonlinear spatial-XOR task (2-class, chance 500‰). Firms up
+    /// whether σ-eprop really beats the flat-rate init (and checks the odd uc16 dip).
+    ///   cargo test --release computation_multiseed -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn computation_multiseed() {
+        let seeds = [0xC0FFEE_1234_5678u64, 0x00A1_1CE5, 0x00B0_B0B0, 0xDEAD_BEEF, 0x1234_ABCD];
+        let (trials, present, read, base, noise) = (200usize, 16usize, 8usize, 13107u32, 3277u32);
+        let mk = |seed: u64, up: u32| {
+            let layer = LayerConfig {
+                topology: vec![TopologyLevel { level: 1, radius: 3, count: up }],
+                leak: (3, 5),
+                cooldown_base: 2,
+                inhibitor_ratio: 0,
+                threshold_jitter: 32,
+                baseline_init: 6,
+                adapt_bump: 5,
+                adapt_decay: 6,
+            };
+            Config { seed, size: 32, layers: vec![layer; 5] }
+        };
+        println!("(pattern chance 250‰, xor chance 500‰; mean over {} seeds)", seeds.len());
+        for up in [16u32, 24, 32] {
+            let (mut fp, mut sp, mut fx, mut sx) = (0u64, 0u64, 0u64, 0u64);
+            for &s in &seeds {
+                let cs = s ^ 0x5EED;
+                let input = random_l0_input(s, 32, 20000);
+                let mut a = Network::new(mk(s, up));
+                rate_reg_init(&mut a, s, &CriticalInitParams::default(), &input);
+                fp += quality_pattern(&mut a, cs, 4, trials, present, read, base, noise).0;
+                fx += quality_xor(&mut a, cs, trials, present, read, base, noise).0;
+
+                let mut b = Network::new(mk(s, up));
+                sigma_eprop_init(&mut b, s, 20000, &SigmaEpropParams::default());
+                sp += quality_pattern(&mut b, cs, 4, trials, present, read, base, noise).0;
+                sx += quality_xor(&mut b, cs, trials, present, read, base, noise).0;
+            }
+            let n = seeds.len() as u64;
+            println!("uc={up}: PATTERN flat={}‰ σ={}‰  |  XOR flat={}‰ σ={}‰", fp / n, sp / n, fx / n, sx / n);
         }
     }
 }
