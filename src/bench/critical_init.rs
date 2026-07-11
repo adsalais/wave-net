@@ -15,7 +15,7 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
-use crate::bench::rsnn::target_of;
+use crate::wave_net::synapse::target_of;
 use crate::wave_net::calibrate::random_l0_input;
 use crate::wave_net::network::Network;
 use crate::wave_net::synapse::{key, mix};

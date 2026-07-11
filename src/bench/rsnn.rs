@@ -7,7 +7,7 @@ use crate::bench::store_recall::{cue_realization, probe_pattern};
 use crate::wave_net::calibrate::{random_l0_input, CalibrateParams};
 use crate::wave_net::config::{Config, LayerConfig};
 use crate::wave_net::network::Network;
-use crate::wave_net::synapse::{key, local_of, map_range24, mix, wrap, xy_of, TopologyLevel, P_TARGET};
+use crate::wave_net::synapse::{key, mix, target_of, TopologyLevel};
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Debug)]
@@ -518,14 +518,6 @@ fn elig_adapt_sum(ttot: usize, beta: f32, rho: f32, psi: impl Fn(usize) -> f32, 
     e
 }
 
-pub(crate) fn target_of(seed: u64, source_global: u32, src_local: u32, level: i32, k: u32, radius: u32, size: u32) -> u32 {
-    let (sx, sy) = xy_of(src_local, size);
-    let h = mix(key(seed, source_global, level, k, P_TARGET));
-    let span = 2 * radius + 1;
-    let dx = map_range24((h >> 40) as u32, span) as i32 - radius as i32;
-    let dy = map_range24(((h >> 16) as u32) & 0x00FF_FFFF, span) as i32 - radius as i32;
-    local_of(wrap(sx, dx, size), wrap(sy, dy, size), size)
-}
 
 /// Build + calibrate + train (readout + hidden e-prop weights); return the trained net and the top-layer
 /// readout. Split out so callers can both evaluate held-out accuracy and probe the trained net's per-layer
