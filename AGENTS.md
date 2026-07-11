@@ -231,6 +231,28 @@ trades them for adds. The only substantial hash win is to **stop recomputing it*
 swapping `mix` for a cheaper finalizer would help but changes every target → re-randomizes the net →
 needs full multi-seed re-validation + risks target quality (what `strong_hash` guards).
 
+**Bitset synapses — prototyped, shelved, worth revisiting.** A memory-lean way to stop recomputing the
+hash: store a per-neuron **window bitset** (deduped connectivity — one bit per `(2r+1)²` cell) built once
+at construction, and iterate the set bits at fire time (`trailing_zeros` + a shared cell→`(dx,dy)` decode
+table + `wrap`/`local_of`). Costs ~0.2 B/synapse (vs +1 B/synapse for a full target/offset cache).
+Prototyped behind a throwaway `bitset_synapses` feature (branch `perf/bitset-synapses-proto`, discarded).
+Findings (size 32×32×5 FF, `examples/profile_wave.rs` with `WAVE_UP_COUNT`):
+- **~+30% forward throughput at *matched load*** (bitset `up_count=51` reproduces the hash `up_count=32`
+  rates exactly: `[30.5,11.5,8.0,6.2,5.3]`, 14.7k vs 11.3k waves/s). The naive **+72%** at `up_count=32`
+  was a load artifact — dedup delivers fewer synapses. +30% reconciles with the profile (`mix`+`map_range`
+  ≈ 25% of total); the hash *arithmetic* alone isn't the bottleneck, so eliminating it caps out near +30%,
+  not the ~2× a naive read of the 67% suggests.
+- **Multiplicity is load-bearing for liveness:** dropping it cuts effective fan-out ~`count`→~0.75·`count`
+  (32→~24 in a 49-cell window), so the sub-critical stack dies faster with depth (tail `5.3%→1.6%`); you
+  must raise draws to ~51 to recover the hash's propagation.
+
+Open explorations if revisited: (1) **the real question — does dedup hurt *task accuracy*?** Run the
+`rsnn` learning benchmarks (temporal-XOR / parity) dedup-on vs off; liveness cost ≠ accuracy cost. (2)
+Tune the bitset fire path — compacted per-set-bit weights (better cache than the window-sized array the
+prototype used), `reserve` the deliveries buffer, precompute cell→local offsets — may push past +30%. (3)
+Re-parameterize fan-out by *desired distinct* count (rejection-sample) since `up_count` = draws ≠ effective
+fan-out under dedup.
+
 ## Conventions (required)
 
 - Rust, edition 2024. **Standard library only by default** — the one optional dependency (`blake3`) is
