@@ -1,7 +1,6 @@
 //! `store_recall` — the Tier-0 delayed-match task and the ALIF-vs-LIF memory-horizon experiment.
 
 use crate::bench::readout::{record_response, NearestCentroid};
-use crate::wave_state_machine::calibrate::{random_l0_input, CalibrateParams};
 use crate::wave_state_machine::config::{Config, LayerConfig};
 use crate::wave_state_machine::network::Network;
 use crate::wave_state_machine::synapse::{key, mix, TopologyLevel};
@@ -93,7 +92,6 @@ pub struct BenchConfig {
     pub trials_per_class: usize,
     pub delays: Vec<usize>, // swept, ascending
     pub task: TaskParams,
-    pub calib: CalibrateParams,
     pub calib_fraction_q16: u32,
 }
 
@@ -122,13 +120,6 @@ impl BenchConfig {
                 keep_q16: 60000,
                 noise_q16: 1500,
                 probe_q16: 20000,
-            },
-            calib: CalibrateParams {
-                warmup: 16,
-                waves: 48,
-                max_steps: 24,
-                refine_passes: 3,
-                ..CalibrateParams::default()
             },
             calib_fraction_q16: 20000,
         }
@@ -164,8 +155,6 @@ pub struct HorizonCurve {
 /// The net is built + calibrated once, then trials reuse the calibrated baselines (reset per trial).
 pub fn memory_horizon(cfg: &BenchConfig, adapt_bump: i16) -> HorizonCurve {
     let mut net = Network::new(cfg.to_engine_config(adapt_bump));
-    let input = random_l0_input(cfg.seed ^ 0xCA11B, cfg.size, cfg.calib_fraction_q16);
-    net.calibrate(&cfg.calib, &input);
 
     let mut accuracy_permille = Vec::with_capacity(cfg.delays.len());
     for &delay in &cfg.delays {

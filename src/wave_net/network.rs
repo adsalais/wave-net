@@ -1,6 +1,7 @@
 //! `network` — owns the layer stack, drives each wave, and routes each layer's
 //! generated synapses into the target layers' inboxes for the next wave.
 
+#[cfg(test)]
 use std::sync::{Arc, Mutex};
 
 use crate::wave_net::config::Config;
@@ -222,6 +223,8 @@ impl Network {
 
     /// Reset, run `warmup` waves (discarded), then `waves` counted; per-layer firing rate =
     /// spikes / (layer_size * waves). Saves and restores the caller's listeners around the run.
+    /// Test-only diagnostic (calibration, its former non-test caller, was removed).
+    #[cfg(test)]
     pub(crate) fn measure_layer_rates(
         &mut self,
         warmup: usize,
