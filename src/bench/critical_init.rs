@@ -12,8 +12,13 @@
 //! learn from — otherwise a fully-dead layer gets no gradient. Feed-forward only (no readout / no
 //! recurrence) for this first spike.
 
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
+
 use crate::bench::rsnn::target_of;
+use crate::wave_net::calibrate::random_l0_input;
 use crate::wave_net::network::Network;
+use crate::wave_net::synapse::{key, mix};
 
 #[derive(Clone, Copy, Debug)]
 pub struct CriticalInitParams {
@@ -104,10 +109,65 @@ pub fn rate_reg_init(net: &mut Network, seed: u64, params: &CriticalInitParams, 
     }
 }
 
+/// Per-hop **forward** damage-spreading avalanche footprint: inject one extra L0 spike at wave
+/// `warmup` and, under deferred one-hop propagation, track its footprint as it climbs — layer `z`'s
+/// front lands at wave `warmup + z`. Returns the mean per-layer footprint (index `z` = # neurons in
+/// layer `z` that fire differently because of the one spike), averaged over `n_perturb` sites. The
+/// per-hop branching ratio is `footprint[z+1] / footprint[z]`: ≈1 critical, <1 the cue shrinks with
+/// depth (sub-critical), >1 grows. Unlike the whole-network `sigma_probe`, this isolates each hop
+/// (no cross-layer accumulation), so it's the right σ read for a feed-forward stack. Bench-side.
+pub fn forward_avalanche(net: &mut Network, drive_seed: u64, drive_frac_q16: u32, warmup: usize, n_perturb: usize) -> Vec<f64> {
+    let l = net.layer_count();
+    let ls = (net.size() * net.size()) as usize;
+    let size = net.size();
+    let drive = random_l0_input(drive_seed, size, drive_frac_q16);
+    let steps = warmup + l + 1;
+    let run = |net: &mut Network, pert: Option<u32>| -> Vec<Vec<Vec<u32>>> {
+        let rec: Arc<Mutex<Vec<Vec<Vec<u32>>>>> = Arc::new(Mutex::new(vec![Vec::new(); l]));
+        for z in 0..l {
+            let r = rec.clone();
+            net.on_layer(z, Box::new(move |_w, fired: &[u32]| r.lock().unwrap()[z].push(fired.to_vec())));
+        }
+        net.reset_state();
+        for w in 0..steps {
+            let mut sites = drive(w);
+            if let (Some(p), true) = (pert, w == warmup) {
+                if !sites.contains(&p) {
+                    sites.push(p);
+                }
+            }
+            net.wave(&sites);
+        }
+        net.clear_listeners();
+        let out = rec.lock().unwrap().clone();
+        out
+    };
+    let refr = run(net, None);
+    let driven: HashSet<u32> = drive(warmup).into_iter().collect();
+    let np = n_perturb.max(1);
+    let mut footprint = vec![0f64; l];
+    for k in 0..np {
+        let mut p = (mix(key(drive_seed, k as u32, 0, 0, 0xC1)) % ls as u64) as u32;
+        let mut guard = 0;
+        while driven.contains(&p) && guard < ls {
+            p = (p + 1) % ls as u32;
+            guard += 1;
+        }
+        let pert = run(net, Some(p));
+        for z in 1..l {
+            let wv = warmup + z; // wave the avalanche front reaches layer z
+            let a: HashSet<u32> = refr[z][wv].iter().copied().collect();
+            let b: HashSet<u32> = pert[z][wv].iter().copied().collect();
+            footprint[z] += a.symmetric_difference(&b).count() as f64 / np as f64;
+        }
+    }
+    footprint
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wave_net::calibrate::{random_l0_input, CalibrateParams};
+    use crate::wave_net::calibrate::CalibrateParams;
     use crate::wave_net::config::{Config, LayerConfig};
     use crate::wave_net::synapse::TopologyLevel;
 
@@ -163,13 +223,21 @@ mod tests {
         assert!(after > before + 0.02, "rate-init should revive the top layer: {before:.3} -> {after:.3}");
     }
 
-    /// Experiment (run manually): calibration vs rate-init resulting regime, on a propagating config
-    /// (up_count 32) and the config where calibration fails (up_count 16, cue dies with depth).
+    /// Experiment (run manually): calibration vs rate-init resulting regime AND criticality σ, on a
+    /// propagating config (up_count 32) and the config where calibration fails (up_count 16). σ is the
+    /// forward-avalanche branching ratio (perturb_layer=None, window=4 = the L1→L4 hops): σ<1 = the
+    /// cue dies with depth, σ≈1 = critical. Tests whether the flat rate regime is *actually* critical.
     ///   cargo test --release critical_init_vs_calibration -- --ignored --nocapture
     #[test]
     #[ignore]
     fn critical_init_vs_calibration() {
         let calib = CalibrateParams { target_permille: 100, ..CalibrateParams::default() };
+        let init = CriticalInitParams::default();
+        // per-hop σ_k = footprint[k+1]/footprint[k] over the forward hops (skip footprint[0]=L0).
+        let hops = |f: &[f64]| -> Vec<f64> {
+            (1..f.len() - 1).map(|z| if f[z] > 0.0 { (f[z + 1] / f[z] * 100.0).round() / 100.0 } else { 0.0 }).collect()
+        };
+        let fp = |f: &[f64]| f[1..].iter().map(|x| (x * 10.0).round() / 10.0).collect::<Vec<_>>();
         for up_count in [16u32, 32] {
             let cfg = ff_config(up_count);
             let input = random_l0_input(SEED, 32, 20000);
@@ -177,14 +245,15 @@ mod tests {
             let mut a = Network::new(cfg.clone());
             a.calibrate(&calib, &input);
             let ra = a.measure_layer_rates(32, 128, &input);
-            println!("up_count={up_count}: calibration          ={:?}", pct(&ra));
+            let fa = forward_avalanche(&mut a, SEED ^ 0xABCD, 20000, 32, 16);
 
-            for lr in [0.008f32, 0.02, 0.05] {
-                let mut b = Network::new(cfg.clone());
-                rate_reg_init(&mut b, SEED, &CriticalInitParams { lr, ..CriticalInitParams::default() }, &input);
-                let rb = b.measure_layer_rates(32, 128, &input);
-                println!("up_count={up_count}: rate_reg_init lr={lr:<5}={:?}", pct(&rb));
-            }
+            let mut b = Network::new(cfg);
+            rate_reg_init(&mut b, SEED, &init, &input);
+            let rb = b.measure_layer_rates(32, 128, &input);
+            let fb = forward_avalanche(&mut b, SEED ^ 0xABCD, 20000, 32, 16);
+
+            println!("up_count={up_count}: calibration   rates={:?} footprint(L1..){:?} σ_hop{:?}", pct(&ra), fp(&fa), hops(&fa));
+            println!("up_count={up_count}: rate_reg_init rates={:?} footprint(L1..){:?} σ_hop{:?}", pct(&rb), fp(&fb), hops(&fb));
         }
     }
 }
