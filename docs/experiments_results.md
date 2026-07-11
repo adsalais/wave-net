@@ -143,3 +143,57 @@ layers), across couplings, an L3 self-loop, and forward/recurrence density tunin
 together**, and the **forward topology** (skip distances, where the side-car couples) is a large untested
 axis. **Immediate blocker → next step: engine performance optimization** (the single-threaded integer engine
 can't run these sweeps multi-seed at size ≥ 64), then resume the systematic scaling / forward-topology study.
+
+## Criticality init — homeostatic weight-training to σ≈1 (the calibration replacement; FF-validated)
+
+**Motivation.** Firing-rate `calibrate` is a brittle *init*: it tunes per-layer **baselines**, but a
+threshold only *gates* a fixed projection — it can't manufacture drive that never arrives, so on a
+sub-critical (cue-dies-with-depth) stack, lowering a starved layer's threshold to 1 still can't revive it.
+And rate is only a **loose proxy for σ** (branching ratio), the real order parameter. Replaced by a
+**homeostatic weight-training init** (`bench::critical_init`) — e-prop-style, layer-wise greedy bottom-up —
+that shapes the stored *weights* (the gain), not the thresholds.
+
+**σ diagnostic.** `forward_avalanche` — per-hop single-spike **damage spreading**, `footprint[z+1]/
+footprint[z]` = the forward branching ratio σ_hop (a *burst* of injected spikes cuts the ratio noise). The
+whole-network `sigma_probe` **accumulates across layers** and mis-reads FF criticality (reads σ>1
+everywhere from cross-layer accumulation); the per-hop measure is the right one for a feed-forward stack.
+
+**Findings (32×32×5 FF, single-entry level+1, `adapt_bump 5`; multi-seed where noted).**
+
+1. **Weight-training revives what calibration can't.** A rate-homeostatic e-prop init (`rate_reg_init`,
+   `Δw ∝ −(r_j − r_target)·pre_i·ψ_j`, greedy) revives a sub-critical stack to σ≈1 where calibration dies
+   with depth (up_count 16: forward avalanche *maintained* `0.6→0.5` vs calibration's `dies to 0`).
+   Confirms the pivot mechanism — **weights set gain/σ; thresholds only gate.** ALIF is load-bearing (LIF →
+   dead: no near-threshold ψ → no gradient). ψ is load-bearing *for the rate rule* (dropping it breaks
+   low-density revival).
+
+2. **σ is a density property; ALIF masks super-criticality.** σ is set by fan-out/radius; there is a
+   **critical density** (~up_count 16 at radius 3 *with trained weights* — lower than the ±1 forward-drive
+   threshold ~32, because trained gain reaches σ=1 at lower fan-out). Below → sub-critical; above →
+   super-critical. Crucially, **ALIF holds the rate at target while σ runs >1** — a rate-stable net can be
+   super-critical, and the rate proxy hides it (LIF at high density goes overtly super-critical instead).
+
+3. **rate ≠ σ off the critical density.** Rate-targeting → *flat rate* but *super-critical* σ at high
+   density; σ-targeting → *σ≈1* but a *decaying rate*. They **coincide only at the critical density**
+   (there the simple rate init gives both flat rate and σ≈1 for free).
+
+4. **Rate-free σ-init.** `sigma_eprop_init` drives σ_hop→1 with a per-synapse update `Δw ∝ −(σ_hop−1)·pre_i`
+   (rate emergent, *no set-point*). A uniform gain-*scaling* controller fails at high density — int8
+   weights are all-or-nothing near the quantization floor → oscillation between super-critical and dead;
+   the per-synapse update's `pre_i` heterogeneity thins weights smoothly and fixes it. The f32 latent
+   shadow crossing zero makes **sign-flip to inhibition** available (unused here — sparsifying excitation
+   reaches σ≤1 first — but it is the lever for the planned BitNet **ternary** path, where magnitude is fixed).
+
+5. **σ≈1 is the robust computational target (multi-seed × two tasks).** Intrinsic top-layer quality
+   (held-out nearest-centroid accuracy + effective-dim), 5 seeds. On the **linear pattern** task, σ-eprop
+   wins at *every* density and the flat-rate init **craters toward chance where it goes super-critical**
+   (uc24: flat 334‰ vs σ 798‰; chance 250‰) — a rate-stable super-critical net is *computationally dead*
+   for linear readout. On the **nonlinear spatial-XOR** task both tie well above chance (super-critical
+   chaos *helps* nonlinear mixing). Textbook edge-of-chaos: **σ≈1 maximizes linear separation; super-critical
+   favors nonlinear mixing; σ≈1 is the safe general target.**
+
+**Status.** FF-validated; **`sigma_eprop_init` (rate-free, σ≈1) is the keeper** and the intended calibration
+replacement. Recurrent criticality (the side-car *loop gain* — a separate quantity `sigma_probe(Some(z))`
+measures) is **not yet handled**: the greedy-FF structure doesn't map to the cyclic (L2↔L3) topology. That
+extension + validation on the recurrent benchmarks is required before it replaces calibration for recurrent
+configs; calibration is retained (downgraded to a bench tool) as the fallback until then.
