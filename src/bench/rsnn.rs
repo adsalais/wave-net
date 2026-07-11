@@ -4,7 +4,8 @@
 
 use crate::bench::eprop::pick_class;
 use crate::bench::store_recall::{cue_realization, probe_pattern};
-use crate::wave_net::calibrate::{random_l0_input, CalibrateParams};
+use crate::wave_net::calibrate::CalibrateParams;
+use crate::wave_net::critical_init::random_l0_input;
 use crate::wave_net::config::{Config, LayerConfig};
 use crate::wave_net::network::Network;
 use crate::wave_net::synapse::{key, mix, target_of, TopologyLevel};

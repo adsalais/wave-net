@@ -8,7 +8,8 @@
 
 use std::sync::{Arc, Mutex};
 
-use wave_net::wave_net::calibrate::{random_l0_input, CalibrateParams};
+use wave_net::wave_net::calibrate::CalibrateParams;
+use wave_net::wave_net::critical_init::random_l0_input;
 use wave_net::wave_net::config::{Config, LayerConfig};
 use wave_net::wave_net::network::Network;
 use wave_net::wave_net::synapse::TopologyLevel;

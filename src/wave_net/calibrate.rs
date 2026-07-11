@@ -4,7 +4,6 @@
 //! owns tuning its own thresholds. Deterministic and single-threaded.
 
 use crate::wave_net::network::Network;
-use crate::wave_net::synapse::{key, mix, P_INPUT};
 
 #[derive(Clone, Copy, Debug)]
 pub struct CalibrateParams {
@@ -28,21 +27,6 @@ impl Default for CalibrateParams {
             refine_passes: 4,
             step_shift: 2,
         }
-    }
-}
-
-/// A deterministic per-wave input: injects each L0 local with probability `fraction_q16 / 2^16`.
-pub fn random_l0_input(seed: u64, size: u32, fraction_q16: u32) -> impl Fn(usize) -> Vec<u32> {
-    let ls = size * size;
-    move |wave: usize| {
-        let mut v = Vec::new();
-        for local in 0..ls {
-            let h = mix(key(seed, local, 0, wave as u32, P_INPUT));
-            if ((h & 0xFFFF) as u32) < fraction_q16 {
-                v.push(local);
-            }
-        }
-        v
     }
 }
 
@@ -95,6 +79,7 @@ impl Network {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wave_net::critical_init::random_l0_input;
     use crate::wave_net::config::{Config, LayerConfig};
     use crate::wave_net::synapse::TopologyLevel;
 
