@@ -20,12 +20,8 @@ pub fn process_layer(
 ) {
     let ls = (size as usize) * (size as usize);
 
-    // 1. cooldown decay
-    for c in layer.cooldown.iter_mut() {
-        *c = c.saturating_sub(1);
-    }
-
-    // 2. drain inbox: sum deliveries in i32, fold into potential, narrow to i16 (overflow guard)
+    // 1. drain inbox: sum deliveries in i32, fold into potential, narrow to i16 (overflow guard).
+    // All of this wave's deliveries must land before any neuron decides, so this stays a full pass.
     for a in acc[..ls].iter_mut() {
         *a = 0;
     }
@@ -38,7 +34,7 @@ pub fn process_layer(
         layer.potential[i] = v.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
     }
 
-    // 3. inject forced-fire input (L0 only; other layers get &[]). L0 is the input transducer
+    // 2. inject forced-fire input (L0 only; other layers get &[]). L0 is the input transducer
     // (baseline i16::MAX, no adaptation — forced in Network::new), so its effective threshold is
     // exactly i16::MAX and setting potential to i16::MAX fires precisely the injected neurons.
     // (In general the ALIF effective threshold `baseline + adapt` can exceed i16::MAX, which is
@@ -55,29 +51,56 @@ pub fn process_layer(
         return;
     }
 
-    // 4. decide (ALIF effective threshold = baseline + adapt, in i32; fire bumps adapt). Also accrue the
-    // e-prop eligibility factors: post pseudo-derivative ψ (box surrogate near threshold) for every neuron,
-    // and the pre-trace (spike count) for firers.
+    // 3. the per-neuron step, fused into ONE pass over the SoA arrays (previously four separate
+    // full sweeps — cooldown decay, decide, leak, adapt-decay). For neuron `i`: decay its cooldown,
+    // decide against the ALIF effective threshold `baseline + (adapt >> ADAPT_SHIFT)` (i32; a fire
+    // resets potential, reloads cooldown, bumps adapt), then leak the survivor's potential and
+    // geometrically decay its adaptation. Cross-neuron independence makes the fusion exact.
+    // Also accrues the e-prop eligibility: the post pseudo-derivative ψ (box surrogate, near-threshold
+    // count) for every neuron and the pre-trace (spike count) for firers, with `decide_potential` /
+    // `decide_eff` snapshotted at the decide step (before this wave's fire-bump mutates adapt).
     const PSI_BAND: i32 = 8;
+    let (la, lb) = layer.leak;
+    let adapt_decay = layer.adapt_decay;
+    let cooldown_base = layer.cooldown_base;
+    let adapt_bump = layer.adapt_bump as i32;
     for i in 0..ls {
-        layer.decide_potential[i] = layer.potential[i]; // snapshot pre fire-reset/leak
+        let c = layer.cooldown[i].saturating_sub(1); // cooldown decay
+        let p = layer.potential[i];
+        let pi = p as i32;
         let eff = layer.threshold[i] as i32 + (layer.adapt[i] >> ADAPT_SHIFT);
-        layer.decide_eff[i] = eff; // snapshot the decide-time effective threshold (before the fire-bump below)
-        if ((layer.potential[i] as i32) - eff).abs() <= PSI_BAND {
+
+        layer.decide_potential[i] = p; // snapshot pre fire-reset/leak
+        layer.decide_eff[i] = eff; // pre-bump effective threshold; pairs with decide_potential
+        if (pi - eff).abs() <= PSI_BAND {
             layer.elig_post[i] += 1;
         }
-        if layer.cooldown[i] == 0 && (layer.potential[i] as i32) >= eff {
-            layer.potential[i] = 0;
-            layer.cooldown[i] = layer.cooldown_base;
-            let bumped = layer.adapt[i] + ((layer.adapt_bump as i32) << ADAPT_SHIFT);
+
+        let mut pot = p;
+        if c == 0 && pi >= eff {
+            pot = 0;
+            layer.cooldown[i] = cooldown_base;
+            let bumped = layer.adapt[i] + (adapt_bump << ADAPT_SHIFT);
             layer.adapt[i] = bumped.clamp(0, ADAPT_MAX);
             layer.elig_pre[i] += 1;
             fired.push(i as u32);
+        } else {
+            layer.cooldown[i] = c;
         }
+
+        // leak the survivor toward 0 (positive decay floored at 1 to escape the integer shift dead
+        // zone where `(v>>la)+(v>>lb) == 0` for `0 < v < 2^la`; negatives keep the raw geometric
+        // decay). A fired neuron has `pot == 0`, so this is a no-op for it.
+        let decay = (pot >> la) + (pot >> lb);
+        layer.potential[i] = pot - if pot > 0 { decay.max(1) } else { decay };
+
+        // decay adaptation toward rest (geometric, like the leak), including this wave's fire-bump.
+        layer.adapt[i] -= layer.adapt[i] >> adapt_decay;
     }
 
-    // 5. generate outgoing synapses, scattered directly into the per-layer `deliveries` buffers
+    // 4. generate outgoing synapses, scattered directly into the per-layer `deliveries` buffers
     // (resolved to absolute target layers) — no intermediate per-level grouping, no second copy.
+    // Generation reads only stored weights + topology (never potential), so it runs after the leak.
     let base = layer_index as usize * ls;
     for &local in fired.iter() {
         generate_into(
@@ -91,23 +114,6 @@ pub fn process_layer(
             layer.total_slots,
             deliveries,
         );
-    }
-
-    // 6. leak survivors into the next wave. Floor the decay at 1 for positive membrane so small
-    // potentials relax to 0 (finite membrane time constant) instead of freezing in the integer
-    // shift dead zone (`(v>>la)+(v>>lb) == 0` for `0 < v < 2^la`). Negatives already relax —
-    // arithmetic shift of a negative is <= -1 — so they keep the raw geometric decay.
-    let (la, lb) = layer.leak;
-    for p in layer.potential.iter_mut() {
-        let v = *p;
-        let decay = (v >> la) + (v >> lb);
-        *p = v - if v > 0 { decay.max(1) } else { decay };
-    }
-
-    // 7. decay adaptation toward rest (geometric, like the potential leak)
-    let d = layer.adapt_decay;
-    for a in layer.adapt.iter_mut() {
-        *a -= *a >> d;
     }
 }
 
