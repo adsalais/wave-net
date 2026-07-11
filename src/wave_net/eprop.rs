@@ -47,6 +47,41 @@ impl Network {
         });
     }
 
+    /// Apply one e-prop weight update to `entry_idx` of layer `source_z` from a caller-supplied
+    /// **per-synapse** eligibility `elig` (indexed `[i*count + kk]`) and per-target `signal` (indexed by
+    /// target local `j`): `out_shadow[i*total_slots + slot_base + kk] += -lr · signal[j] · elig[i*count+kk]`,
+    /// then requantise. `target_of` recovers each synapse's target `j` (no re-scatter). No-op if the entry's
+    /// target layer is off the stack. Standalone (does NOT share code with `eprop_update`) so the factored
+    /// path stays byte-identical — f32 multiplication is not associative.
+    pub fn eprop_update_synaptic(&mut self, source_z: usize, entry_idx: usize, elig: &[f32], signal: &[f32], lr: f32) {
+        let seed = self.seed_val();
+        let size = self.size();
+        let l = self.layer_count();
+        let ls = (size as usize) * (size as usize);
+        let (level, radius, count, slot_base, total_slots) = self.with_layer(source_z, |lz| {
+            let e = &lz.topology[entry_idx];
+            let slot_base: usize = lz.topology[..entry_idx].iter().map(|t| t.count as usize).sum();
+            (e.level, e.radius, e.count as usize, slot_base, lz.total_slots)
+        });
+        let tz = source_z as i32 + level;
+        if tz < 0 || tz as usize >= l {
+            return;
+        }
+        let base = source_z * ls;
+        self.with_layer_mut(source_z, |lz| {
+            for i in 0..ls {
+                let sg = (base + i) as u32;
+                for kk in 0..count {
+                    let j = target_of(seed, sg, i as u32, level, kk as u32, radius, size) as usize;
+                    lz.out_shadow[i * total_slots + slot_base + kk] += -lr * signal[j] * elig[i * count + kk];
+                }
+            }
+            for (wq, s) in lz.out_weights.iter_mut().zip(&lz.out_shadow) {
+                *wq = s.round().clamp(-127.0, 127.0) as i8;
+            }
+        });
+    }
+
     /// Windowed per-neuron eligibility for every layer: the pre-trace + ψ accumulated over `waves`
     /// *after* a `warmup` transient, via the difference of the running `elig_pre`/`elig_post`
     /// accumulators (so the boots-hot transient is excluded).
@@ -142,5 +177,29 @@ mod tests {
         net.train_ff(30, 8, |_t, _w| all.clone(), |_net, _t| vec![vec![-1.0f32; 64]], 0.02);
         let after: f32 = net.with_layer(0, |l| l.out_shadow.iter().sum());
         assert!(after > before + 1.0, "signal<0 should raise weights: {before} -> {after}");
+    }
+
+    #[test]
+    fn eprop_update_synaptic_applies_expected_delta() {
+        // radius-0, count-1 up entry: target of source local i is local i in the layer above.
+        let lc = LayerConfig {
+            topology: vec![TopologyLevel { level: 1, radius: 0, count: 1 }],
+            leak: (3, 5),
+            cooldown_base: 2,
+            inhibitor_ratio: 0,
+            threshold_jitter: 0,
+            baseline_init: 6,
+            adapt_bump: 0,
+            adapt_decay: 5,
+        };
+        let mut net = Network::new(Config { seed: 1, size: 4, layers: vec![lc; 2] });
+        let ls = 16;
+        let elig = vec![2.0f32; ls]; // [i*count + kk], count = 1 -> indexed by i
+        let signal = vec![0.5f32; ls]; // per target-local j
+        let before = net.with_layer(0, |l| l.out_shadow[0]);
+        net.eprop_update_synaptic(0, 0, &elig, &signal, 0.1);
+        let after = net.with_layer(0, |l| l.out_shadow[0]);
+        // Δ = -lr·signal[0]·elig[0] = -0.1·0.5·2 = -0.1
+        assert!((after - before + 0.1).abs() < 1e-4, "{before} -> {after}");
     }
 }
