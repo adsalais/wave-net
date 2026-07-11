@@ -156,7 +156,12 @@ across every benchmark and seed (a strict improvement, no downside).** Headline 
   load-bearing). **Apply it across all layer types — `rate_reg` everywhere (2026-07-11).** This supersedes
   the earlier "forward-path-only, use the per-layer class-preserving `rec_stab` on recurrent weights" rule:
   `rec_stab` was not carrying its weight, so it is **set aside** (its code stays in `rsnn.rs`; resurrect only
-  if a recurrent config is shown to need it). See `docs/experiments_results.md` (2026-07-11).
+  if a recurrent config is shown to need it). See `docs/experiments_results.md` (2026-07-11). **Caveat — it
+  over-trains: `rate_reg` is class-agnostic and always-on, so after the task converges it homogenizes firing
+  rates and *erodes* the class signal → a non-monotonic accuracy collapse (transient at ~4 layers, permanent
+  by ~12; ablation-confirmed rate_reg-driven). Mitigate with early-stopping / best-checkpoint (NOT yet built);
+  compare at the *peak* of a duration sweep, never a fixed final trial count. Duration-swept multi-seed
+  benchmarks are how this became visible — see the benchmark convention below.**
 - **ALIF adaptation is both a working memory *and* load-bearing for liveness.** It is a strong ~64-wave
   held-category memory (store-recall); it does **not** help linear echo (MC) or nonlinear temporal
   computation (XOR) feed-forward — LIF wins those short tasks — **but it is *necessary* for deep-FF

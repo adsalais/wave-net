@@ -307,3 +307,43 @@ has no such gap and stays robust. Practical consequence: on strongly-driven laye
 `elig_psi_width` to match the potential-overshoot scale or use spike-ψ; the fixed W = 16 is tuned for
 near-threshold operation, not saturated drive. (This is why the engine's recurrent-edge training test uses
 spike-ψ; the eligibility-β path itself is covered by the `temporal_eligibility` unit tests.)
+
+## Over-training collapse — `rate_reg` dominance after convergence (diagnosed 2026-07-11)
+
+**Finding (multi-seed).** Multi-layer temporal-DFA training is **non-monotonic**: held-out accuracy peaks
+then degrades with more training, seed-robustly (3 seeds). Severity scales with depth — a 4-layer FF
+(temporal XOR, r4/c64) *dips transiently* (worst-seed 1000→526→1000 over 800/3000/6000 trials, recovers); a
+12-layer FF (2-class, r4/c48) *collapses permanently* (all seeds 1000@300 → 465@1500). **Single-seed,
+single-checkpoint benchmarks masked this entirely** — it only shows up once training duration and seeds are
+explicit axes (now the standing benchmark convention; the `*_bench` reports show the curve). This is not new
+breakage — it is a property of the DFA+`rate_reg` rule that fixed-trial evaluation never surfaced.
+
+**Root cause — `rate_reg` (ablation-confirmed).** On the collapsing configs, the collapse appears **only with
+strong `rate_reg`** and vanishes without it:
+
+| config | `rate_reg` | acc over training |
+|---|---|---|
+| FF XOR r4/c64 (4L) | 5 | 1000 / 1000 / 733 / 526 / 1000 / 1000 |
+| " | 1 | 1000 / 1000 / 1000 / 1000 / 1000 / 1000 |
+| " | 0 | 1000 / 1000 / 1000 / 1000 / 1000 / 1000 |
+| FF 2-class r4/c48 (12L) | 5 | 1000 / 465 / 465 / 465 |
+| " | 0 | 1000 / 1000 / 1000 / 1000 |
+
+Mechanism: `rate_reg = c_reg·(rate − target)` is **class-agnostic and always-on** (fixed c_reg = 5, folded
+into the learning signal via the same eligibility). It is *load-bearing* to revive/keep-alive a starved
+substrate (its intended job — see the liveness rescue above). But once the task converges the task signal
+(`readout-error × feedback`) →0, so `rate_reg` becomes the dominant term and keeps pushing every neuron toward
+the *uniform* target rate — **homogenizing the representation and eroding class separability**. Depth
+amplifies it (more compounding reg terms, a more fragile deep class signal), turning a transient dip (4L,
+recovers) into a permanent collapse (12L). `rate_reg = 0` (or weak = 1) removes the collapse **on a generous
+substrate** (r4/c48/c64, σ ≈ 0.5–0.74, which is alive without the reg); on a *starved* substrate the reg is
+still needed for liveness, so it cannot simply be deleted.
+
+**Mitigation — early-stopping (documented, NOT implemented).** Because `rate_reg` must stay ON during the
+bootstrap/revival phase but is harmful after convergence, the fix is to **stop eroding the converged
+solution**: select the **best held-out checkpoint (early-stopping)** rather than training a fixed trial count
+— the duration-swept benchmarks already expose the peak, so compare at the *peak* of the curve, not the final
+point. Equivalent directions to try (not yet built): **anneal `c_reg` → 0 as the task error falls** (keep the
+liveness rescue early, remove the homogenizing pressure late), or **gate `rate_reg` off** for neurons/layers
+already at/above target rate. Left unimplemented per scope; recorded so the collapse is not mistaken for a
+substrate/credit limit.
