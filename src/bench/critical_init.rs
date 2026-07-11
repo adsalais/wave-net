@@ -192,6 +192,66 @@ fn scale_layer(net: &mut Network, z: usize, g: f32) {
     });
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct SigmaEpropParams {
+    pub rounds: usize,
+    pub lr: f32,          // per-synapse σ-error learning rate
+    pub tol: f32,         // stop an edge when |σ_hop - 1| <= tol
+    pub warmup: usize,
+    pub waves: usize,     // window for the source pre-trace
+    pub n_perturb: usize, // sites averaged per σ measurement
+}
+
+impl Default for SigmaEpropParams {
+    fn default() -> SigmaEpropParams {
+        SigmaEpropParams { rounds: 40, lr: 0.05, tol: 0.15, warmup: 32, waves: 96, n_perturb: 24 }
+    }
+}
+
+/// **Rate-free criticality init with sign-flipping.** Same σ_hop→1 objective as `sigma_gain_init`, but
+/// a **per-synapse** update instead of a uniform scale: `out_shadow[i,kk] += -lr·(σ_hop-1)·pre_i`,
+/// driven by the source's activity `pre_i` (no ψ, so dead targets still revive). The f32 latent shadow
+/// crossing zero flips `+1 → 0 → -1` — so a super-critical hop is tamed by turning the most-active
+/// sources **inhibitory** (and the per-source spread in `pre_i` gives the heterogeneity a uniform
+/// scalar lacked at the int8 quantization floor). σ>1 → weights down/negative, σ<1 (or dead) → up.
+/// Layer-wise greedy bottom-up; int8 quantizer (BitNet ternary is a separate path).
+pub fn sigma_eprop_init(net: &mut Network, drive_seed: u64, drive_frac_q16: u32, params: &SigmaEpropParams) {
+    let l = net.layer_count();
+    let ls = (net.size() * net.size()) as usize;
+    let size = net.size();
+    let drive = random_l0_input(drive_seed, size, drive_frac_q16);
+    for z in 1..l {
+        let src = z - 1;
+        let up = net.with_layer(src, |lz| lz.topology[0].count as usize);
+        for _ in 0..params.rounds {
+            let fp = forward_avalanche(net, drive_seed, drive_frac_q16, params.warmup, params.n_perturb);
+            let denom = fp[z - 1];
+            let sigma = if denom > 0.0 { fp[z] / denom } else { 0.0 };
+            if denom > 0.0 && (sigma - 1.0).abs() <= params.tol as f64 {
+                break;
+            }
+            let sig_err = (sigma - 1.0) as f32; // >0 super-critical (shrink/flip), <0 sub-critical/dead (grow)
+            let (pre, _psi) = windowed_eligibility(net, params.warmup, params.waves, &drive);
+            let lr = params.lr;
+            net.with_layer_mut(src, |lz| {
+                for i in 0..ls {
+                    let pre_i = pre[src][i] as f32;
+                    if pre_i == 0.0 {
+                        continue;
+                    }
+                    let delta = -lr * sig_err * pre_i;
+                    for kk in 0..up {
+                        lz.out_shadow[i * up + kk] += delta;
+                    }
+                }
+                for (wq, s) in lz.out_weights.iter_mut().zip(&lz.out_shadow) {
+                    *wq = s.round().clamp(-127.0, 127.0) as i8;
+                }
+            });
+        }
+    }
+}
+
 /// **Rate-free criticality init.** Drive each forward hop's branching ratio σ_hop → 1 by scaling the
 /// source layer's weight *gain* (no firing-rate target — the rate is whatever criticality produces),
 /// layer-wise greedy bottom-up. σ_hop is measured by `forward_avalanche` (per-hop damage spreading);
@@ -331,6 +391,34 @@ mod tests {
             let r = net.measure_layer_rates(32, 128, &input);
             let f = forward_avalanche(&mut net, SEED ^ 0xABCD, 20000, 32, 32);
             println!("uc={up_count:<2}: rates(emergent)={:?} footprint(L0..){:?} σ_hop{:?}", pct(&r), fp(&f), hops(&f));
+        }
+    }
+
+    /// Experiment (run manually): the **sign-flipping** σ-eprop init across density. Same σ_hop≈1,
+    /// rate-free objective, but a per-synapse update that can turn sources inhibitory — so it should
+    /// tame the high-density super-criticality where the uniform-scaling controller oscillated. Also
+    /// prints the fraction of negative (inhibitory) weights per layer, to see the brake being built.
+    ///   cargo test --release sigma_eprop_init_vs_density -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn sigma_eprop_init_vs_density() {
+        let params = SigmaEpropParams::default();
+        let hops = |f: &[f64]| -> Vec<f64> {
+            (1..f.len()).map(|z| if f[z - 1] > 0.0 { (f[z] / f[z - 1] * 100.0).round() / 100.0 } else { 0.0 }).collect()
+        };
+        for up_count in [8u32, 16, 24, 32, 48] {
+            let mut net = Network::new(ff_config(up_count, 3, 5));
+            sigma_eprop_init(&mut net, SEED ^ 0xABCD, 20000, &params);
+            let input = random_l0_input(SEED, 32, 20000);
+            let r = net.measure_layer_rates(32, 128, &input);
+            let f = forward_avalanche(&mut net, SEED ^ 0xABCD, 20000, 32, 32);
+            let neg: Vec<f64> = (0..net.layer_count() - 1)
+                .map(|z| {
+                    let (n, tot) = net.with_layer(z, |l| (l.out_weights.iter().filter(|&&w| w < 0).count(), l.out_weights.len()));
+                    (n as f64 / tot as f64 * 100.0).round() / 10.0 * 10.0
+                })
+                .collect();
+            println!("uc={up_count:<2}: rates={:?} σ_hop{:?} neg%(L0..)={:?}", pct(&r), hops(&f), neg);
         }
     }
 }
