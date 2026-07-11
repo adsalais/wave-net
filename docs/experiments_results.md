@@ -192,6 +192,28 @@ everywhere from cross-layer accumulation); the per-hop measure is the right one 
    chaos *helps* nonlinear mixing). Textbook edge-of-chaos: **σ≈1 maximizes linear separation; super-critical
    favors nonlinear mixing; σ≈1 is the safe general target.**
 
+**End-to-end FF training gate (2026-07-11) — σ≈1 does NOT cleanly beat calibration on *trained readout*
+accuracy.** Deep (5-layer), width-32 FF, full multi-layer e-prop + trained readout, `critical_init` vs
+the calibration fallback, 3 seeds (chance 500‰):
+
+| up_count | calibration | critical_init |
+|---|---|---|
+| 8  | 830‰ | **1000‰** |
+| 12 | **1000‰** | 820‰ |
+| 16 | 1000‰ | 1000‰ |
+| 32 | 1000‰ | 982‰ |
+
+Two lessons: (1) **training compensates for a brittle init** — `rate_reg`/e-prop revives a
+calibration-starved deep stack, so both hit ceiling at up_count ≥ 16 (the init barely matters once you
+train). (2) **σ≈1 is not the right target for a *readout*-based objective** — its emergent *rate decays
+with depth*, so the top layer can be too **sparse** to read, and `critical_init` *regresses* at up_count 12
+(820 vs 1000). It wins only where calibration is genuinely un-revivable (up_count 8). So the intrinsic-
+separability win (linear pattern preservation) does **not** transfer to trained-readout accuracy: readout
+wants a dense-enough top layer, which the rate-decaying σ-init doesn't guarantee. **Consequence: the FF
+default was NOT flipped to `critical_init`** — it stays an available init (a decisive revive for
+un-trainable sub-critical stacks), calibration stays the default, and reconciling σ≈1 with a dense top
+layer (e.g. a mild super-critical target, a rate floor, or reading multiple layers) is open work.
+
 **Status.** FF-validated; **`sigma_eprop_init` (rate-free, σ≈1) is the keeper** and the intended calibration
 replacement. Recurrent criticality (the side-car *loop gain* — a separate quantity `sigma_probe(Some(z))`
 measures) is **not yet handled**: the greedy-FF structure doesn't map to the cyclic (L2↔L3) topology. That

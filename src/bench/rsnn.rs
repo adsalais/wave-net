@@ -5,7 +5,7 @@
 use crate::bench::eprop::pick_class;
 use crate::bench::store_recall::{cue_realization, probe_pattern};
 use crate::bench::calibrate::{calibrate, CalibrateParams};
-use crate::wave_net::critical_init::random_l0_input;
+use crate::wave_net::critical_init::{random_l0_input, CriticalInitParams};
 use crate::wave_net::config::{Config, LayerConfig};
 use crate::wave_net::network::Network;
 use crate::wave_net::synapse::{key, mix, target_of, TopologyLevel};
@@ -37,6 +37,7 @@ pub struct RsnnConfig {
     pub adapt_decay: u8,  // ALIF adaptation decay shift
     pub rec_init: i8,     // initial recurrent weight (0 = keep procedural ±1; >0 bootstraps self-excitation)
     pub multi_layer: bool, // train every feed-forward layer (DFA credit), not just the last
+    pub init_critical: bool, // FF init: true = Network::critical_init (σ≈1), false = calibration fallback
     pub back_count: u32,   // level −1/−2 backward synapses per neuron (0 = feed-forward only)
     pub back_radius: u32,  // backward recurrence radius
     pub subthreshold_psi: bool, // temporal-eligibility ψ from decide-time potential, not just spikes
@@ -80,6 +81,7 @@ impl RsnnConfig {
             adapt_decay: 6,
             rec_init: 0,
             multi_layer: false,
+            init_critical: false,
             back_count: 0,
             back_radius: 2,
             subthreshold_psi: false,
@@ -525,7 +527,11 @@ fn elig_adapt_sum(ttot: usize, beta: f32, rho: f32, psi: impl Fn(usize) -> f32, 
 /// firing rates. `hidden_lr = 0` leaves the reservoir fixed (readout-only baseline).
 fn train_eprop_inner(cfg: &RsnnConfig) -> (Network, Vec<Vec<f32>>) {
     let mut net = Network::new(cfg.engine_config());
-    calibrate(&mut net, &cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
+    if cfg.init_critical {
+        net.critical_init(cfg.seed ^ 0xE9, cfg.calib_fraction_q16, &CriticalInitParams::default());
+    } else {
+        calibrate(&mut net, &cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
+    }
     let l = net.layer_count();
     let ls = (cfg.size * cfg.size) as usize;
     let top = l - 1;
@@ -1408,6 +1414,28 @@ pub fn sigma_probe(net: &mut Network, cfg: &RsnnConfig, warmup: usize, window: u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **FF init validation gate** (run manually). End-to-end multi-layer e-prop + trained readout on a
+    /// **deep (5-layer), width-32** FF classification task, `critical_init` vs the calibration fallback,
+    /// swept over `up_count` and averaged over seeds. Gate: `critical_init ≥ calibration`, and it should
+    /// **win where calibration is brittle** (deep + low `up_count`, where calibration lets the cue die
+    /// with depth). Only if it passes does the FF default flip to `critical_init`.
+    ///   cargo test --release ff_init_validation_gate -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn ff_init_validation_gate() {
+        let seeds = [0x00E9u64, 0x00A1_1CE5, 0x00B0_B0B0];
+        for up_count in [8u32, 12, 16, 32] {
+            let (mut cal, mut crit) = (0u64, 0u64);
+            for &s in &seeds {
+                let base = RsnnConfig { seed: s, task_seed: s, size: 32, layers: 5, multi_layer: true, up_count, trials: 1200, present_waves: 10, ..RsnnConfig::demo() };
+                cal += train_eprop(&RsnnConfig { init_critical: false, ..base });
+                crit += train_eprop(&RsnnConfig { init_critical: true, ..base });
+            }
+            let n = seeds.len() as u64;
+            println!("up_count={up_count}: calibration={}‰  critical_init={}‰  (mean over {n} seeds, chance {}‰)", cal / n, crit / n, 1000 / 2);
+        }
+    }
 
     #[test]
     fn sigma_probe_is_deterministic() {
