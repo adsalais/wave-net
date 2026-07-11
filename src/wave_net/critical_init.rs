@@ -88,6 +88,32 @@ pub fn forward_avalanche(net: &mut Network, drive_seed: u64, drive_frac_q16: u32
     footprint
 }
 
+/// Per-layer firing rate (fraction of neurons firing per wave) on the noise drive, measured over
+/// `waves` after a `warmup`, through the public layer-listener API (same trick as the throughput
+/// bench's `measure_rates`). Leaves the net warmed; the caller resets before the next measurement.
+pub fn layer_rates(net: &mut Network, drive_seed: u64, frac_q16: u32, warmup: usize, waves: usize) -> Vec<f64> {
+    let l = net.layer_count();
+    let ls = (net.size() * net.size()) as u64;
+    let drive = random_l0_input(drive_seed, net.size(), frac_q16);
+    let counts = Arc::new(Mutex::new(vec![0u64; l]));
+    for z in 0..l {
+        let c = counts.clone();
+        net.on_layer(z, Box::new(move |_w, fired: &[u32]| *c.lock().unwrap().get_mut(z).unwrap() += fired.len() as u64));
+    }
+    net.reset_state();
+    for w in 0..warmup {
+        net.wave(&drive(w));
+    }
+    counts.lock().unwrap().iter_mut().for_each(|x| *x = 0); // discard warmup
+    for w in 0..waves {
+        net.wave(&drive(warmup + w));
+    }
+    net.clear_listeners();
+    let counts = std::mem::take(&mut *counts.lock().unwrap());
+    let denom = (ls * waves as u64) as f64;
+    counts.iter().map(|&s| s as f64 / denom).collect()
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct CriticalInitParams {
     pub rounds: usize,    // max σ-gain rounds per layer edge
@@ -125,6 +151,34 @@ impl Network {
                     break;
                 }
                 let sig_err = (sigma - 1.0) as f32;
+                let (pre, psi) = self.windowed_eligibility(params.warmup, params.waves, &drive);
+                self.eprop_update(src, 0, &pre[src], &psi[z], &vec![sig_err; ls], params.lr, false);
+            }
+        }
+    }
+
+    /// **Rate-matched FF init.** Drive each layer's firing rate toward the rate of the layer directly
+    /// *below* it (`rate[z] → rate[z-1]`), greedy bottom-up starting at layer 1 (which chases the input
+    /// drive rate `rate[0]`, capped wherever ALIF adaptation lets it settle). Each hop then preserves
+    /// the rate beneath it, so the profile flattens at the sustainable level — no rate set-point, fully
+    /// self-referential. The knob is the e-prop weight update: per-synapse, heterogeneous (source
+    /// `pre_i` weighting), sign-flipping (f32 shadow crossing zero adds inhibition) — a finer
+    /// homeostatic rule than the bench calibration's uniform per-layer *threshold* shift. Feed-forward.
+    /// `params.tol` is a *relative* band around the layer-below rate.
+    pub fn rate_match_init(&mut self, drive_seed: u64, frac_q16: u32, params: &CriticalInitParams) {
+        let l = self.layer_count();
+        let ls = (self.size() * self.size()) as usize;
+        let drive = random_l0_input(drive_seed, self.size(), frac_q16);
+        for z in 1..l {
+            let src = z - 1;
+            for _ in 0..params.rounds {
+                let rates = layer_rates(self, drive_seed, frac_q16, params.warmup, params.waves);
+                let anchor = rates[z - 1];
+                let err = rates[z] - anchor;
+                if err.abs() <= params.tol as f64 * anchor.max(1e-3) {
+                    break;
+                }
+                let sig_err = err as f32;
                 let (pre, psi) = self.windowed_eligibility(params.warmup, params.waves, &drive);
                 self.eprop_update(src, 0, &pre[src], &psi[z], &vec![sig_err; ls], params.lr, false);
             }

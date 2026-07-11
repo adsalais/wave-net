@@ -11,6 +11,18 @@ use crate::wave_net::network::Network;
 use crate::wave_net::synapse::{key, mix, target_of, TopologyLevel};
 use std::sync::{Arc, Mutex};
 
+/// Which feed-forward init to use in the e-prop trainers (see `train_eprop_inner`). `Calibrate` is the
+/// firing-rate homeostasis fallback (bench tool); `Sigma` is `Network::critical_init` (σ≈1, edge of
+/// chaos); `RateMatch` is `Network::rate_match_init` (flat rate matched to the first layer — cures the
+/// σ-init's sparse-top decay).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum FfInit {
+    None, // raw weights, no init pass — train from scratch (rate_reg only). Tests calibration's redundancy.
+    Calibrate,
+    Sigma,
+    RateMatch,
+}
+
 #[derive(Clone, Debug)]
 pub struct RsnnConfig {
     pub seed: u64,
@@ -37,7 +49,7 @@ pub struct RsnnConfig {
     pub adapt_decay: u8,  // ALIF adaptation decay shift
     pub rec_init: i8,     // initial recurrent weight (0 = keep procedural ±1; >0 bootstraps self-excitation)
     pub multi_layer: bool, // train every feed-forward layer (DFA credit), not just the last
-    pub init_critical: bool, // FF init: true = Network::critical_init (σ≈1), false = calibration fallback
+    pub ff_init: FfInit, // which FF init the e-prop trainers use: calibration / σ-critical / rate-matched
     pub back_count: u32,   // level −1/−2 backward synapses per neuron (0 = feed-forward only)
     pub back_radius: u32,  // backward recurrence radius
     pub subthreshold_psi: bool, // temporal-eligibility ψ from decide-time potential, not just spikes
@@ -81,7 +93,7 @@ impl RsnnConfig {
             adapt_decay: 6,
             rec_init: 0,
             multi_layer: false,
-            init_critical: false,
+            ff_init: FfInit::Calibrate,
             back_count: 0,
             back_radius: 2,
             subthreshold_psi: false,
@@ -527,10 +539,11 @@ fn elig_adapt_sum(ttot: usize, beta: f32, rho: f32, psi: impl Fn(usize) -> f32, 
 /// firing rates. `hidden_lr = 0` leaves the reservoir fixed (readout-only baseline).
 fn train_eprop_inner(cfg: &RsnnConfig) -> (Network, Vec<Vec<f32>>) {
     let mut net = Network::new(cfg.engine_config());
-    if cfg.init_critical {
-        net.critical_init(cfg.seed ^ 0xE9, cfg.calib_fraction_q16, &CriticalInitParams::default());
-    } else {
-        calibrate(&mut net, &cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
+    match cfg.ff_init {
+        FfInit::None => {}
+        FfInit::Calibrate => calibrate(&mut net, &cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16)),
+        FfInit::Sigma => net.critical_init(cfg.seed ^ 0xE9, cfg.calib_fraction_q16, &CriticalInitParams::default()),
+        FfInit::RateMatch => net.rate_match_init(cfg.seed ^ 0xE9, cfg.calib_fraction_q16, &CriticalInitParams { rounds: 100, lr: 0.15, ..CriticalInitParams::default() }),
     }
     let l = net.layer_count();
     let ls = (cfg.size * cfg.size) as usize;
@@ -1426,14 +1439,42 @@ mod tests {
     fn ff_init_validation_gate() {
         let seeds = [0x00E9u64, 0x00A1_1CE5, 0x00B0_B0B0];
         for up_count in [8u32, 12, 16, 32] {
-            let (mut cal, mut crit) = (0u64, 0u64);
+            let (mut none, mut cal, mut sig, mut rm) = (0u64, 0u64, 0u64, 0u64);
             for &s in &seeds {
                 let base = RsnnConfig { seed: s, task_seed: s, size: 32, layers: 5, multi_layer: true, up_count, trials: 1200, present_waves: 10, ..RsnnConfig::demo() };
-                cal += train_eprop(&RsnnConfig { init_critical: false, ..base });
-                crit += train_eprop(&RsnnConfig { init_critical: true, ..base });
+                none += train_eprop(&RsnnConfig { ff_init: FfInit::None, ..base.clone() });
+                cal += train_eprop(&RsnnConfig { ff_init: FfInit::Calibrate, ..base.clone() });
+                sig += train_eprop(&RsnnConfig { ff_init: FfInit::Sigma, ..base.clone() });
+                rm += train_eprop(&RsnnConfig { ff_init: FfInit::RateMatch, ..base });
             }
             let n = seeds.len() as u64;
-            println!("up_count={up_count}: calibration={}‰  critical_init={}‰  (mean over {n} seeds, chance {}‰)", cal / n, crit / n, 1000 / 2);
+            println!("up_count={up_count}: none={}‰  calibration={}‰  σ-init={}‰  rate-match={}‰  (mean over {n} seeds, chance 500‰)", none / n, cal / n, sig / n, rm / n);
+        }
+    }
+
+    /// Fast diagnostic (no training): per-layer firing-rate profile (%) after each FF init, so we can
+    /// see whether `rate_match_init` actually flattens the depth decay the σ-init leaves.
+    ///   cargo test --release ff_init_rate_profiles -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn ff_init_rate_profiles() {
+        use crate::wave_net::critical_init::layer_rates;
+        let s = 0x00E9u64;
+        for up_count in [8u32, 12, 32] {
+            let cfg = RsnnConfig { seed: s, size: 32, layers: 5, up_count, ..RsnnConfig::demo() };
+            let frac = cfg.calib_fraction_q16;
+            let pct = |net: &mut Network| -> Vec<f64> {
+                layer_rates(net, s ^ 0xE9, frac, 32, 96).iter().map(|r| (r * 1000.0).round() / 10.0).collect()
+            };
+            let mut a = Network::new(cfg.engine_config());
+            calibrate(&mut a, &cfg.calib, &random_l0_input(s ^ 0xE9, cfg.size, frac));
+            let mut b = Network::new(cfg.engine_config());
+            b.critical_init(s ^ 0xE9, frac, &CriticalInitParams::default());
+            let mut c = Network::new(cfg.engine_config());
+            c.rate_match_init(s ^ 0xE9, frac, &CriticalInitParams::default());
+            let mut d = Network::new(cfg.engine_config());
+            d.rate_match_init(s ^ 0xE9, frac, &CriticalInitParams { rounds: 100, lr: 0.15, ..CriticalInitParams::default() });
+            println!("uc{up_count}: calib={:?}  σ={:?}  rate-match={:?}  rate-match+={:?}", pct(&mut a), pct(&mut b), pct(&mut c), pct(&mut d));
         }
     }
 

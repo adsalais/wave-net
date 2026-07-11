@@ -207,12 +207,51 @@ Two lessons: (1) **training compensates for a brittle init** — `rate_reg`/e-pr
 calibration-starved deep stack, so both hit ceiling at up_count ≥ 16 (the init barely matters once you
 train). (2) **σ≈1 is not the right target for a *readout*-based objective** — its emergent *rate decays
 with depth*, so the top layer can be too **sparse** to read, and `critical_init` *regresses* at up_count 12
-(820 vs 1000). It wins only where calibration is genuinely un-revivable (up_count 8). So the intrinsic-
-separability win (linear pattern preservation) does **not** transfer to trained-readout accuracy: readout
-wants a dense-enough top layer, which the rate-decaying σ-init doesn't guarantee. **Consequence: the FF
-default was NOT flipped to `critical_init`** — it stays an available init (a decisive revive for
-un-trainable sub-critical stacks), calibration stays the default, and reconciling σ≈1 with a dense top
-layer (e.g. a mild super-critical target, a rate floor, or reading multiple layers) is open work.
+(820 vs 1000). It wins only where calibration is genuinely un-revivable (up_count 8). **Consequence: the FF default was
+NOT flipped to `critical_init`** — it stays an available init (a decisive revive for un-trainable
+sub-critical stacks), calibration stays the default.
+
+**Follow-up (2026-07-11) — the regression is NOT a sparse-top problem; density is not the lever.** The
+initial diagnosis ("σ≈1's decaying rate leaves the top too sparse for the readout") was **wrong**. The
+pre-training per-layer rate profiles (5-layer, width 32) show σ-init actually keeps the **densest, most
+alive top** of the σ/calibration pair (uc32 σ = `[30.6, 10.0, 4.0, 3.9, 4.4]` vs calibration
+`[30.6, 6.0, 2.0, 0.6, 0.4]`, whose top is *dead* pre-training and only revived by training's `rate_reg`).
+To test density directly, a third init — `Network::rate_match_init` (drive each layer's rate to the layer
+below, `rate[z]→rate[z-1]`, via the same e-prop weight update; converged at rounds 100 / lr 0.15) —
+produces a **flat, dense, alive** profile everywhere (uc8 top **11%**, uc12 **15%**, uc32 **16%**), by far
+the densest of the three. Its trained accuracy: `[819, 832, 988, 992]‰` over uc `[8,12,16,32]` — the
+**worst or tied-worst almost everywhere**. Decisive point: at uc8 the *densest* init (rate-match, top 11%)
+trains to **819**, while the *sparsest* (σ-init, top 1%) trains to **1000**. So (1) the init's static rate
+profile does **not** predict trained accuracy, and (2) **denser is worse**, not better. The real substrate
+quality is **σ≈1 = optimal information propagation at the edge of chaos**, *not* firing rate: where the
+substrate is the bottleneck (uc8) σ=1 preserves the signal while an over-driven dense regime saturates it.
+Net: `rate_match_init` is a **confirmed dead end** for trained-readout accuracy; calibration stays the FF
+default, `critical_init` (σ≈1) stays the rescue init for un-revivable starved stacks.
+
+**Is calibration itself redundant with training? — No (`None`-init test, 2026-07-11).** A fourth init,
+`FfInit::None` (train from *raw* weights, no init pass, `rate_reg` only), added as a column to the gate:
+
+| up_count | none | calibration | σ-init | rate-match+ |
+|---|---|---|---|---|
+| 8  | 498 (chance) | 830 | **1000** | 819 |
+| 12 | 498 (chance) | **1000** | 820 | 832 |
+| 16 | 1000 | 1000 | 1000 | 988 |
+| 32 | 1000 | 1000 | 982 | 992 |
+
+`None` sits at **chance** at uc8/uc12 and only reaches 1000 at uc16/uc32. So training's `rate_reg` *cannot*
+bootstrap a raw stack at marginal fan-in — it needs calibration's threshold pre-pass to reach a trainable
+operating point first. This gives a clean **three-regime picture by substrate richness**: (1) **generous
+fan-in (uc16, 32)** — init is irrelevant, even `None` trains to 1000, calibration *is* redundant here; (2)
+**marginal fan-in (uc12)** — calibration is *decisive* (chance→perfect), `rate_reg` alone can't bootstrap
+raw weights; (3) **severe starvation (uc8)** — even calibration limps (830), σ≈1 is the unique rescue
+(1000). A standing puzzle: at uc12 the *more-alive* inits (σ-init, rate-match) train *worse* than
+calibration's dead-top init — "more firing at init" is not the good; calibration lands a specific operating
+point ideal for `rate_reg` training that the weight-only inits miss (cf. Pennington: forward liveness ≠ a
+trainable basin). Literature frame: untrained reservoirs (ESN/LSM) need edge-of-chaos init because the
+hidden weights are never trained (our uc8); trained RSNNs (Bellec e-prop/LSNN) rely on firing-rate
+regularization and treat init as a warm-start (our uc16/32); deep-FF signal-propagation theory
+(Poole/Schoenholz, Pennington) says criticality enables depth but normalization can substitute — all three
+consistent with the regimes above.
 
 **Status.** FF-validated; **`sigma_eprop_init` (rate-free, σ≈1) is the keeper** and the intended calibration
 replacement. Recurrent criticality (the side-car *loop gain* — a separate quantity `sigma_probe(Some(z))`
