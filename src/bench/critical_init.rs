@@ -116,13 +116,14 @@ pub fn rate_reg_init(net: &mut Network, seed: u64, params: &CriticalInitParams, 
 /// per-hop branching ratio is `footprint[z+1] / footprint[z]`: ≈1 critical, <1 the cue shrinks with
 /// depth (sub-critical), >1 grows. Unlike the whole-network `sigma_probe`, this isolates each hop
 /// (no cross-layer accumulation), so it's the right σ read for a feed-forward stack. Bench-side.
-pub fn forward_avalanche(net: &mut Network, drive_seed: u64, drive_frac_q16: u32, warmup: usize, n_perturb: usize) -> Vec<f64> {
+pub fn forward_avalanche(net: &mut Network, drive_seed: u64, drive_frac_q16: u32, warmup: usize, n_perturb: usize, burst: usize) -> Vec<f64> {
     let l = net.layer_count();
     let ls = (net.size() * net.size()) as usize;
     let size = net.size();
     let drive = random_l0_input(drive_seed, size, drive_frac_q16);
     let steps = warmup + l + 1;
-    let run = |net: &mut Network, pert: Option<u32>| -> Vec<Vec<Vec<u32>>> {
+    // Inject `burst` extra L0 spikes at `warmup` (bigger avalanche = less noisy σ ratio; burst cancels).
+    let run = |net: &mut Network, extra: &[u32]| -> Vec<Vec<Vec<u32>>> {
         let rec: Arc<Mutex<Vec<Vec<Vec<u32>>>>> = Arc::new(Mutex::new(vec![Vec::new(); l]));
         for z in 0..l {
             let r = rec.clone();
@@ -131,9 +132,11 @@ pub fn forward_avalanche(net: &mut Network, drive_seed: u64, drive_frac_q16: u32
         net.reset_state();
         for w in 0..steps {
             let mut sites = drive(w);
-            if let (Some(p), true) = (pert, w == warmup) {
-                if !sites.contains(&p) {
-                    sites.push(p);
+            if w == warmup {
+                for &e in extra {
+                    if !sites.contains(&e) {
+                        sites.push(e);
+                    }
                 }
             }
             net.wave(&sites);
@@ -142,26 +145,34 @@ pub fn forward_avalanche(net: &mut Network, drive_seed: u64, drive_frac_q16: u32
         let out = rec.lock().unwrap().clone();
         out
     };
-    let refr = run(net, None);
+    let refr = run(net, &[]);
     let driven: HashSet<u32> = drive(warmup).into_iter().collect();
     let np = n_perturb.max(1);
+    let b = burst.max(1);
     let mut footprint = vec![0f64; l];
     for k in 0..np {
-        let mut p = (mix(key(drive_seed, k as u32, 0, 0, 0xC1)) % ls as u64) as u32;
-        let mut guard = 0;
-        while driven.contains(&p) && guard < ls {
-            p = (p + 1) % ls as u32;
-            guard += 1;
+        // `b` distinct extra sites for this trial, none already driven at `warmup`.
+        let mut extra: Vec<u32> = Vec::with_capacity(b);
+        for j in 0..b {
+            let mut p = (mix(key(drive_seed, k as u32, j as i32, 0, 0xC1)) % ls as u64) as u32;
+            let mut guard = 0;
+            while (driven.contains(&p) || extra.contains(&p)) && guard < ls {
+                p = (p + 1) % ls as u32;
+                guard += 1;
+            }
+            if !driven.contains(&p) && !extra.contains(&p) {
+                extra.push(p);
+            }
         }
-        let pert = run(net, Some(p));
+        let pert = run(net, &extra);
         for z in 0..l {
-            let wv = warmup + z; // wave the avalanche front reaches layer z (z=0: the extra spike itself)
+            let wv = warmup + z; // wave the avalanche front reaches layer z (z=0: the injected spikes)
             let a: HashSet<u32> = refr[z][wv].iter().copied().collect();
-            let b: HashSet<u32> = pert[z][wv].iter().copied().collect();
-            footprint[z] += a.symmetric_difference(&b).count() as f64 / np as f64;
+            let bset: HashSet<u32> = pert[z][wv].iter().copied().collect();
+            footprint[z] += a.symmetric_difference(&bset).count() as f64 / np as f64;
         }
     }
-    footprint // footprint[0] ≈ 1 (the injected spike); σ_hop(z-1→z) = footprint[z]/footprint[z-1]
+    footprint // footprint[0] ≈ burst; σ_hop(z-1→z) = footprint[z]/footprint[z-1]
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -171,11 +182,12 @@ pub struct SigmaInitParams {
     pub tol: f32,        // stop an edge when |σ_hop - 1| <= tol
     pub warmup: usize,   // avalanche measurement warmup
     pub n_perturb: usize, // perturbation sites averaged per σ measurement
+    pub burst: usize,    // extra spikes injected per perturbation (bigger = less noisy σ)
 }
 
 impl Default for SigmaInitParams {
     fn default() -> SigmaInitParams {
-        SigmaInitParams { rounds: 30, alpha: 0.5, tol: 0.15, warmup: 32, n_perturb: 24 }
+        SigmaInitParams { rounds: 30, alpha: 0.5, tol: 0.15, warmup: 32, n_perturb: 24, burst: 16 }
     }
 }
 
@@ -200,11 +212,12 @@ pub struct SigmaEpropParams {
     pub warmup: usize,
     pub waves: usize,     // window for the source pre-trace
     pub n_perturb: usize, // sites averaged per σ measurement
+    pub burst: usize,     // extra spikes injected per perturbation (bigger = less noisy σ)
 }
 
 impl Default for SigmaEpropParams {
     fn default() -> SigmaEpropParams {
-        SigmaEpropParams { rounds: 40, lr: 0.05, tol: 0.15, warmup: 32, waves: 96, n_perturb: 24 }
+        SigmaEpropParams { rounds: 40, lr: 0.05, tol: 0.15, warmup: 32, waves: 96, n_perturb: 24, burst: 16 }
     }
 }
 
@@ -224,7 +237,7 @@ pub fn sigma_eprop_init(net: &mut Network, drive_seed: u64, drive_frac_q16: u32,
         let src = z - 1;
         let up = net.with_layer(src, |lz| lz.topology[0].count as usize);
         for _ in 0..params.rounds {
-            let fp = forward_avalanche(net, drive_seed, drive_frac_q16, params.warmup, params.n_perturb);
+            let fp = forward_avalanche(net, drive_seed, drive_frac_q16, params.warmup, params.n_perturb, params.burst);
             let denom = fp[z - 1];
             let sigma = if denom > 0.0 { fp[z] / denom } else { 0.0 };
             if denom > 0.0 && (sigma - 1.0).abs() <= params.tol as f64 {
@@ -260,7 +273,7 @@ pub fn sigma_gain_init(net: &mut Network, drive_seed: u64, drive_frac_q16: u32, 
     let l = net.layer_count();
     for z in 1..l {
         for _ in 0..params.rounds {
-            let fp = forward_avalanche(net, drive_seed, drive_frac_q16, params.warmup, params.n_perturb);
+            let fp = forward_avalanche(net, drive_seed, drive_frac_q16, params.warmup, params.n_perturb, params.burst);
             let denom = fp[z - 1];
             let sigma = if denom > 0.0 { fp[z] / denom } else { 0.0 };
             if denom > 0.0 && (sigma - 1.0).abs() <= params.tol as f64 {
@@ -353,7 +366,7 @@ mod tests {
             let mut net = Network::new(ff_config(up_count, up_radius, adapt_bump));
             rate_reg_init(&mut net, SEED, &init, &input);
             let r = net.measure_layer_rates(32, 128, &input);
-            let f = forward_avalanche(&mut net, SEED ^ 0xABCD, 20000, 32, 16);
+            let f = forward_avalanche(&mut net, SEED ^ 0xABCD, 20000, 32, 16, 16);
             let alif = if adapt_bump > 0 { "ALIF" } else { "LIF " };
             println!("uc={up_count:<2} r={up_radius} {alif}: rates={:?} footprint{:?} σ_hop{:?}", pct(&r), fp(&f), hops(&f));
         };
@@ -389,7 +402,7 @@ mod tests {
             sigma_gain_init(&mut net, SEED ^ 0xABCD, 20000, &params);
             let input = random_l0_input(SEED, 32, 20000);
             let r = net.measure_layer_rates(32, 128, &input);
-            let f = forward_avalanche(&mut net, SEED ^ 0xABCD, 20000, 32, 32);
+            let f = forward_avalanche(&mut net, SEED ^ 0xABCD, 20000, 32, 32, 16);
             println!("uc={up_count:<2}: rates(emergent)={:?} footprint(L0..){:?} σ_hop{:?}", pct(&r), fp(&f), hops(&f));
         }
     }
@@ -411,7 +424,7 @@ mod tests {
             sigma_eprop_init(&mut net, SEED ^ 0xABCD, 20000, &params);
             let input = random_l0_input(SEED, 32, 20000);
             let r = net.measure_layer_rates(32, 128, &input);
-            let f = forward_avalanche(&mut net, SEED ^ 0xABCD, 20000, 32, 32);
+            let f = forward_avalanche(&mut net, SEED ^ 0xABCD, 20000, 32, 32, 16);
             let neg: Vec<f64> = (0..net.layer_count() - 1)
                 .map(|z| {
                     let (n, tot) = net.with_layer(z, |l| (l.out_weights.iter().filter(|&&w| w < 0).count(), l.out_weights.len()));
