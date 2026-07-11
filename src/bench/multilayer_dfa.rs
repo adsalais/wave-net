@@ -429,4 +429,63 @@ mod tests {
         assert_eq!(rec1.pots, rec2.pots);
         assert_eq!(rec1.effs, rec2.effs);
     }
+
+    fn ff_cfg(trials: usize, hidden_lr: f32, elig_beta: f32) -> TaskCfg {
+        TaskCfg {
+            size: 8,
+            present: 6,
+            delay: 4,
+            read: 6,
+            trials,
+            holdout: 200,
+            readout_lr: 0.02,
+            hidden_lr,
+            rate_reg: 5.0,
+            rate_target: 0.1,
+            elig: EligParams { rec_tau: 6.0, elig_beta, elig_psi_width: PSI_WIDTH, use_bump: elig_beta != 0.0, adapt_decay: 6 },
+        }
+    }
+
+    #[test]
+    fn multilayer_dfa_learns_separable_2class_above_chance() {
+        // Deep (4-layer) FF net, generous fan-in (size 16, up_count 32) so every layer stays alive; a
+        // 2-class separable task trains to ceiling when every layer is trained (multi-layer DFA + rate_reg).
+        // Empirical: 4 layers at size 8 is fan-in-starved (dead deep layers → chance); size 16 + up 32 is
+        // the target regime. If this dips below ~600, raise up_count/size/trials — do NOT lower the bar
+        // toward chance (500).
+        let seed = 0xE9_0B_0A17u64;
+        let (mut net, entries) = make_ff(seed, 16, 4, 32, 3, 20, 6);
+        let mut cfg = ff_cfg(400, 0.004, 0.0);
+        cfg.size = 16;
+        let acc = train_and_eval(&mut net, &entries, seed, seed, &cfg, single_task);
+        assert!(acc > 750, "2-class separable should train well above chance: {acc}");
+    }
+
+    #[test]
+    fn training_is_deterministic_both_elig_flavors() {
+        // A live config (L3, size 8, up 32) so both the membrane and ALIF-εᵃ paths actually train; the
+        // point is bit-reproducibility of the whole loop.
+        let seed = 0x1234_5678u64;
+        let run = |beta: f32| {
+            let (mut net, entries) = make_ff(seed, 8, 3, 32, 3, 20, 6);
+            train_and_eval(&mut net, &entries, seed, seed, &ff_cfg(120, 0.004, beta), single_task)
+        };
+        assert_eq!(run(0.0), run(0.0), "membrane-eligibility training must be deterministic");
+        assert_eq!(run(0.4), run(0.4), "ALIF-eligibility training must be deterministic");
+    }
+
+    #[test]
+    #[ignore] // expensive; run manually in --release: the real temporal task
+    fn multilayer_dfa_learns_temporal_xor() {
+        // Temporal XOR (memory across a gap): FF-readout-only is ~chance; training every layer (ALIF +
+        // rate_reg, generous fan-in) must clear it.
+        let seed = 0xE9_0B_0A17u64;
+        let (mut net, entries) = make_ff(seed, 16, 4, 32, 3, 20, 6);
+        let mut cfg = ff_cfg(1500, 0.004, 0.4);
+        cfg.size = 16;
+        cfg.delay = 8;
+        cfg.holdout = 400;
+        let acc = train_and_eval(&mut net, &entries, seed, seed, &cfg, xor_task);
+        assert!(acc > 640, "temporal XOR should train above chance: {acc}");
+    }
 }
