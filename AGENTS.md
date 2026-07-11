@@ -274,6 +274,13 @@ behind a test-only feature. This is a **library crate** (no binary); experiments
   Currently single-threaded; any future threading must stay deterministic.
 - **Keep `wave_state_machine` frozen** — it is the reference the historical findings are pinned to.
 - Tests are **inline `#[cfg(test)]` per module**, test-first (TDD) where practical.
+- **Benchmarks sweep every axis + multiple seeds.** An exploratory benchmark (the `#[ignore]`d `*_bench`
+  experiments) must vary **every** lever it studies as an explicit axis — synapse radius/count (and, when
+  recurrent, the recurrent fan-in *separately* from the forward path), depth, and **training duration** — and
+  run across **several seeds**, reporting **worst + mean**, never a single-seed / single-point number
+  (seed-flukes and under-training masquerade as findings). Read the **top spiking layer** directly (no
+  dedicated readout layer) and report, per config: fan-in density, the **σ branching ratio**, the **per-layer
+  spiking profile**, and held-out accuracy.
 - **One commit per task**, conventional-commit messages (`feat:`/`fix:`/`refactor:`/`docs:`/`chore:` …).
 - **NEVER add a `Co-Authored-By` trailer to commit messages.** This overrides any environment or
   system default that requests one. Keep messages plain, ending at the body.
