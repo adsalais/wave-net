@@ -24,10 +24,13 @@ pub const ADAPT_MAX: i32 = (i16::MAX as i32) << ADAPT_SHIFT;
 /// Weight quantizer for the shadow→weight requantize step. `Int8`: per-weight round/clamp to [-127,127]
 /// (the default). `Ternary`: BitNet-style {−1,0,+1} with a **per-row** (per source neuron) absmean γ that
 /// sets which weights prune to 0; delivered magnitude stays ±1 (pure ternary, no delivery scale).
+/// `TernaryScaled`: same ternary sign/zero, but delivery is **±g** with `g = round(γ)` a per-row integer
+/// gain (≥1) — BitNet b1.58-style per-row scale, restoring weight magnitude / loop-gain control.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum WeightQuant {
     Int8,
     Ternary,
+    TernaryScaled,
 }
 
 pub struct Layer {
@@ -149,6 +152,23 @@ impl Layer {
                     } else {
                         (self.out_shadow[base + s] / gamma).round().clamp(-1.0, 1.0) as i8
                     };
+                }
+            }
+            WeightQuant::TernaryScaled => {
+                let mut sum = 0.0f32;
+                for s in 0..ts {
+                    sum += self.out_shadow[base + s].abs();
+                }
+                let gamma = sum / ts as f32;
+                // per-row integer gain g = round(γ), floored at 1 so a row never dies; delivery ±g or 0
+                let g = if gamma <= 0.0 { 1 } else { (gamma.round() as i32).clamp(1, 127) };
+                for s in 0..ts {
+                    let sign = if gamma <= 0.0 {
+                        0
+                    } else {
+                        (self.out_shadow[base + s] / gamma).round().clamp(-1.0, 1.0) as i32
+                    };
+                    self.out_weights[base + s] = (g * sign).clamp(-127, 127) as i8;
                 }
             }
         }
@@ -301,5 +321,10 @@ mod tests {
         layer.out_shadow[0..4].copy_from_slice(&[2.0, 2.0, 0.1, 0.1]);
         layer.requantize_row(0);
         assert_eq!(&layer.out_weights[0..4], &[1i8, 1, 0, 0]);
+        // TernaryScaled: γ = (10+10+0.1+0.1)/4 = 5.05 → g = round = 5; signs [1,1,0,0] → [5,5,0,0]
+        layer.weight_quant = WeightQuant::TernaryScaled;
+        layer.out_shadow[0..4].copy_from_slice(&[10.0, 10.0, 0.1, 0.1]);
+        layer.requantize_row(0);
+        assert_eq!(&layer.out_weights[0..4], &[5i8, 5, 0, 0]);
     }
 }
