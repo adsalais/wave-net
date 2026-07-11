@@ -195,6 +195,42 @@ cargo test --features random_weights # test-only: procedural random-magnitude we
 Experiments are written as `#[ignore]`d tests (the expensive ones note `run manually in --release`),
 so `cargo test` stays fast and the experiments are reproducible on demand.
 
+## Profiling
+
+Baseline throughput lives in `benches/throughput.rs` (`cargo bench --bench throughput`, ~waves/s on a
+calibrated 32×32×5 FF net). To find *where* time goes, sample the forward pass with `perf`:
+`examples/profile_wave.rs` is a ready harness (same calibrated net, eligibility off, tight wave loop).
+
+```bash
+# perf needs kernel.perf_event_paranoid <= 1 for user-space sampling. ALWAYS CHECK IT FIRST:
+cat /proc/sys/kernel/perf_event_paranoid
+CARGO_PROFILE_RELEASE_DEBUG=true RUSTFLAGS="-C force-frame-pointers=yes" \
+  cargo build --release --example profile_wave
+perf record -g --call-graph fp -- ./target/release/examples/profile_wave 1000000
+perf report --stdio --no-children -g none | head        # flat self-time by function
+perf annotate --stdio -l -s wave_net::wave_net::synapse::generate_into   # per-instruction
+```
+
+**An agent cannot lower `perf_event_paranoid` itself (needs root).** When you need to profile and
+`cat /proc/sys/kernel/perf_event_paranoid` reports `> 1`, ask the user to run
+`sudo sysctl kernel.perf_event_paranoid=1` (temporary — resets on reboot; restore with the old value).
+
+**Last profile (2026-07-11, size 32×32×5 FF, post hot-path refactor):** synapse generation
+`generate_into` ≈ **67%** of cycles (≈70% of *that* is the procedural hash — `mix`/`key`/`map_range24`),
+`process_layer` (per-neuron drain/decide/leak/adapt over all neurons) ≈ **32%**, everything else <0.5%
+(buffer reuse already removed allocation from the hot path). The dominant cost is confirmed to be the
+fire-time synapse-address hashing, not memory. Materializing the synapse targets (a per-slot target
+cache — `u16` suffices for `size <= 256`, ~320 KB at 32×32×5, small next to the existing `out_shadow`
+`f32`s) would remove the hash and roughly **2×** throughput.
+
+**Dead end (don't re-try): micro-optimizing the hash arithmetic.** Strength-reducing `key()` inside
+`generate_into` (its four `wrapping_mul(GOLDEN)` collapse to a running `+= GOLDEN` — byte-identical,
+verified) measured a **wash** (~0%): the per-synapse loop is latency-bound on the `mix → map_range24`
+derivation chain (and the `Vec::push`), not throughput-bound on multiplies, so cutting multiplies just
+trades them for adds. The only substantial hash win is to **stop recomputing it** (cache targets);
+swapping `mix` for a cheaper finalizer would help but changes every target → re-randomizes the net →
+needs full multi-seed re-validation + risks target quality (what `strong_hash` guards).
+
 ## Conventions (required)
 
 - Rust, edition 2024. **Standard library only by default** — the one optional dependency (`blake3`) is
