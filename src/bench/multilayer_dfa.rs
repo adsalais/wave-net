@@ -151,37 +151,41 @@ pub fn multilayer_dfa_step(net: &mut Network, entries: &[Vec<Edge>], rec: &Trial
     }
 }
 
+/// Bench-owned test/benchmark harness for `multilayer_dfa` — the trial runner, readout, DFA signal, tasks,
+/// net builders, and liveness reports. Shared by this file's unit tests and `multilayer_dfa_bench.rs`.
+/// Test-only (`#[cfg(test)]`); it does NOT move to `wave_net` with the engine.
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod harness {
+    use super::{multilayer_dfa_step, Edge, EligParams, TrialRecords, PSI_WIDTH};
     use crate::wave_net::config::{Config, LayerConfig};
+    use crate::wave_net::critical_init::{forward_avalanche, layer_rates};
     use crate::wave_net::network::Network;
     use crate::wave_net::synapse::{key, mix, TopologyLevel};
     use std::sync::{Arc, Mutex};
 
-    const CUE_P: u64 = 0xC0E;
-    const P_DFA: u64 = 61; // fixed random DFA feedback (copied from rsnn — this file has no rsnn dep)
+    pub(crate) const CUE_P: u64 = 0xC0E;
+    pub(crate) const P_DFA: u64 = 61; // fixed random DFA feedback (copied from rsnn — no rsnn dep)
 
     /// Deterministic, class-distinct L0 spike pattern (~25% density), stable across waves.
-    fn cue_sites(task_seed: u64, size: u32, class: usize) -> Vec<u32> {
+    pub(crate) fn cue_sites(task_seed: u64, size: u32, class: usize) -> Vec<u32> {
         let ls = (size * size) as u32;
         (0..ls).filter(|&loc| mix(key(task_seed, loc, class as i32, 0, CUE_P)) & 3 == 0).collect()
     }
 
-    fn softmax2(z0: f32, z1: f32) -> (f32, f32) {
+    pub(crate) fn softmax2(z0: f32, z1: f32) -> (f32, f32) {
         let m = z0.max(z1);
         let (e0, e1) = ((z0 - m).exp(), (z1 - m).exp());
         let s = (e0 + e1).max(1e-30);
         (e0 / s, e1 / s)
     }
 
-    fn dfa_weight(seed: u64, neuron_global: u32, class: usize) -> f32 {
+    pub(crate) fn dfa_weight(seed: u64, neuron_global: u32, class: usize) -> f32 {
         if mix(key(seed, neuron_global, class as i32, 0, P_DFA)) & 1 == 1 { 1.0 } else { -1.0 }
     }
 
     /// Drive a cue sequence and record per-wave fired-sets + decide potential/eff for EVERY layer.
     /// Returns (top-layer read-window spike counts, records). Bench owns the trial.
-    fn run_trial(net: &mut Network, size: u32, classes: &[usize], task_seed: u64, present: usize, delay: usize, read: usize) -> (Vec<f32>, TrialRecords) {
+    pub(crate) fn run_trial(net: &mut Network, size: u32, classes: &[usize], task_seed: u64, present: usize, delay: usize, read: usize) -> (Vec<f32>, TrialRecords) {
         let l = net.layer_count();
         let ls = (size * size) as usize;
         let top = l - 1;
@@ -228,23 +232,23 @@ mod tests {
         (act, TrialRecords { spikes, pots, effs })
     }
 
-    struct TaskCfg {
-        size: u32,
-        present: usize,
-        delay: usize,
-        read: usize,
-        trials: usize,
-        holdout: usize,
-        readout_lr: f32,
-        hidden_lr: f32,
-        rate_reg: f32,
-        rate_target: f32,
-        elig: EligParams,
+    pub(crate) struct TaskCfg {
+        pub(crate) size: u32,
+        pub(crate) present: usize,
+        pub(crate) delay: usize,
+        pub(crate) read: usize,
+        pub(crate) trials: usize,
+        pub(crate) holdout: usize,
+        pub(crate) readout_lr: f32,
+        pub(crate) hidden_lr: f32,
+        pub(crate) rate_reg: f32,
+        pub(crate) rate_target: f32,
+        pub(crate) elig: EligParams,
     }
 
     /// Bench readout + DFA + rate_reg → `signal[tz][j]` (symmetric readout on top, random DFA deeper;
     /// per-neuron rate_reg on ALL layers — no rec_stab, per spec).
-    fn build_signal(rec: &TrialRecords, w: &[Vec<f32>], err: &[f32], seed: u64, l: usize, ls: usize, top: usize, cfg: &TaskCfg) -> Vec<Vec<f32>> {
+    pub(crate) fn build_signal(rec: &TrialRecords, w: &[Vec<f32>], err: &[f32], seed: u64, l: usize, ls: usize, top: usize, cfg: &TaskCfg) -> Vec<Vec<f32>> {
         let ttot = rec.spikes[top].len().max(1) as f32;
         let mut signal = vec![vec![0f32; ls]; l];
         for tz in 1..l {
@@ -264,7 +268,7 @@ mod tests {
     }
 
     /// Full training loop (bench-owned) over the engine step. Returns held-out accuracy permille.
-    fn train_and_eval(net: &mut Network, entries: &[Vec<Edge>], seed: u64, task_seed: u64, cfg: &TaskCfg, task: impl Fn(u64, usize) -> (Vec<usize>, usize)) -> u64 {
+    pub(crate) fn train_and_eval(net: &mut Network, entries: &[Vec<Edge>], seed: u64, task_seed: u64, cfg: &TaskCfg, task: impl Fn(u64, usize) -> (Vec<usize>, usize)) -> u64 {
         let l = net.layer_count();
         let ls = (cfg.size * cfg.size) as usize;
         let top = l - 1;
@@ -301,7 +305,7 @@ mod tests {
     }
 
     /// Feed-forward net of `layers` layers + matching `entries` (each layer but the top has one +1 edge).
-    fn make_ff(seed: u64, size: u32, layers: usize, up_count: u32, up_radius: u32, adapt_bump: i16, adapt_decay: u8) -> (Network, Vec<Vec<Edge>>) {
+    pub(crate) fn make_ff(seed: u64, size: u32, layers: usize, up_count: u32, up_radius: u32, adapt_bump: i16, adapt_decay: u8) -> (Network, Vec<Vec<Edge>>) {
         let lc = LayerConfig {
             topology: vec![TopologyLevel { level: 1, radius: up_radius, count: up_count }],
             leak: (3, 5),
@@ -319,18 +323,133 @@ mod tests {
         (net, entries)
     }
 
+    /// Multi-topology stack (3 layers) with a LEVEL-0 self-recurrence on the ACTIVE middle layer L1:
+    /// L0→L1(+1); L1 self(0) + →L2(+1); L2 read. L1 sits on the forward path (driven by L0), so its
+    /// recurrent edge reliably gets real eligibility.
+    pub(crate) fn make_hidden_rec(seed: u64, size: u32, uc: u32, ur: u32, n: u32, r: u32, adapt_bump: i16, adapt_decay: u8) -> (Network, Vec<Vec<Edge>>) {
+        let mk = |topology| LayerConfig {
+            topology,
+            leak: (3, 5),
+            cooldown_base: 2,
+            inhibitor_ratio: 0,
+            threshold_jitter: 32,
+            baseline_init: 6,
+            adapt_bump,
+            adapt_decay,
+        };
+        let layers = vec![
+            mk(vec![TopologyLevel { level: 1, radius: ur, count: uc }]),
+            mk(vec![TopologyLevel { level: 1, radius: ur, count: uc }, TopologyLevel { level: 0, radius: r, count: n }]),
+            mk(vec![]),
+        ];
+        let net = Network::new(Config { seed, size, layers });
+        let entries = vec![
+            vec![Edge { level: 1, count: uc as usize, radius: ur }],
+            vec![Edge { level: 1, count: uc as usize, radius: ur }, Edge { level: 0, count: n as usize, radius: r }],
+            vec![],
+        ];
+        (net, entries)
+    }
+
+    /// Backward-fed side-car (5 layers), mirroring `rsnn::engine_config_sidecar`'s topology ORDER exactly so
+    /// `entries` line up with `out_weights`: L0→L1(+1); L1→L3(+2 skip); L2 self(0)+ →L3(+1); L3 →L2(−1)+
+    /// →L4(+1); L4 read. Forward/skip path uses (uc, ur); the recurrent side-car uses its own (n, r).
+    pub(crate) fn make_sidecar(seed: u64, size: u32, uc: u32, ur: u32, n: u32, r: u32, adapt_bump: i16, adapt_decay: u8) -> (Network, Vec<Vec<Edge>>) {
+        let mk = |topology| LayerConfig {
+            topology,
+            leak: (3, 5),
+            cooldown_base: 2,
+            inhibitor_ratio: 0,
+            threshold_jitter: 32,
+            baseline_init: 6,
+            adapt_bump,
+            adapt_decay,
+        };
+        let layers = vec![
+            mk(vec![TopologyLevel { level: 1, radius: ur, count: uc }]),
+            mk(vec![TopologyLevel { level: 2, radius: ur, count: uc }]),
+            mk(vec![TopologyLevel { level: 0, radius: r, count: n }, TopologyLevel { level: 1, radius: r, count: n }]),
+            mk(vec![TopologyLevel { level: -1, radius: r, count: n }, TopologyLevel { level: 1, radius: ur, count: uc }]),
+            mk(vec![]),
+        ];
+        let net = Network::new(Config { seed, size, layers });
+        let entries = vec![
+            vec![Edge { level: 1, count: uc as usize, radius: ur }],
+            vec![Edge { level: 2, count: uc as usize, radius: ur }],
+            vec![Edge { level: 0, count: n as usize, radius: r }, Edge { level: 1, count: n as usize, radius: r }],
+            vec![Edge { level: -1, count: n as usize, radius: r }, Edge { level: 1, count: uc as usize, radius: ur }],
+            vec![],
+        ];
+        (net, entries)
+    }
+
     /// Single-cue 2-class task: present class c, label = c. Immediately separable (fast learning check).
-    fn single_task(seed: u64, t: usize) -> (Vec<usize>, usize) {
+    pub(crate) fn single_task(seed: u64, t: usize) -> (Vec<usize>, usize) {
         let c = (mix(key(seed, t as u32, 0, 0, 71)) & 1) as usize;
         (vec![c], c)
     }
 
     /// Temporal XOR: two cue bits (a, b), label = a XOR b.
-    fn xor_task(seed: u64, t: usize) -> (Vec<usize>, usize) {
+    pub(crate) fn xor_task(seed: u64, t: usize) -> (Vec<usize>, usize) {
         let a = (mix(key(seed, t as u32, 0, 0, 51)) & 1) as usize;
         let b = (mix(key(seed, t as u32, 0, 0, 53)) & 1) as usize;
         (vec![a, b], a ^ b)
     }
+
+    /// N-bit sequential parity: N deterministic cue bits, label = their XOR (non-monotone; needs memory).
+    pub(crate) fn task_parity(seed: u64, t: usize, n: usize) -> (Vec<usize>, usize) {
+        let bits: Vec<usize> = (0..n).map(|i| (mix(key(seed, t as u32, 0, i as u32, 51)) & 1) as usize).collect();
+        let label = bits.iter().fold(0usize, |a, &b| a ^ b);
+        (bits, label)
+    }
+
+    /// Default training config (size overridden by the caller). ALIF on; `rate_reg` liveness on all layers.
+    pub(crate) fn ff_cfg(trials: usize, hidden_lr: f32, elig_beta: f32) -> TaskCfg {
+        TaskCfg {
+            size: 8,
+            present: 6,
+            delay: 4,
+            read: 6,
+            trials,
+            holdout: 200,
+            readout_lr: 0.02,
+            hidden_lr,
+            rate_reg: 5.0,
+            rate_target: 0.1,
+            elig: EligParams { rec_tau: 6.0, elig_beta, elig_psi_width: PSI_WIDTH, use_bump: elig_beta != 0.0, adapt_decay: 6 },
+        }
+    }
+
+    /// Per-layer firing rate (fraction of neurons firing per wave) under random L0 drive — the substrate's
+    /// spiking-activity profile through depth. Mutates (drives) the net; weights are untouched.
+    pub(crate) fn per_layer_rates(net: &mut Network, drive_seed: u64) -> Vec<f64> {
+        layer_rates(net, drive_seed, 20000, 32, 96)
+    }
+
+    /// σ branching ratio: geometric per-hop growth of a single-spike avalanche through the computational
+    /// layers (>1 super-critical/grows, <1 sub-critical/dies, ≈1 critical), from `forward_avalanche`'s
+    /// per-layer footprint. Returns 0.0 if the avalanche is dead everywhere.
+    pub(crate) fn sigma_ratio(net: &mut Network, drive_seed: u64) -> f64 {
+        let fp = forward_avalanche(net, drive_seed, 20000, 16, 8, 1);
+        let l = fp.len();
+        let (mut logsum, mut n) = (0.0f64, 0usize);
+        for z in 1..l.saturating_sub(1) {
+            if fp[z] > 0.0 && fp[z + 1] > 0.0 {
+                logsum += (fp[z + 1] / fp[z]).ln();
+                n += 1;
+            }
+        }
+        if n == 0 { 0.0 } else { (logsum / n as f64).exp() }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::harness::*;
+    use super::*;
+    use crate::wave_net::config::{Config, LayerConfig};
+    use crate::wave_net::network::Network;
+    use crate::wave_net::synapse::TopologyLevel;
 
     // A 2-layer, radius-0, count-1 up net: target of source local i is local i above.
     fn tiny_net() -> Network {
@@ -430,22 +549,6 @@ mod tests {
         assert_eq!(rec1.effs, rec2.effs);
     }
 
-    fn ff_cfg(trials: usize, hidden_lr: f32, elig_beta: f32) -> TaskCfg {
-        TaskCfg {
-            size: 8,
-            present: 6,
-            delay: 4,
-            read: 6,
-            trials,
-            holdout: 200,
-            readout_lr: 0.02,
-            hidden_lr,
-            rate_reg: 5.0,
-            rate_target: 0.1,
-            elig: EligParams { rec_tau: 6.0, elig_beta, elig_psi_width: PSI_WIDTH, use_bump: elig_beta != 0.0, adapt_decay: 6 },
-        }
-    }
-
     #[test]
     fn multilayer_dfa_learns_separable_2class_above_chance() {
         // Deep (4-layer) FF net, generous fan-in (size 16, up_count 32) so every layer stays alive; a
@@ -487,35 +590,6 @@ mod tests {
         cfg.holdout = 400;
         let acc = train_and_eval(&mut net, &entries, seed, seed, &cfg, xor_task);
         assert!(acc > 640, "temporal XOR should train above chance: {acc}");
-    }
-
-    /// Multi-topology stack (3 layers) with a LEVEL-0 self-recurrence on the ACTIVE middle layer L1:
-    /// L0→L1(+1); L1 self(0) + →L2(+1); L2 read. L1 sits on the forward path (driven by L0), so — unlike the
-    /// side-car's backward-only-fed scratchpad — its recurrent edge reliably gets real eligibility. The
-    /// `entries` order mirrors each layer's built topology so slots line up with `out_weights`.
-    fn make_hidden_rec(seed: u64, size: u32, uc: u32, ur: u32, n: u32, r: u32, adapt_bump: i16, adapt_decay: u8) -> (Network, Vec<Vec<Edge>>) {
-        let mk = |topology| LayerConfig {
-            topology,
-            leak: (3, 5),
-            cooldown_base: 2,
-            inhibitor_ratio: 0,
-            threshold_jitter: 32,
-            baseline_init: 6,
-            adapt_bump,
-            adapt_decay,
-        };
-        let layers = vec![
-            mk(vec![TopologyLevel { level: 1, radius: ur, count: uc }]),
-            mk(vec![TopologyLevel { level: 1, radius: ur, count: uc }, TopologyLevel { level: 0, radius: r, count: n }]),
-            mk(vec![]),
-        ];
-        let net = Network::new(Config { seed, size, layers });
-        let entries = vec![
-            vec![Edge { level: 1, count: uc as usize, radius: ur }],
-            vec![Edge { level: 1, count: uc as usize, radius: ur }, Edge { level: 0, count: n as usize, radius: r }],
-            vec![],
-        ];
-        (net, entries)
     }
 
     #[test]
