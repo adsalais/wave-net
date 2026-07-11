@@ -161,7 +161,7 @@ across every benchmark and seed (a strict improvement, no downside).** Headline 
   rates and *erodes* the class signal → a non-monotonic accuracy collapse (transient at ~4 layers, permanent
   by ~12; ablation-confirmed rate_reg-driven). Mitigate with early-stopping / best-checkpoint (NOT yet built);
   compare at the *peak* of a duration sweep, never a fixed final trial count. Duration-swept multi-seed
-  benchmarks are how this became visible — see the benchmark convention below.**
+  benchmarks are how this became visible — see the benchmark convention below. Alternatives to try: anneal c_reg→0 as task error falls, or gate rate_reg off for neurons already at target rate. Left unimplemented.**
 - **ALIF adaptation is both a working memory *and* load-bearing for liveness.** It is a strong ~64-wave
   held-category memory (store-recall); it does **not** help linear echo (MC) or nonlinear temporal
   computation (XOR) feed-forward — LIF wins those short tasks — **but it is *necessary* for deep-FF
