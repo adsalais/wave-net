@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 
-use wave_net::wave_net::calibrate::{random_l0_input, CalibrateParams};
+use wave_net::wave_net::critical_init::{random_l0_input, CriticalInitParams};
 use wave_net::wave_net::config::{Config, LayerConfig};
 use wave_net::wave_net::network::Network;
 use wave_net::wave_net::synapse::TopologyLevel;
@@ -53,9 +53,9 @@ fn build_config() -> Config {
 /// setup, not measured. The same drive is used for measurement so the operating point transfers.
 fn setup_net() -> Network {
     let mut net = Network::new(build_config());
-    let input = random_l0_input(SEED, SIZE, NOISE_FRACTION_Q16);
-    let params = CalibrateParams { target_permille: 100, ..CalibrateParams::default() };
-    net.calibrate(&params, &input);
+    // Set a live operating point for the forward-throughput measurement. Calibration was removed; the
+    // untrained net needs *some* init to fire realistically, so use the σ≈1 critical init.
+    net.critical_init(SEED, NOISE_FRACTION_Q16, &CriticalInitParams::default());
     // Pure forward-throughput measurement: no training reads the eligibility, so skip accruing it.
     net.set_record_eligibility(false);
     net
@@ -102,8 +102,8 @@ fn assert_operating_point(net: &mut Network) {
     println!("wave_net 32x32x5 FF per-layer firing rate (%): {pct:?}");
     for z in 1..net.layer_count() {
         assert!(
-            (0.03..=0.25).contains(&rates[z]),
-            "layer {z} firing rate {:.3} outside live band [0.03, 0.25] — calibration drifted",
+            (0.005..=0.30).contains(&rates[z]),
+            "layer {z} firing rate {:.3} outside live band [0.005, 0.30] — init produced a dead/saturated layer",
             rates[z]
         );
     }

@@ -8,7 +8,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use wave_net::wave_net::calibrate::{random_l0_input, CalibrateParams};
+use wave_net::wave_net::critical_init::{random_l0_input, CriticalInitParams};
 use wave_net::wave_net::config::{Config, LayerConfig};
 use wave_net::wave_net::network::Network;
 use wave_net::wave_net::synapse::TopologyLevel;
@@ -57,7 +57,7 @@ fn main() {
     let config = Config { seed: SEED, size: SIZE, layers: vec![layer; LAYERS] };
     let mut net = Network::new(config);
     let input = random_l0_input(SEED, SIZE, NOISE_FRACTION_Q16);
-    net.calibrate(&CalibrateParams { target_permille: 100, ..CalibrateParams::default() }, &input);
+    net.critical_init(SEED, NOISE_FRACTION_Q16, &CriticalInitParams::default());
 
     let rates = measure_rates(&mut net, 32, 128, &input);
     let pct: Vec<f64> = rates.iter().map(|r| (r * 1000.0).round() / 10.0).collect();

@@ -143,3 +143,131 @@ layers), across couplings, an L3 self-loop, and forward/recurrence density tunin
 together**, and the **forward topology** (skip distances, where the side-car couples) is a large untested
 axis. **Immediate blocker → next step: engine performance optimization** (the single-threaded integer engine
 can't run these sweeps multi-seed at size ≥ 64), then resume the systematic scaling / forward-topology study.
+
+## Criticality init — homeostatic weight-training to σ≈1 (the calibration replacement; FF-validated)
+
+**Motivation.** Firing-rate `calibrate` is a brittle *init*: it tunes per-layer **baselines**, but a
+threshold only *gates* a fixed projection — it can't manufacture drive that never arrives, so on a
+sub-critical (cue-dies-with-depth) stack, lowering a starved layer's threshold to 1 still can't revive it.
+And rate is only a **loose proxy for σ** (branching ratio), the real order parameter. Replaced by a
+**homeostatic weight-training init** (`bench::critical_init`) — e-prop-style, layer-wise greedy bottom-up —
+that shapes the stored *weights* (the gain), not the thresholds.
+
+**σ diagnostic.** `forward_avalanche` — per-hop single-spike **damage spreading**, `footprint[z+1]/
+footprint[z]` = the forward branching ratio σ_hop (a *burst* of injected spikes cuts the ratio noise). The
+whole-network `sigma_probe` **accumulates across layers** and mis-reads FF criticality (reads σ>1
+everywhere from cross-layer accumulation); the per-hop measure is the right one for a feed-forward stack.
+
+**Findings (32×32×5 FF, single-entry level+1, `adapt_bump 5`; multi-seed where noted).**
+
+1. **Weight-training revives what calibration can't.** A rate-homeostatic e-prop init (`rate_reg_init`,
+   `Δw ∝ −(r_j − r_target)·pre_i·ψ_j`, greedy) revives a sub-critical stack to σ≈1 where calibration dies
+   with depth (up_count 16: forward avalanche *maintained* `0.6→0.5` vs calibration's `dies to 0`).
+   Confirms the pivot mechanism — **weights set gain/σ; thresholds only gate.** ALIF is load-bearing (LIF →
+   dead: no near-threshold ψ → no gradient). ψ is load-bearing *for the rate rule* (dropping it breaks
+   low-density revival).
+
+2. **σ is a density property; ALIF masks super-criticality.** σ is set by fan-out/radius; there is a
+   **critical density** (~up_count 16 at radius 3 *with trained weights* — lower than the ±1 forward-drive
+   threshold ~32, because trained gain reaches σ=1 at lower fan-out). Below → sub-critical; above →
+   super-critical. Crucially, **ALIF holds the rate at target while σ runs >1** — a rate-stable net can be
+   super-critical, and the rate proxy hides it (LIF at high density goes overtly super-critical instead).
+
+3. **rate ≠ σ off the critical density.** Rate-targeting → *flat rate* but *super-critical* σ at high
+   density; σ-targeting → *σ≈1* but a *decaying rate*. They **coincide only at the critical density**
+   (there the simple rate init gives both flat rate and σ≈1 for free).
+
+4. **Rate-free σ-init.** `sigma_eprop_init` drives σ_hop→1 with a per-synapse update `Δw ∝ −(σ_hop−1)·pre_i`
+   (rate emergent, *no set-point*). A uniform gain-*scaling* controller fails at high density — int8
+   weights are all-or-nothing near the quantization floor → oscillation between super-critical and dead;
+   the per-synapse update's `pre_i` heterogeneity thins weights smoothly and fixes it. The f32 latent
+   shadow crossing zero makes **sign-flip to inhibition** available (unused here — sparsifying excitation
+   reaches σ≤1 first — but it is the lever for the planned BitNet **ternary** path, where magnitude is fixed).
+
+5. **σ≈1 is the robust computational target (multi-seed × two tasks).** Intrinsic top-layer quality
+   (held-out nearest-centroid accuracy + effective-dim), 5 seeds. On the **linear pattern** task, σ-eprop
+   wins at *every* density and the flat-rate init **craters toward chance where it goes super-critical**
+   (uc24: flat 334‰ vs σ 798‰; chance 250‰) — a rate-stable super-critical net is *computationally dead*
+   for linear readout. On the **nonlinear spatial-XOR** task both tie well above chance (super-critical
+   chaos *helps* nonlinear mixing). Textbook edge-of-chaos: **σ≈1 maximizes linear separation; super-critical
+   favors nonlinear mixing; σ≈1 is the safe general target.**
+
+**End-to-end FF training gate (2026-07-11) — σ≈1 does NOT cleanly beat calibration on *trained readout*
+accuracy.** Deep (5-layer), width-32 FF, full multi-layer e-prop + trained readout, `critical_init` vs
+the calibration fallback, 3 seeds (chance 500‰):
+
+| up_count | calibration | critical_init |
+|---|---|---|
+| 8  | 830‰ | **1000‰** |
+| 12 | **1000‰** | 820‰ |
+| 16 | 1000‰ | 1000‰ |
+| 32 | 1000‰ | 982‰ |
+
+Two lessons: (1) **training compensates for a brittle init** — `rate_reg`/e-prop revives a
+calibration-starved deep stack, so both hit ceiling at up_count ≥ 16 (the init barely matters once you
+train). (2) **σ≈1 is not the right target for a *readout*-based objective** — its emergent *rate decays
+with depth*, so the top layer can be too **sparse** to read, and `critical_init` *regresses* at up_count 12
+(820 vs 1000). It wins only where calibration is genuinely un-revivable (up_count 8). **Consequence: the FF default was
+NOT flipped to `critical_init`** — it stays an available init (a decisive revive for un-trainable
+sub-critical stacks), calibration stays the default.
+
+**Follow-up (2026-07-11) — the regression is NOT a sparse-top problem; density is not the lever.** The
+initial diagnosis ("σ≈1's decaying rate leaves the top too sparse for the readout") was **wrong**. The
+pre-training per-layer rate profiles (5-layer, width 32) show σ-init actually keeps the **densest, most
+alive top** of the σ/calibration pair (uc32 σ = `[30.6, 10.0, 4.0, 3.9, 4.4]` vs calibration
+`[30.6, 6.0, 2.0, 0.6, 0.4]`, whose top is *dead* pre-training and only revived by training's `rate_reg`).
+To test density directly, a third init — `Network::rate_match_init` (drive each layer's rate to the layer
+below, `rate[z]→rate[z-1]`, via the same e-prop weight update; converged at rounds 100 / lr 0.15) —
+produces a **flat, dense, alive** profile everywhere (uc8 top **11%**, uc12 **15%**, uc32 **16%**), by far
+the densest of the three. Its trained accuracy: `[819, 832, 988, 992]‰` over uc `[8,12,16,32]` — the
+**worst or tied-worst almost everywhere**. Decisive point: at uc8 the *densest* init (rate-match, top 11%)
+trains to **819**, while the *sparsest* (σ-init, top 1%) trains to **1000**. So (1) the init's static rate
+profile does **not** predict trained accuracy, and (2) **denser is worse**, not better. The real substrate
+quality is **σ≈1 = optimal information propagation at the edge of chaos**, *not* firing rate: where the
+substrate is the bottleneck (uc8) σ=1 preserves the signal while an over-driven dense regime saturates it.
+Net: `rate_match_init` is a **confirmed dead end** for trained-readout accuracy; calibration stays the FF
+default, `critical_init` (σ≈1) stays the rescue init for un-revivable starved stacks.
+
+**Is calibration itself redundant with training? — No (`None`-init test, 2026-07-11).** A fourth init,
+`FfInit::None` (train from *raw* weights, no init pass, `rate_reg` only), added as a column to the gate:
+
+| up_count | none | calibration | σ-init | rate-match+ |
+|---|---|---|---|---|
+| 8  | 498 (chance) | 830 | **1000** | 819 |
+| 12 | 498 (chance) | **1000** | 820 | 832 |
+| 16 | 1000 | 1000 | 1000 | 988 |
+| 32 | 1000 | 1000 | 982 | 992 |
+
+`None` sits at **chance** at uc8/uc12 and only reaches 1000 at uc16/uc32. So training's `rate_reg` *cannot*
+bootstrap a raw stack at marginal fan-in — it needs calibration's threshold pre-pass to reach a trainable
+operating point first. This gives a clean **three-regime picture by substrate richness**: (1) **generous
+fan-in (uc16, 32)** — init is irrelevant, even `None` trains to 1000, calibration *is* redundant here; (2)
+**marginal fan-in (uc12)** — calibration is *decisive* (chance→perfect), `rate_reg` alone can't bootstrap
+raw weights; (3) **severe starvation (uc8)** — even calibration limps (830), σ≈1 is the unique rescue
+(1000). A standing puzzle: at uc12 the *more-alive* inits (σ-init, rate-match) train *worse* than
+calibration's dead-top init — "more firing at init" is not the good; calibration lands a specific operating
+point ideal for `rate_reg` training that the weight-only inits miss (cf. Pennington: forward liveness ≠ a
+trainable basin). Literature frame: untrained reservoirs (ESN/LSM) need edge-of-chaos init because the
+hidden weights are never trained (our uc8); trained RSNNs (Bellec e-prop/LSNN) rely on firing-rate
+regularization and treat init as a warm-start (our uc16/32); deep-FF signal-propagation theory
+(Poole/Schoenholz, Pennington) says criticality enables depth but normalization can substitute — all three
+consistent with the regimes above.
+
+**Final decision (2026-07-11) — calibration removed *entirely* (clean slate; supersedes "calibration stays
+the default" above).** Calibration had caused recurring headaches in the recurrent experiments, and the
+study above shows it only ever *bootstraps* a marginal-fan-in stack. So it was dropped wholesale from
+`wave_net`/`bench` (`Network::calibrate`, `CalibrateParams`, `bench/calibrate.rs`, `FfInit::Calibrate`, and
+every call site) — the **frozen `wave_state_machine` keeps its own `calibrate`, untouched**. The standing
+discipline (see `AGENTS.md` → *Initialization*): **feed-forward nets train from raw weights** under a
+contract of **generous fan-in + a liveness assert** (target the `up_count ≥ 16` regime where even raw
+`FfInit::None` trains to ceiling); `Network::critical_init` (σ≈1) is the **rescue** for forced-starved
+substrates and the operating-point setter for *untrained forward measurement* (throughput bench,
+`profile_wave`); `rate_match_init` is a documented dead end. Benchmarks that depended on a calibrated
+substrate (two e-prop learning tests, one characterization value) are `#[ignore]`d pending re-analysis from
+the calibration-free baseline.
+
+**Status.** FF-validated; **`sigma_eprop_init` (rate-free, σ≈1) is the keeper** and the intended calibration
+replacement. Recurrent criticality (the side-car *loop gain* — a separate quantity `sigma_probe(Some(z))`
+measures) is **not yet handled**: the greedy-FF structure doesn't map to the cyclic (L2↔L3) topology. That
+extension + validation on the recurrent benchmarks is required before it replaces calibration for recurrent
+configs; calibration is retained (downgraded to a bench tool) as the fallback until then.

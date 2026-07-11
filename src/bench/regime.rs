@@ -1,7 +1,7 @@
-//! Reservoir-regime diagnostic — measures properties of the calibrated-but-untrained reservoir to find
+//! Reservoir-regime diagnostic — measures properties of the untrained reservoir to find
 //! which predict learnability (V1 & V2b) and how topology couples to the other knobs. Bench-side, f64.
 
-use crate::bench::eprop::{calibrated_reservoir, pick_class, EpropConfig};
+use crate::bench::eprop::{pick_class, reservoir, EpropConfig};
 use crate::bench::readout::NearestCentroid;
 use crate::bench::store_recall::{cue_realization, probe_pattern};
 use crate::wave_state_machine::network::Network;
@@ -65,7 +65,7 @@ pub fn top_state(layered: &[Vec<u32>]) -> Vec<u32> {
 
 /// Collect `trials` top-layer reservoir states with their class labels (no training).
 pub fn collect_states(cfg: &EpropConfig, trials: usize) -> (Vec<Vec<u32>>, Vec<usize>) {
-    let mut net = calibrated_reservoir(cfg);
+    let mut net = reservoir(cfg);
     let mut states = Vec::with_capacity(trials);
     let mut labels = Vec::with_capacity(trials);
     for t in 0..trials {
@@ -174,7 +174,7 @@ pub fn as_f64(states: &[Vec<u32>]) -> Vec<Vec<f64>> {
 /// across noisy copies of one input (one class, different noise realizations). PR is the soft rank.
 pub fn kernel_minus_gen_rank(cfg: &EpropConfig) -> f64 {
     let m = 64usize;
-    let mut net = calibrated_reservoir(cfg);
+    let mut net = reservoir(cfg);
     let kernel: Vec<Vec<u32>> = (0..m)
         .map(|t| top_state(&reservoir_states(&mut net, cfg, pick_class(cfg.task_seed, t, cfg.k), t, &[])))
         .collect();
@@ -187,7 +187,7 @@ pub fn kernel_minus_gen_rank(cfg: &EpropConfig) -> f64 {
 /// divergence up the stack. (A single-site flip is too weak to register in these small integer nets.)
 pub fn perturbation_spread(cfg: &EpropConfig) -> f64 {
     use crate::wave_state_machine::synapse::{key, mix};
-    let mut net = calibrated_reservoir(cfg);
+    let mut net = reservoir(cfg);
     let ls = cfg.size * cfg.size;
     let nflip = (ls / 16).max(4);
     let mut sites: Vec<u32> = (0..nflip).map(|i| (mix(key(cfg.seed, i, 0, 0, 71)) % ls as u64) as u32).collect();
@@ -213,7 +213,7 @@ pub fn perturbation_spread(cfg: &EpropConfig) -> f64 {
 
 /// Mean firing fraction per computational layer over `trials` trials.
 pub fn layer_gain(cfg: &EpropConfig, trials: usize) -> Vec<f64> {
-    let mut net = calibrated_reservoir(cfg);
+    let mut net = reservoir(cfg);
     let ls = (cfg.size * cfg.size) as usize;
     let waves = (cfg.present_waves + cfg.delay + cfg.read_waves).max(1);
     let mut sum: Vec<f64> = Vec::new();
@@ -277,12 +277,7 @@ mod tests {
     use super::*;
 
     fn small() -> EpropConfig {
-        let mut cfg = EpropConfig::demo();
-        cfg.calib.warmup = 8;
-        cfg.calib.waves = 24;
-        cfg.calib.max_steps = 12;
-        cfg.calib.refine_passes = 2;
-        cfg
+        EpropConfig::demo()
     }
 
     fn dead_cfg() -> EpropConfig {

@@ -4,7 +4,6 @@
 
 use crate::bench::readout::RidgeReadout;
 use crate::bench::stream::{self, StreamParams};
-use crate::wave_state_machine::calibrate::{random_l0_input, CalibrateParams};
 use crate::wave_state_machine::network::Network;
 
 /// XOR of two bits held as f64 `0.0`/`1.0`.
@@ -30,7 +29,6 @@ pub struct XorConfig {
     pub taus: Vec<usize>,
     pub lambda: f64,
     pub train_frac_permille: u64,
-    pub calib: CalibrateParams,
     pub calib_fraction_q16: u32,
 }
 
@@ -53,7 +51,6 @@ impl XorConfig {
             taus: vec![1, 2, 4, 8],
             lambda: 1.0,
             train_frac_permille: 700,
-            calib: CalibrateParams { warmup: 16, waves: 48, max_steps: 24, refine_passes: 3, ..CalibrateParams::default() },
             calib_fraction_q16: 20000,
         }
     }
@@ -85,8 +82,6 @@ pub fn temporal_xor(cfg: &XorConfig, adapt_bump: i16, recurrent: bool) -> XorCur
         cfg.seed, cfg.size, cfg.layers, cfg.baseline_init, adapt_bump, cfg.adapt_decay,
         cfg.inhibitor_ratio, recurrent,
     ));
-    let input = random_l0_input(cfg.seed ^ 0x0AB1, cfg.size, cfg.calib_fraction_q16);
-    net.calibrate(&cfg.calib, &input);
     let (xs, us) = stream::collect_states(&mut net, &cfg.stream_params());
 
     let n = xs.len();

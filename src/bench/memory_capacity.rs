@@ -4,7 +4,6 @@
 
 use crate::bench::readout::RidgeReadout;
 use crate::bench::stream::{self, StreamParams};
-use crate::wave_state_machine::calibrate::{random_l0_input, CalibrateParams};
 use crate::wave_state_machine::config::Config;
 use crate::wave_state_machine::network::Network;
 
@@ -25,7 +24,6 @@ pub struct McConfig {
     pub k_lags: usize,
     pub lambda: f64,
     pub train_frac_permille: u64,
-    pub calib: CalibrateParams,
     pub calib_fraction_q16: u32,
 }
 
@@ -48,13 +46,6 @@ impl McConfig {
             k_lags: 20,
             lambda: 1.0,
             train_frac_permille: 700,
-            calib: CalibrateParams {
-                warmup: 16,
-                waves: 48,
-                max_steps: 24,
-                refine_passes: 3,
-                ..CalibrateParams::default()
-            },
             calib_fraction_q16: 20000,
         }
     }
@@ -109,8 +100,6 @@ fn r2(pred: &[f64], target: &[f64]) -> f64 {
 /// `u(t-k)`. `adapt_bump` selects ALIF (>0) vs LIF (0); `recurrent` selects the topology.
 pub fn memory_capacity(cfg: &McConfig, adapt_bump: i16, recurrent: bool) -> McCurve {
     let mut net = Network::new(cfg.engine_config(adapt_bump, recurrent));
-    let input = random_l0_input(cfg.seed ^ 0x3EC0, cfg.size, cfg.calib_fraction_q16);
-    net.calibrate(&cfg.calib, &input);
     let (xs, us) = stream::collect_states(&mut net, &cfg.stream_params());
 
     let n = xs.len();
@@ -154,8 +143,6 @@ mod tests {
         let cfg = McConfig::demo();
         let build = || {
             let mut net = Network::new(cfg.engine_config(cfg.adapt_bump, true));
-            let input = random_l0_input(cfg.seed ^ 0x3EC0, cfg.size, cfg.calib_fraction_q16);
-            net.calibrate(&cfg.calib, &input);
             stream::collect_states(&mut net, &cfg.stream_params())
         };
         let (xs, us) = build();

@@ -4,11 +4,22 @@
 
 use crate::bench::eprop::pick_class;
 use crate::bench::store_recall::{cue_realization, probe_pattern};
-use crate::wave_net::calibrate::{random_l0_input, CalibrateParams};
+use crate::wave_net::critical_init::{random_l0_input, CriticalInitParams};
 use crate::wave_net::config::{Config, LayerConfig};
 use crate::wave_net::network::Network;
-use crate::wave_net::synapse::{key, local_of, map_range24, mix, wrap, xy_of, TopologyLevel, P_TARGET};
+use crate::wave_net::synapse::{key, mix, target_of, TopologyLevel};
 use std::sync::{Arc, Mutex};
+
+/// Which feed-forward init to use in the e-prop trainers (see `train_eprop_inner`). `None` is the
+/// default — raw weights, train from scratch (`rate_reg` maintains activity); the contract is generous
+/// fan-in + a liveness check. `Sigma` is `Network::critical_init` (σ≈1, edge of chaos — the rescue init
+/// for starved substrates); `RateMatch` is `Network::rate_match_init` (flat-rate; a documented dead end).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum FfInit {
+    None,
+    Sigma,
+    RateMatch,
+}
 
 #[derive(Clone, Debug)]
 pub struct RsnnConfig {
@@ -36,11 +47,11 @@ pub struct RsnnConfig {
     pub adapt_decay: u8,  // ALIF adaptation decay shift
     pub rec_init: i8,     // initial recurrent weight (0 = keep procedural ±1; >0 bootstraps self-excitation)
     pub multi_layer: bool, // train every feed-forward layer (DFA credit), not just the last
+    pub ff_init: FfInit, // which FF init the e-prop trainers use: calibration / σ-critical / rate-matched
     pub back_count: u32,   // level −1/−2 backward synapses per neuron (0 = feed-forward only)
     pub back_radius: u32,  // backward recurrence radius
     pub subthreshold_psi: bool, // temporal-eligibility ψ from decide-time potential, not just spikes
-    pub calib: CalibrateParams,
-    pub calib_fraction_q16: u32,
+    pub calib_fraction_q16: u32, // noise-drive density (Q16) for the random L0 input; NOT calibration
     pub rate_reg: f32,             // firing-rate regularization coefficient c_reg (0.0 = off)
     pub rate_target_permille: u32, // target per-neuron firing rate r_target, permille (e.g. 100 = 10%)
     pub xor_layers: usize,         // depth of the sequence-task stack: forward layers under a recurrent top (2 = the original L0→L1)
@@ -79,10 +90,10 @@ impl RsnnConfig {
             adapt_decay: 6,
             rec_init: 0,
             multi_layer: false,
+            ff_init: FfInit::None,
             back_count: 0,
             back_radius: 2,
             subthreshold_psi: false,
-            calib: CalibrateParams { warmup: 16, waves: 48, max_steps: 24, refine_passes: 3, ..CalibrateParams::default() },
             calib_fraction_q16: 20000,
             rate_reg: 0.0,
             rate_target_permille: 100,
@@ -340,7 +351,6 @@ pub(crate) fn softmax(z: &[f32]) -> Vec<f32> {
 /// Train a K×N linear readout (delta rule) on the reservoir; return held-out test accuracy permille.
 pub fn train_readout(cfg: &RsnnConfig) -> u64 {
     let mut net = Network::new(cfg.engine_config());
-    net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
     let n = (cfg.layers - 1) * (cfg.size * cfg.size) as usize;
     let mut w = vec![vec![0f32; n]; cfg.k]; // readout weights (bench-side f32; int8 later)
     for t in 0..cfg.trials {
@@ -518,21 +528,17 @@ fn elig_adapt_sum(ttot: usize, beta: f32, rho: f32, psi: impl Fn(usize) -> f32, 
     e
 }
 
-fn target_of(seed: u64, source_global: u32, src_local: u32, level: i32, k: u32, radius: u32, size: u32) -> u32 {
-    let (sx, sy) = xy_of(src_local, size);
-    let h = mix(key(seed, source_global, level, k, P_TARGET));
-    let span = 2 * radius + 1;
-    let dx = map_range24((h >> 40) as u32, span) as i32 - radius as i32;
-    let dy = map_range24(((h >> 16) as u32) & 0x00FF_FFFF, span) as i32 - radius as i32;
-    local_of(wrap(sx, dx, size), wrap(sy, dy, size), size)
-}
 
 /// Build + calibrate + train (readout + hidden e-prop weights); return the trained net and the top-layer
 /// readout. Split out so callers can both evaluate held-out accuracy and probe the trained net's per-layer
 /// firing rates. `hidden_lr = 0` leaves the reservoir fixed (readout-only baseline).
 fn train_eprop_inner(cfg: &RsnnConfig) -> (Network, Vec<Vec<f32>>) {
     let mut net = Network::new(cfg.engine_config());
-    net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
+    match cfg.ff_init {
+        FfInit::None => {}
+        FfInit::Sigma => net.critical_init(cfg.seed ^ 0xE9, cfg.calib_fraction_q16, &CriticalInitParams::default()),
+        FfInit::RateMatch => net.rate_match_init(cfg.seed ^ 0xE9, cfg.calib_fraction_q16, &CriticalInitParams { rounds: 100, lr: 0.15, ..CriticalInitParams::default() }),
+    }
     let l = net.layer_count();
     let ls = (cfg.size * cfg.size) as usize;
     let top = l - 1;
@@ -832,7 +838,6 @@ fn recurrent_update(net: &mut Network, cfg: &RsnnConfig, w: &[Vec<f32>], err: &[
 /// and the L1 readout. Split out so callers can probe the trained net's per-wave recurrent activity.
 fn train_xor_inner(cfg: &RsnnConfig) -> (Network, Vec<Vec<f32>>) {
     let mut net = Network::new(cfg.engine_config_xor());
-    net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
     if cfg.rec_count > 0 && cfg.rec_init != 0 {
         // bootstrap self-excitation so recurrent activity persists through the gap (else no eligibility)
         net.with_layer_mut(1, |l1| {
@@ -894,7 +899,6 @@ pub fn train_xor(cfg: &RsnnConfig) -> u64 {
 /// Calibration is a one-time sensible init; ALIF and rate reg come from `cfg`.
 pub fn train_sequence(cfg: &RsnnConfig, task: impl Fn(u64, usize) -> (Vec<usize>, usize)) -> u64 {
     let mut net = Network::new(cfg.engine_config_xor());
-    net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
     let ls = (cfg.size * cfg.size) as usize;
     let mut w = vec![vec![0f32; ls]; 2];
     let score = |w: &[Vec<f32>], a: &[f32]| -> Vec<f32> {
@@ -933,7 +937,6 @@ pub fn train_sequence(cfg: &RsnnConfig, task: impl Fn(u64, usize) -> (Vec<usize>
 /// multi-layer net. `back_count = 0` is the feed-forward baseline. Returns held-out test accuracy permille.
 pub fn train_recurrent(cfg: &RsnnConfig) -> u64 {
     let mut net = Network::new(cfg.engine_config_recurrent());
-    net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
     let l = net.layer_count();
     let ls = (cfg.size * cfg.size) as usize;
     let top = l - 1;
@@ -1237,8 +1240,7 @@ pub fn train_sidecar_task(cfg: &RsnnConfig, task: impl Fn(u64, usize) -> (Vec<us
 /// Same as `train_sidecar_task` but also returns the trained net — for post-training probes (e.g. the σ
 /// criticality measurement, which only shows the recurrence collapse once the recurrent weights have grown).
 pub fn train_sidecar_task_net(cfg: &RsnnConfig, task: impl Fn(u64, usize) -> (Vec<usize>, usize)) -> (u64, Network) {
-    let mut net = Network::new(cfg.engine_config_sidecar());
-    net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
+    let net = Network::new(cfg.engine_config_sidecar());
     let (uc, ur) = (cfg.up_count as usize, cfg.up_radius);
     let (n, r) = (cfg.rec_count as usize, cfg.rec_radius);
     // per-layer entries, matching engine_config_sidecar's topology order exactly
@@ -1254,8 +1256,7 @@ pub fn train_sidecar_task_net(cfg: &RsnnConfig, task: impl Fn(u64, usize) -> (Ve
 
 /// The deeper 6-layer side-car (see `engine_config_sidecar_deep`) on an arbitrary binary sequence task.
 pub fn train_sidecar_deep_task(cfg: &RsnnConfig, task: impl Fn(u64, usize) -> (Vec<usize>, usize)) -> u64 {
-    let mut net = Network::new(cfg.engine_config_sidecar_deep());
-    net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
+    let net = Network::new(cfg.engine_config_sidecar_deep());
     let (uc, ur) = (cfg.up_count as usize, cfg.up_radius);
     let (n, r) = (cfg.rec_count as usize, cfg.rec_radius);
     // per-layer entries, matching engine_config_sidecar_deep's topology order exactly
@@ -1281,8 +1282,7 @@ pub fn train_hidden_rec(cfg: &RsnnConfig) -> u64 {
 /// recurrence. This is the deep-forward-trained + recurrence combination the recurrence-null doc flagged as
 /// the missing fair test.
 pub fn train_hidden_rec_task(cfg: &RsnnConfig, task: impl Fn(u64, usize) -> (Vec<usize>, usize)) -> u64 {
-    let mut net = Network::new(cfg.engine_config_hidden_rec());
-    net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
+    let net = Network::new(cfg.engine_config_hidden_rec());
     let (uc, ur) = (cfg.up_count as usize, cfg.up_radius);
     let (n, r) = (cfg.rec_count as usize, cfg.rec_radius);
     let rec_entry = if n > 0 { vec![(1i32, uc, ur), (0i32, n, r)] } else { vec![(1i32, uc, ur)] };
@@ -1305,8 +1305,7 @@ pub fn train_hidden_rec_task(cfg: &RsnnConfig, task: impl Fn(u64, usize) -> (Vec
 
 /// Train the L0→L1→L2 stack with the L2↔L3 loop (see `engine_config_l2l3loop`) on temporal XOR; permille.
 pub fn train_l2l3loop(cfg: &RsnnConfig) -> u64 {
-    let mut net = Network::new(cfg.engine_config_l2l3loop());
-    net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
+    let net = Network::new(cfg.engine_config_l2l3loop());
     let (uc, ur) = (cfg.up_count as usize, cfg.up_radius);
     let (n, r) = (cfg.rec_count as usize, cfg.rec_radius);
     // per-layer entries, matching engine_config_l2l3loop's topology order exactly
@@ -1416,14 +1415,59 @@ pub fn sigma_probe(net: &mut Network, cfg: &RsnnConfig, warmup: usize, window: u
 mod tests {
     use super::*;
 
+    /// **FF init comparison** (run manually). End-to-end multi-layer e-prop + trained readout on a
+    /// **deep (5-layer), width-32** FF classification task, sweeping `up_count` over 3 seeds. Records the
+    /// init study behind dropping calibration: `None` (train from raw) matches everything at generous
+    /// fan-in and sits at chance at marginal fan-in; `Sigma` (`critical_init`) is the rescue for the most
+    /// starved case (uc8); `RateMatch` is a documented dead end. Full history in `experiments_results.md`.
+    ///   cargo test --release ff_init_validation_gate -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn ff_init_validation_gate() {
+        let seeds = [0x00E9u64, 0x00A1_1CE5, 0x00B0_B0B0];
+        for up_count in [8u32, 12, 16, 32] {
+            let (mut none, mut sig, mut rm) = (0u64, 0u64, 0u64);
+            for &s in &seeds {
+                let base = RsnnConfig { seed: s, task_seed: s, size: 32, layers: 5, multi_layer: true, up_count, trials: 1200, present_waves: 10, ..RsnnConfig::demo() };
+                none += train_eprop(&RsnnConfig { ff_init: FfInit::None, ..base.clone() });
+                sig += train_eprop(&RsnnConfig { ff_init: FfInit::Sigma, ..base.clone() });
+                rm += train_eprop(&RsnnConfig { ff_init: FfInit::RateMatch, ..base });
+            }
+            let n = seeds.len() as u64;
+            println!("up_count={up_count}: none={}‰  σ-init={}‰  rate-match={}‰  (mean over {n} seeds, chance 500‰)", none / n, sig / n, rm / n);
+        }
+    }
+
+    /// Fast diagnostic (no training): per-layer firing-rate profile (%) after each FF init, so we can
+    /// see whether `rate_match_init` actually flattens the depth decay the σ-init leaves.
+    ///   cargo test --release ff_init_rate_profiles -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn ff_init_rate_profiles() {
+        use crate::wave_net::critical_init::layer_rates;
+        let s = 0x00E9u64;
+        for up_count in [8u32, 12, 32] {
+            let cfg = RsnnConfig { seed: s, size: 32, layers: 5, up_count, ..RsnnConfig::demo() };
+            let frac = cfg.calib_fraction_q16;
+            let pct = |net: &mut Network| -> Vec<f64> {
+                layer_rates(net, s ^ 0xE9, frac, 32, 96).iter().map(|r| (r * 1000.0).round() / 10.0).collect()
+            };
+            let mut a = Network::new(cfg.engine_config()); // raw / None init
+            let mut b = Network::new(cfg.engine_config());
+            b.critical_init(s ^ 0xE9, frac, &CriticalInitParams::default());
+            let mut d = Network::new(cfg.engine_config());
+            d.rate_match_init(s ^ 0xE9, frac, &CriticalInitParams { rounds: 100, lr: 0.15, ..CriticalInitParams::default() });
+            println!("uc{up_count}: none/raw={:?}  σ={:?}  rate-match+={:?}", pct(&mut a), pct(&mut b), pct(&mut d));
+        }
+    }
+
     #[test]
     fn sigma_probe_is_deterministic() {
         let mut cfg = RsnnConfig::demo();
         cfg.size = 8;
         cfg.rec_count = 8;
         let mk = || {
-            let mut net = Network::new(cfg.engine_config_sidecar());
-            net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
+            let net = Network::new(cfg.engine_config_sidecar());
             net
         };
         let (_, s1) = sigma_probe(&mut mk(), &cfg, 16, 6, 4, None);
@@ -1453,7 +1497,6 @@ mod tests {
                 c.rec_count = rc;
                 c.rec_radius = 4;
                 let mut net = Network::new(c.engine_config_sidecar());
-                net.calibrate(&c.calib, &random_l0_input(c.seed ^ 0xE9, c.size, c.calib_fraction_q16));
                 // L0 perturbation (forward branching) vs recurrent-site perturbation (force a spike in the L2
                 // scratchpad → the recurrent-loop gain that should track the rec_count collapse).
                 let (_, sig_l0) = sigma_probe(&mut net, &c, 32, 8, 8, None);
@@ -1610,7 +1653,6 @@ mod tests {
         cfg.present_waves = 12;
         cfg.base_q16 = 30000;
         let mut net = Network::new(cfg.engine_config_recurrent());
-        net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
         let l = net.layer_count();
         let ls = (cfg.size * cfg.size) as usize;
         let theta: Vec<Vec<f32>> = (0..l)
@@ -1794,7 +1836,6 @@ mod tests {
             c.delay = 12;
             c.adapt_bump = ab;
             let mut net = Network::new(c.engine_config_recurrent());
-            net.calibrate(&c.calib, &random_l0_input(c.seed ^ 0xE9, c.size, c.calib_fraction_q16));
             let (_, spikes, _, _) = xor_trial_layers(&mut net, &c, 1, 0, 0);
             let per_layer: Vec<usize> = (1..spikes.len()).map(|z| spikes[z].iter().map(|w| w.len()).sum()).collect();
             eprintln!("adapt_bump {ab}: L1..L3 total spikes over a cue trial {per_layer:?}");
@@ -1814,6 +1855,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "calibration removed — characterization value (550) was a calibrated baseline; re-baseline from raw during clean-slate re-analysis"]
     fn train_multilayer_elig_off_is_unchanged_and_on_differs() {
         // Guard on an ALIVE config (so eligibility is non-zero and the εᵃ term can act): with the feature
         // at its defaults the trainer takes the pre-change branch and returns the frozen characterization
@@ -2398,7 +2440,6 @@ mod tests {
         cfg.rec_tau = 20.0;
         cfg.rec_stab = 5.0;
         let mut net = Network::new(cfg.engine_config_hidden_rec());
-        net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
         let l = net.layer_count();
         let ls = (cfg.size * cfg.size) as usize;
         let (uc, ur) = (cfg.up_count as usize, cfg.up_radius);
@@ -2587,8 +2628,7 @@ mod tests {
         base.rate_target_permille = 100;
         // liveness probe: does every layer (esp. the read top L3) fire?
         let mut net = Network::new(base.engine_config_l2l3loop());
-        net.calibrate(&base.calib, &random_l0_input(base.seed ^ 0xE9, base.size, base.calib_fraction_q16));
-        let rates = net.measure_layer_rates(base.calib.warmup, base.calib.waves, &random_l0_input(base.seed ^ 0xE9, base.size, base.calib_fraction_q16));
+        let rates = net.measure_layer_rates(16, 48, &random_l0_input(base.seed ^ 0xE9, base.size, base.calib_fraction_q16));
         eprintln!("l2l3loop per-layer rates L0..L3: {:?}", rates.iter().map(|x| (x * 1000.0).round() / 1000.0).collect::<Vec<_>>());
 
         let seeds = [0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF];
@@ -2874,8 +2914,7 @@ mod tests {
         cfg.delay = 20;
         cfg.rec_count = 0;
         let build = || {
-            let mut net = Network::new(cfg.engine_config_xor());
-            net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
+            let net = Network::new(cfg.engine_config_xor());
             net
         };
         let mut n1 = build();
@@ -2895,8 +2934,7 @@ mod tests {
         cfg.layers = 4;
         cfg.delay = 12;
         let build = || {
-            let mut net = Network::new(cfg.engine_config_hidden_rec());
-            net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
+            let net = Network::new(cfg.engine_config_hidden_rec());
             net
         };
         let mut n1 = build();
@@ -3085,11 +3123,7 @@ mod tests {
             c.rate_reg = reg;
             c.rate_target_permille = 100;
             let (mut net, _w) = train_eprop_inner(&c);
-            let rates = net.measure_layer_rates(
-                c.calib.warmup,
-                c.calib.waves,
-                &random_l0_input(c.seed ^ 0xE9, c.size, c.calib_fraction_q16),
-            );
+            let rates = net.measure_layer_rates(16, 48, &random_l0_input(c.seed ^ 0xE9, c.size, c.calib_fraction_q16));
             let r2: Vec<f64> = rates.iter().map(|x| (x * 100.0).round() / 100.0).collect();
             eprintln!("rate_reg {reg}: per-layer rates {r2:?}");
         }

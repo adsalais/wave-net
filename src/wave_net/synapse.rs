@@ -85,6 +85,18 @@ pub fn wrap(base: u32, off: i32, size: u32) -> u32 {
     ((base as i32 + off) as u32) & (size - 1)
 }
 
+/// Target local of one synapse (source `src_local`, topology `level`, slot `k`, `radius`) — the same
+/// hash `generate_into` uses to scatter. Lets a learning rule recover a synapse's target without
+/// re-scattering (the e-prop weight update indexes weights by this).
+pub fn target_of(seed: u64, source_global: u32, src_local: u32, level: i32, k: u32, radius: u32, size: u32) -> u32 {
+    let (sx, sy) = xy_of(src_local, size);
+    let h = mix(key(seed, source_global, level, k, P_TARGET));
+    let span = 2 * radius + 1;
+    let dx = map_range24((h >> 40) as u32, span) as i32 - radius as i32;
+    let dy = map_range24(((h >> 16) as u32) & 0x00FF_FFFF, span) as i32 - radius as i32;
+    local_of(wrap(sx, dx, size), wrap(sy, dy, size), size)
+}
+
 /// Append one firing neuron's outgoing synapses **directly** into the per-layer `deliveries`
 /// buffers, resolved to the **absolute** target layer (`source_layer + entry.level`). Relative
 /// levels landing outside `[0, deliveries.len())` are dropped (as the toroidal-in-depth boundary).
