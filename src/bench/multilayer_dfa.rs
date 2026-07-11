@@ -132,6 +132,25 @@ pub fn temporal_eligibility(net: &Network, entries: &[Vec<Edge>], rec: &TrialRec
     out
 }
 
+/// One training step: build the temporal eligibility from `rec`, then update **every** trainable edge via
+/// `Network::eprop_update_synaptic` with the caller-supplied per-target-layer `signal` (`signal[tz][j]`).
+/// Edges whose target is off-stack or into L0 (`tz ∉ [1, L−1]`) are skipped (untrainable). Requantising the
+/// source layer once per edge is equivalent to accumulating then requantising once.
+pub fn multilayer_dfa_step(net: &mut Network, entries: &[Vec<Edge>], rec: &TrialRecords, signal: &[Vec<f32>], lr: f32, p: &EligParams) {
+    let l = net.layer_count();
+    let elig = temporal_eligibility(net, entries, rec, p);
+    for z in 0..l {
+        for (e_idx, edge) in entries[z].iter().enumerate() {
+            let tz_i = z as i32 + edge.level;
+            if tz_i < 1 || tz_i as usize >= l {
+                continue;
+            }
+            let tz = tz_i as usize;
+            net.eprop_update_synaptic(z, e_idx, &elig[z][e_idx], &signal[tz], lr);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,5 +214,21 @@ mod tests {
         let ea = temporal_eligibility(&net, &entries, &rec, &adapt);
         assert_eq!(e0a, e0b, "eligibility must be deterministic");
         assert!(ea[0][0] != e0a[0][0], "β>0 (ALIF εᵃ) must change the eligibility");
+    }
+
+    #[test]
+    fn multilayer_dfa_step_raises_weights_on_negative_signal() {
+        let mut net = tiny_net();
+        let ls = 16;
+        let rec = dense_records(ls, 2, 3);
+        let entries = vec![vec![Edge { level: 1, count: 1, radius: 0 }], vec![]];
+        // signal into the top layer (tz = 1) is negative → weights should rise (fire more).
+        let signal = vec![vec![0.0f32; ls], vec![-1.0f32; ls]];
+        let p = EligParams { rec_tau: 4.0, elig_beta: 0.0, elig_psi_width: PSI_WIDTH, use_bump: false, adapt_decay: 6 };
+        let before: f32 = net.with_layer(0, |lz| lz.out_shadow.iter().sum());
+        multilayer_dfa_step(&mut net, &entries, &rec, &signal, 0.02, &p);
+        let after: f32 = net.with_layer(0, |lz| lz.out_shadow.iter().sum());
+        // Δ per synapse = -lr·signal·e = -0.02·(-1)·5.0625 > 0
+        assert!(after > before + 1.0, "negative signal + positive eligibility must raise layer-0 weights: {before} -> {after}");
     }
 }
