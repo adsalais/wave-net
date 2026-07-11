@@ -4,7 +4,7 @@
 
 use crate::bench::eprop::pick_class;
 use crate::bench::store_recall::{cue_realization, probe_pattern};
-use crate::wave_net::calibrate::CalibrateParams;
+use crate::bench::calibrate::{calibrate, CalibrateParams};
 use crate::wave_net::critical_init::random_l0_input;
 use crate::wave_net::config::{Config, LayerConfig};
 use crate::wave_net::network::Network;
@@ -341,7 +341,7 @@ pub(crate) fn softmax(z: &[f32]) -> Vec<f32> {
 /// Train a K×N linear readout (delta rule) on the reservoir; return held-out test accuracy permille.
 pub fn train_readout(cfg: &RsnnConfig) -> u64 {
     let mut net = Network::new(cfg.engine_config());
-    net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
+    calibrate(&mut net, &cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
     let n = (cfg.layers - 1) * (cfg.size * cfg.size) as usize;
     let mut w = vec![vec![0f32; n]; cfg.k]; // readout weights (bench-side f32; int8 later)
     for t in 0..cfg.trials {
@@ -525,7 +525,7 @@ fn elig_adapt_sum(ttot: usize, beta: f32, rho: f32, psi: impl Fn(usize) -> f32, 
 /// firing rates. `hidden_lr = 0` leaves the reservoir fixed (readout-only baseline).
 fn train_eprop_inner(cfg: &RsnnConfig) -> (Network, Vec<Vec<f32>>) {
     let mut net = Network::new(cfg.engine_config());
-    net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
+    calibrate(&mut net, &cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
     let l = net.layer_count();
     let ls = (cfg.size * cfg.size) as usize;
     let top = l - 1;
@@ -825,7 +825,7 @@ fn recurrent_update(net: &mut Network, cfg: &RsnnConfig, w: &[Vec<f32>], err: &[
 /// and the L1 readout. Split out so callers can probe the trained net's per-wave recurrent activity.
 fn train_xor_inner(cfg: &RsnnConfig) -> (Network, Vec<Vec<f32>>) {
     let mut net = Network::new(cfg.engine_config_xor());
-    net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
+    calibrate(&mut net, &cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
     if cfg.rec_count > 0 && cfg.rec_init != 0 {
         // bootstrap self-excitation so recurrent activity persists through the gap (else no eligibility)
         net.with_layer_mut(1, |l1| {
@@ -887,7 +887,7 @@ pub fn train_xor(cfg: &RsnnConfig) -> u64 {
 /// Calibration is a one-time sensible init; ALIF and rate reg come from `cfg`.
 pub fn train_sequence(cfg: &RsnnConfig, task: impl Fn(u64, usize) -> (Vec<usize>, usize)) -> u64 {
     let mut net = Network::new(cfg.engine_config_xor());
-    net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
+    calibrate(&mut net, &cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
     let ls = (cfg.size * cfg.size) as usize;
     let mut w = vec![vec![0f32; ls]; 2];
     let score = |w: &[Vec<f32>], a: &[f32]| -> Vec<f32> {
@@ -926,7 +926,7 @@ pub fn train_sequence(cfg: &RsnnConfig, task: impl Fn(u64, usize) -> (Vec<usize>
 /// multi-layer net. `back_count = 0` is the feed-forward baseline. Returns held-out test accuracy permille.
 pub fn train_recurrent(cfg: &RsnnConfig) -> u64 {
     let mut net = Network::new(cfg.engine_config_recurrent());
-    net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
+    calibrate(&mut net, &cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
     let l = net.layer_count();
     let ls = (cfg.size * cfg.size) as usize;
     let top = l - 1;
@@ -1231,7 +1231,7 @@ pub fn train_sidecar_task(cfg: &RsnnConfig, task: impl Fn(u64, usize) -> (Vec<us
 /// criticality measurement, which only shows the recurrence collapse once the recurrent weights have grown).
 pub fn train_sidecar_task_net(cfg: &RsnnConfig, task: impl Fn(u64, usize) -> (Vec<usize>, usize)) -> (u64, Network) {
     let mut net = Network::new(cfg.engine_config_sidecar());
-    net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
+    calibrate(&mut net, &cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
     let (uc, ur) = (cfg.up_count as usize, cfg.up_radius);
     let (n, r) = (cfg.rec_count as usize, cfg.rec_radius);
     // per-layer entries, matching engine_config_sidecar's topology order exactly
@@ -1248,7 +1248,7 @@ pub fn train_sidecar_task_net(cfg: &RsnnConfig, task: impl Fn(u64, usize) -> (Ve
 /// The deeper 6-layer side-car (see `engine_config_sidecar_deep`) on an arbitrary binary sequence task.
 pub fn train_sidecar_deep_task(cfg: &RsnnConfig, task: impl Fn(u64, usize) -> (Vec<usize>, usize)) -> u64 {
     let mut net = Network::new(cfg.engine_config_sidecar_deep());
-    net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
+    calibrate(&mut net, &cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
     let (uc, ur) = (cfg.up_count as usize, cfg.up_radius);
     let (n, r) = (cfg.rec_count as usize, cfg.rec_radius);
     // per-layer entries, matching engine_config_sidecar_deep's topology order exactly
@@ -1275,7 +1275,7 @@ pub fn train_hidden_rec(cfg: &RsnnConfig) -> u64 {
 /// the missing fair test.
 pub fn train_hidden_rec_task(cfg: &RsnnConfig, task: impl Fn(u64, usize) -> (Vec<usize>, usize)) -> u64 {
     let mut net = Network::new(cfg.engine_config_hidden_rec());
-    net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
+    calibrate(&mut net, &cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
     let (uc, ur) = (cfg.up_count as usize, cfg.up_radius);
     let (n, r) = (cfg.rec_count as usize, cfg.rec_radius);
     let rec_entry = if n > 0 { vec![(1i32, uc, ur), (0i32, n, r)] } else { vec![(1i32, uc, ur)] };
@@ -1299,7 +1299,7 @@ pub fn train_hidden_rec_task(cfg: &RsnnConfig, task: impl Fn(u64, usize) -> (Vec
 /// Train the L0→L1→L2 stack with the L2↔L3 loop (see `engine_config_l2l3loop`) on temporal XOR; permille.
 pub fn train_l2l3loop(cfg: &RsnnConfig) -> u64 {
     let mut net = Network::new(cfg.engine_config_l2l3loop());
-    net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
+    calibrate(&mut net, &cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
     let (uc, ur) = (cfg.up_count as usize, cfg.up_radius);
     let (n, r) = (cfg.rec_count as usize, cfg.rec_radius);
     // per-layer entries, matching engine_config_l2l3loop's topology order exactly
@@ -1416,7 +1416,7 @@ mod tests {
         cfg.rec_count = 8;
         let mk = || {
             let mut net = Network::new(cfg.engine_config_sidecar());
-            net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
+            calibrate(&mut net, &cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
             net
         };
         let (_, s1) = sigma_probe(&mut mk(), &cfg, 16, 6, 4, None);
@@ -1446,7 +1446,7 @@ mod tests {
                 c.rec_count = rc;
                 c.rec_radius = 4;
                 let mut net = Network::new(c.engine_config_sidecar());
-                net.calibrate(&c.calib, &random_l0_input(c.seed ^ 0xE9, c.size, c.calib_fraction_q16));
+                calibrate(&mut net, &c.calib, &random_l0_input(c.seed ^ 0xE9, c.size, c.calib_fraction_q16));
                 // L0 perturbation (forward branching) vs recurrent-site perturbation (force a spike in the L2
                 // scratchpad → the recurrent-loop gain that should track the rec_count collapse).
                 let (_, sig_l0) = sigma_probe(&mut net, &c, 32, 8, 8, None);
@@ -1603,7 +1603,7 @@ mod tests {
         cfg.present_waves = 12;
         cfg.base_q16 = 30000;
         let mut net = Network::new(cfg.engine_config_recurrent());
-        net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
+        calibrate(&mut net, &cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
         let l = net.layer_count();
         let ls = (cfg.size * cfg.size) as usize;
         let theta: Vec<Vec<f32>> = (0..l)
@@ -1787,7 +1787,7 @@ mod tests {
             c.delay = 12;
             c.adapt_bump = ab;
             let mut net = Network::new(c.engine_config_recurrent());
-            net.calibrate(&c.calib, &random_l0_input(c.seed ^ 0xE9, c.size, c.calib_fraction_q16));
+            calibrate(&mut net, &c.calib, &random_l0_input(c.seed ^ 0xE9, c.size, c.calib_fraction_q16));
             let (_, spikes, _, _) = xor_trial_layers(&mut net, &c, 1, 0, 0);
             let per_layer: Vec<usize> = (1..spikes.len()).map(|z| spikes[z].iter().map(|w| w.len()).sum()).collect();
             eprintln!("adapt_bump {ab}: L1..L3 total spikes over a cue trial {per_layer:?}");
@@ -2391,7 +2391,7 @@ mod tests {
         cfg.rec_tau = 20.0;
         cfg.rec_stab = 5.0;
         let mut net = Network::new(cfg.engine_config_hidden_rec());
-        net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
+        calibrate(&mut net, &cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
         let l = net.layer_count();
         let ls = (cfg.size * cfg.size) as usize;
         let (uc, ur) = (cfg.up_count as usize, cfg.up_radius);
@@ -2580,7 +2580,7 @@ mod tests {
         base.rate_target_permille = 100;
         // liveness probe: does every layer (esp. the read top L3) fire?
         let mut net = Network::new(base.engine_config_l2l3loop());
-        net.calibrate(&base.calib, &random_l0_input(base.seed ^ 0xE9, base.size, base.calib_fraction_q16));
+        calibrate(&mut net, &base.calib, &random_l0_input(base.seed ^ 0xE9, base.size, base.calib_fraction_q16));
         let rates = net.measure_layer_rates(base.calib.warmup, base.calib.waves, &random_l0_input(base.seed ^ 0xE9, base.size, base.calib_fraction_q16));
         eprintln!("l2l3loop per-layer rates L0..L3: {:?}", rates.iter().map(|x| (x * 1000.0).round() / 1000.0).collect::<Vec<_>>());
 
@@ -2868,7 +2868,7 @@ mod tests {
         cfg.rec_count = 0;
         let build = || {
             let mut net = Network::new(cfg.engine_config_xor());
-            net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
+            calibrate(&mut net, &cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
             net
         };
         let mut n1 = build();
@@ -2889,7 +2889,7 @@ mod tests {
         cfg.delay = 12;
         let build = || {
             let mut net = Network::new(cfg.engine_config_hidden_rec());
-            net.calibrate(&cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
+            calibrate(&mut net, &cfg.calib, &random_l0_input(cfg.seed ^ 0xE9, cfg.size, cfg.calib_fraction_q16));
             net
         };
         let mut n1 = build();

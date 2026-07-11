@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 
-use wave_net::wave_net::calibrate::CalibrateParams;
+use wave_net::bench::calibrate::{calibrate, CalibrateParams};
 use wave_net::wave_net::critical_init::random_l0_input;
 use wave_net::wave_net::config::{Config, LayerConfig};
 use wave_net::wave_net::network::Network;
@@ -56,7 +56,7 @@ fn setup_net() -> Network {
     let mut net = Network::new(build_config());
     let input = random_l0_input(SEED, SIZE, NOISE_FRACTION_Q16);
     let params = CalibrateParams { target_permille: 100, ..CalibrateParams::default() };
-    net.calibrate(&params, &input);
+    calibrate(&mut net, &params, &input);
     // Pure forward-throughput measurement: no training reads the eligibility, so skip accruing it.
     net.set_record_eligibility(false);
     net

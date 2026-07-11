@@ -131,3 +131,16 @@ impl Network {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn random_input_hits_expected_fraction() {
+        let input = random_l0_input(1, 8, 32768); // ~50%
+        let total: usize = (0..200).map(|w| input(w).len()).sum();
+        let frac = total as f64 / (200 * 64) as f64;
+        assert!((frac - 0.5).abs() < 0.05, "fraction {frac} != ~0.5");
+    }
+}
