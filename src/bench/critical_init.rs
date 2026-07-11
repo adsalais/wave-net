@@ -167,22 +167,22 @@ pub fn forward_avalanche(net: &mut Network, drive_seed: u64, drive_frac_q16: u32
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wave_net::calibrate::CalibrateParams;
     use crate::wave_net::config::{Config, LayerConfig};
     use crate::wave_net::synapse::TopologyLevel;
 
     const SEED: u64 = 0xC0FFEE_1234_5678;
 
-    /// The 32×32 × 5 uniform feed-forward config, parameterized by forward fan-out.
-    fn ff_config(up_count: u32) -> Config {
+    /// The 32×32 × 5 uniform feed-forward config, parameterized by forward fan-out `up_count`, spatial
+    /// `up_radius`, and `adapt_bump` (0 = LIF, >0 = ALIF).
+    fn ff_config(up_count: u32, up_radius: u32, adapt_bump: i16) -> Config {
         let layer = LayerConfig {
-            topology: vec![TopologyLevel { level: 1, radius: 3, count: up_count }],
+            topology: vec![TopologyLevel { level: 1, radius: up_radius, count: up_count }],
             leak: (3, 5),
             cooldown_base: 2,
             inhibitor_ratio: 0,
             threshold_jitter: 32,
             baseline_init: 6,
-            adapt_bump: 5,
+            adapt_bump,
             adapt_decay: 6,
         };
         Config { seed: SEED, size: 32, layers: vec![layer; 5] }
@@ -223,37 +223,42 @@ mod tests {
         assert!(after > before + 0.02, "rate-init should revive the top layer: {before:.3} -> {after:.3}");
     }
 
-    /// Experiment (run manually): calibration vs rate-init resulting regime AND criticality σ, on a
-    /// propagating config (up_count 32) and the config where calibration fails (up_count 16). σ is the
-    /// forward-avalanche branching ratio (perturb_layer=None, window=4 = the L1→L4 hops): σ<1 = the
-    /// cue dies with depth, σ≈1 = critical. Tests whether the flat rate regime is *actually* critical.
-    ///   cargo test --release critical_init_vs_calibration -- --ignored --nocapture
+    /// Experiment (run manually): does rate-init reach criticality (σ≈1), and how does **density**
+    /// (fan-out `up_count`, spatial `up_radius`) + **ALIF** affect it? For each config: rate-init, then
+    /// measure per-layer rate and the per-hop forward-avalanche footprint. σ_hop = footprint[k+1]/[k]:
+    /// ≈1 critical, <1 the cue dies with depth, >1 super-critical. Hypothesis under test: ALIF holds
+    /// the *rate* at target while high density lets *branching* (σ) run >1 — i.e. adaptation masks a
+    /// density-driven super-criticality that the rate alone can't see.
+    ///   cargo test --release rate_init_criticality_vs_density -- --ignored --nocapture
     #[test]
     #[ignore]
-    fn critical_init_vs_calibration() {
-        let calib = CalibrateParams { target_permille: 100, ..CalibrateParams::default() };
+    fn rate_init_criticality_vs_density() {
         let init = CriticalInitParams::default();
-        // per-hop σ_k = footprint[k+1]/footprint[k] over the forward hops (skip footprint[0]=L0).
         let hops = |f: &[f64]| -> Vec<f64> {
             (1..f.len() - 1).map(|z| if f[z] > 0.0 { (f[z + 1] / f[z] * 100.0).round() / 100.0 } else { 0.0 }).collect()
         };
         let fp = |f: &[f64]| f[1..].iter().map(|x| (x * 10.0).round() / 10.0).collect::<Vec<_>>();
-        for up_count in [16u32, 32] {
-            let cfg = ff_config(up_count);
+        let mut run = |up_count: u32, up_radius: u32, adapt_bump: i16| {
             let input = random_l0_input(SEED, 32, 20000);
-
-            let mut a = Network::new(cfg.clone());
-            a.calibrate(&calib, &input);
-            let ra = a.measure_layer_rates(32, 128, &input);
-            let fa = forward_avalanche(&mut a, SEED ^ 0xABCD, 20000, 32, 16);
-
-            let mut b = Network::new(cfg);
-            rate_reg_init(&mut b, SEED, &init, &input);
-            let rb = b.measure_layer_rates(32, 128, &input);
-            let fb = forward_avalanche(&mut b, SEED ^ 0xABCD, 20000, 32, 16);
-
-            println!("up_count={up_count}: calibration   rates={:?} footprint(L1..){:?} σ_hop{:?}", pct(&ra), fp(&fa), hops(&fa));
-            println!("up_count={up_count}: rate_reg_init rates={:?} footprint(L1..){:?} σ_hop{:?}", pct(&rb), fp(&fb), hops(&fb));
+            let mut net = Network::new(ff_config(up_count, up_radius, adapt_bump));
+            rate_reg_init(&mut net, SEED, &init, &input);
+            let r = net.measure_layer_rates(32, 128, &input);
+            let f = forward_avalanche(&mut net, SEED ^ 0xABCD, 20000, 32, 16);
+            let alif = if adapt_bump > 0 { "ALIF" } else { "LIF " };
+            println!("uc={up_count:<2} r={up_radius} {alif}: rates={:?} footprint{:?} σ_hop{:?}", pct(&r), fp(&f), hops(&f));
+        };
+        println!("== density (up_count) sweep, radius 3, ALIF ==");
+        for uc in [8u32, 16, 24, 32, 48] {
+            run(uc, 3, 5);
+        }
+        println!("== radius sweep, up_count 16, ALIF ==");
+        for rad in [2u32, 4] {
+            run(16, rad, 5);
+        }
+        println!("== ALIF vs LIF (adapt_bump 0), radius 3 ==");
+        for uc in [16u32, 32] {
+            run(uc, 3, 5);
+            run(uc, 3, 0);
         }
     }
 }
