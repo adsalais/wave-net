@@ -55,6 +55,7 @@ pub struct Layer {
     pub out_weights: Vec<i8>, // stored plastic weight per (source local, slot); addresses stay procedural
     pub out_shadow: Vec<f32>, // higher-precision training accumulator, quantised into out_weights
     pub weight_quant: WeightQuant, // shadow→weight quantizer (default Int8)
+    pub ternary_threshold: f32,    // ternary prune threshold t: |shadow|/γ < t → 0 (default 0.5 = round)
     pub elig_pre: Vec<i32>,   // e-prop presynaptic trace: this neuron's spike count this trial
     pub elig_post: Vec<i32>,  // e-prop postsynaptic pseudo-derivative accumulated this trial
     pub decide_potential: Vec<i16>, // potential at the decide step (pre fire-reset/leak); per-wave snapshot
@@ -106,6 +107,7 @@ impl Layer {
             out_weights,
             out_shadow,
             weight_quant: WeightQuant::Int8,
+            ternary_threshold: 0.5,
             elig_pre: vec![0; ls],
             elig_post: vec![0; ls],
             decide_potential: vec![0; ls],
@@ -146,12 +148,10 @@ impl Layer {
                     sum += self.out_shadow[base + s].abs();
                 }
                 let gamma = sum / ts as f32;
+                let t = self.ternary_threshold; // |shadow|/γ < t → 0 (t=0.5 == round-to-nearest)
                 for s in 0..ts {
-                    self.out_weights[base + s] = if gamma <= 0.0 {
-                        0
-                    } else {
-                        (self.out_shadow[base + s] / gamma).round().clamp(-1.0, 1.0) as i8
-                    };
+                    let x = if gamma <= 0.0 { 0.0 } else { self.out_shadow[base + s] / gamma };
+                    self.out_weights[base + s] = if x.abs() < t { 0 } else if x > 0.0 { 1 } else { -1 };
                 }
             }
             WeightQuant::TernaryScaled => {
@@ -162,12 +162,10 @@ impl Layer {
                 let gamma = sum / ts as f32;
                 // per-row integer gain g = round(γ), floored at 1 so a row never dies; delivery ±g or 0
                 let g = if gamma <= 0.0 { 1 } else { (gamma.round() as i32).clamp(1, 127) };
+                let t = self.ternary_threshold;
                 for s in 0..ts {
-                    let sign = if gamma <= 0.0 {
-                        0
-                    } else {
-                        (self.out_shadow[base + s] / gamma).round().clamp(-1.0, 1.0) as i32
-                    };
+                    let x = if gamma <= 0.0 { 0.0 } else { self.out_shadow[base + s] / gamma };
+                    let sign = if x.abs() < t { 0 } else if x > 0.0 { 1 } else { -1 };
                     self.out_weights[base + s] = (g * sign).clamp(-127, 127) as i8;
                 }
             }
@@ -326,5 +324,14 @@ mod tests {
         layer.out_shadow[0..4].copy_from_slice(&[10.0, 10.0, 0.1, 0.1]);
         layer.requantize_row(0);
         assert_eq!(&layer.out_weights[0..4], &[5i8, 5, 0, 0]);
+        // Prune threshold controls zeros: [1,1,0.7,0.7] γ=0.85; x=[1.18,1.18,0.82,0.82].
+        layer.weight_quant = WeightQuant::Ternary;
+        layer.out_shadow[0..4].copy_from_slice(&[1.0, 1.0, 0.7, 0.7]);
+        layer.ternary_threshold = 0.5; // round: nothing prunes
+        layer.requantize_row(0);
+        assert_eq!(&layer.out_weights[0..4], &[1i8, 1, 1, 1]);
+        layer.ternary_threshold = 0.9; // the 0.82 pair now < 0.9 → 0
+        layer.requantize_row(0);
+        assert_eq!(&layer.out_weights[0..4], &[1i8, 1, 0, 0]);
     }
 }

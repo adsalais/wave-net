@@ -61,6 +61,21 @@ impl Network {
         }
     }
 
+    /// Set the ternary prune threshold `t` (`|shadow|/γ < t → 0`) on every layer and requantise. Higher `t`
+    /// prunes more weights to 0 (more sparsity). Only affects `Ternary`/`TernaryScaled`; `Int8` ignores it.
+    pub fn set_ternary_threshold(&mut self, t: f32) {
+        for layer in self.layers.iter_mut() {
+            layer.ternary_threshold = t;
+            if layer.total_slots == 0 {
+                continue;
+            }
+            let rows = layer.out_shadow.len() / layer.total_slots;
+            for i in 0..rows {
+                layer.requantize_row(i);
+            }
+        }
+    }
+
     fn build(config: Config, readout_last: bool) -> Network {
         config.validate().expect("invalid config");
         let size = config.size;
