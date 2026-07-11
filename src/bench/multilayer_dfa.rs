@@ -304,6 +304,53 @@ pub(crate) mod harness {
         (correct as u64 * 1000) / cfg.holdout as u64
     }
 
+    /// Like `train_and_eval` but with a **training-duration axis**: train continuously and evaluate held-out
+    /// accuracy at each cumulative trial count in `checkpoints` (ascending), against a FIXED held-out set
+    /// (disjoint from training, same across checkpoints). One training pass to `checkpoints.last()`; returns
+    /// one accuracy permille per checkpoint. `cfg.trials` is ignored.
+    pub(crate) fn train_and_eval_curve(net: &mut Network, entries: &[Vec<Edge>], seed: u64, task_seed: u64, cfg: &TaskCfg, task: impl Fn(u64, usize) -> (Vec<usize>, usize), checkpoints: &[usize]) -> Vec<u64> {
+        const EVAL_OFFSET: usize = 10_000_000; // held-out trials, disjoint from any training length
+        let l = net.layer_count();
+        let ls = (cfg.size * cfg.size) as usize;
+        let top = l - 1;
+        let mut w = vec![vec![0f32; ls]; 2];
+        let score = |w: &[Vec<f32>], a: &[f32]| -> (f32, f32) {
+            (w[0].iter().zip(a).map(|(x, y)| x * y).sum(), w[1].iter().zip(a).map(|(x, y)| x * y).sum())
+        };
+        let mut accs = Vec::with_capacity(checkpoints.len());
+        let mut trained = 0usize;
+        for &ckpt in checkpoints {
+            for t in trained..ckpt {
+                let (classes, label) = task(task_seed, t);
+                let (act, rec) = run_trial(net, cfg.size, &classes, task_seed, cfg.present, cfg.delay, cfg.read);
+                let (s0, s1) = score(&w, &act);
+                let (p0, p1) = softmax2(s0, s1);
+                let err = [p0 - if label == 0 { 1.0 } else { 0.0 }, p1 - if label == 1 { 1.0 } else { 0.0 }];
+                for c in 0..2 {
+                    for j in 0..ls {
+                        w[c][j] -= cfg.readout_lr * err[c] * act[j];
+                    }
+                }
+                if cfg.hidden_lr != 0.0 {
+                    let signal = build_signal(&rec, &w, &err, seed, l, ls, top, cfg);
+                    multilayer_dfa_step(net, entries, &rec, &signal, cfg.hidden_lr, &cfg.elig);
+                }
+            }
+            trained = ckpt;
+            let mut correct = 0usize;
+            for i in 0..cfg.holdout {
+                let (classes, label) = task(task_seed, EVAL_OFFSET + i);
+                let (act, _) = run_trial(net, cfg.size, &classes, task_seed, cfg.present, cfg.delay, cfg.read);
+                let (s0, s1) = score(&w, &act);
+                if ((s1 > s0) as usize) == label {
+                    correct += 1;
+                }
+            }
+            accs.push((correct as u64 * 1000) / cfg.holdout as u64);
+        }
+        accs
+    }
+
     /// Feed-forward net of `layers` layers + matching `entries` (each layer but the top has one +1 edge).
     pub(crate) fn make_ff(seed: u64, size: u32, layers: usize, up_count: u32, up_radius: u32, adapt_bump: i16, adapt_decay: u8) -> (Network, Vec<Vec<Edge>>) {
         let lc = LayerConfig {
