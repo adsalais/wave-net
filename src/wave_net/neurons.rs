@@ -21,6 +21,15 @@ pub const ADAPT_SHIFT: u32 = 12;
 /// Ceiling for `adapt`, so the effective contribution never exceeds `i16::MAX` (overflow guard).
 pub const ADAPT_MAX: i32 = (i16::MAX as i32) << ADAPT_SHIFT;
 
+/// Weight quantizer for the shadow→weight requantize step. `Int8`: per-weight round/clamp to [-127,127]
+/// (the default). `Ternary`: BitNet-style {−1,0,+1} with a **per-row** (per source neuron) absmean γ that
+/// sets which weights prune to 0; delivered magnitude stays ±1 (pure ternary, no delivery scale).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum WeightQuant {
+    Int8,
+    Ternary,
+}
+
 pub struct Layer {
     // wave-mutable hot state
     pub potential: Vec<i16>,
@@ -42,6 +51,7 @@ pub struct Layer {
     pub total_slots: usize,   // Σ topology counts — the stride for out_weights[local·total_slots + slot]
     pub out_weights: Vec<i8>, // stored plastic weight per (source local, slot); addresses stay procedural
     pub out_shadow: Vec<f32>, // higher-precision training accumulator, quantised into out_weights
+    pub weight_quant: WeightQuant, // shadow→weight quantizer (default Int8)
     pub elig_pre: Vec<i32>,   // e-prop presynaptic trace: this neuron's spike count this trial
     pub elig_post: Vec<i32>,  // e-prop postsynaptic pseudo-derivative accumulated this trial
     pub decide_potential: Vec<i16>, // potential at the decide step (pre fire-reset/leak); per-wave snapshot
@@ -92,6 +102,7 @@ impl Layer {
             total_slots,
             out_weights,
             out_shadow,
+            weight_quant: WeightQuant::Int8,
             elig_pre: vec![0; ls],
             elig_post: vec![0; ls],
             decide_potential: vec![0; ls],
@@ -108,6 +119,38 @@ impl Layer {
     pub fn shift_threshold(&mut self, delta: i32) {
         for t in self.threshold.iter_mut() {
             *t = ((*t as i32) - delta).clamp(1, i16::MAX as i32) as i16;
+        }
+    }
+
+    /// Requantise source neuron `i`'s row (`out_{weights,shadow}[i*total_slots .. +total_slots]`) from the
+    /// shadow, per `weight_quant`. Int8: per-weight round/clamp. Ternary: per-row absmean γ sets zeros
+    /// (|shadow| < 0.5γ → 0), delivery ±1. No-op for a no-outgoing layer (`total_slots == 0`).
+    pub fn requantize_row(&mut self, i: usize) {
+        let ts = self.total_slots;
+        if ts == 0 {
+            return;
+        }
+        let base = i * ts;
+        match self.weight_quant {
+            WeightQuant::Int8 => {
+                for s in 0..ts {
+                    self.out_weights[base + s] = self.out_shadow[base + s].round().clamp(-127.0, 127.0) as i8;
+                }
+            }
+            WeightQuant::Ternary => {
+                let mut sum = 0.0f32;
+                for s in 0..ts {
+                    sum += self.out_shadow[base + s].abs();
+                }
+                let gamma = sum / ts as f32;
+                for s in 0..ts {
+                    self.out_weights[base + s] = if gamma <= 0.0 {
+                        0
+                    } else {
+                        (self.out_shadow[base + s] / gamma).round().clamp(-1.0, 1.0) as i8
+                    };
+                }
+            }
         }
     }
 
@@ -232,5 +275,31 @@ mod tests {
         l.shift_threshold(500);
         l.set_thresholds(snap.clone());
         assert_eq!(l.thresholds(), snap.as_slice());
+    }
+
+    #[test]
+    fn requantize_row_int8_and_ternary() {
+        let cfg = LayerConfig {
+            topology: vec![TopologyLevel { level: 1, radius: 0, count: 4 }],
+            leak: (3, 5),
+            cooldown_base: 2,
+            inhibitor_ratio: 0,
+            threshold_jitter: 0,
+            baseline_init: 6,
+            adapt_bump: 0,
+            adapt_decay: 5,
+        };
+        let mut layer = Layer::new(&cfg, 1, 0, 2); // size 2 → ls 4, total_slots 4
+        assert_eq!(layer.total_slots, 4);
+        assert_eq!(layer.weight_quant, WeightQuant::Int8);
+        // Int8: per-weight round/clamp
+        layer.out_shadow[0..4].copy_from_slice(&[3.7, -50.0, 0.4, 200.0]);
+        layer.requantize_row(0);
+        assert_eq!(&layer.out_weights[0..4], &[4i8, -50, 0, 127]);
+        // Ternary: γ = mean|shadow| = (2+2+0.1+0.1)/4 = 1.05; 2/1.05→1, 0.1/1.05→0
+        layer.weight_quant = WeightQuant::Ternary;
+        layer.out_shadow[0..4].copy_from_slice(&[2.0, 2.0, 0.1, 0.1]);
+        layer.requantize_row(0);
+        assert_eq!(&layer.out_weights[0..4], &[1i8, 1, 0, 0]);
     }
 }
