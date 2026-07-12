@@ -5,7 +5,7 @@
 
 use crate::wave_bitnet::config::Config;
 use crate::wave_bitnet::neurons::Layer;
-use crate::wave_bitnet::synapse::{decode_cell, Synapse};
+use crate::wave_bitnet::synapse::Synapse;
 use crate::wave_bitnet::wave::process_layer;
 
 pub struct Network {
@@ -166,19 +166,19 @@ impl Network {
                 return;
             }
             let count = entry.count as usize;
-            let n = lz.neigh[level_idx];
             let sbase = lz.slot_bases[level_idx];
             let ts = lz.total_slots;
-            let radius = entry.radius;
+            // (rank, target) for one neuron, word-scanned + decoded once, then applied to the shadow.
+            let mut wired: Vec<(usize, usize)> = Vec::with_capacity(count);
             for i in 0..ls {
-                let cells: Vec<usize> = lz.occupancy[level_idx].iter_set_in(i * n, n).collect();
+                wired.clear();
+                lz.for_wired(level_idx, i, |r, c| wired.push((r, lz.decode(level_idx, i as u32, c, size) as usize)));
                 let mut touched = false;
-                for (r, &c) in cells.iter().enumerate() {
+                for &(r, target) in &wired {
                     let e = elig[i * count + r];
                     if e != 0.0 {
                         touched = true;
-                        let target = decode_cell(c, i as u32, radius, size);
-                        lz.shadow[i * ts + sbase + r] += -lr * signal[target as usize] * e;
+                        lz.shadow[i * ts + sbase + r] += -lr * signal[target] * e;
                     }
                 }
                 if touched {

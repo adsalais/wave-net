@@ -223,8 +223,8 @@ mod tests {
             net.with_layer(z, |lz| {
                 let ls = lz.potential.len();
                 syn += ls * lz.total_slots;
-                for &nsz in &lz.neigh {
-                    occ_bits += ls * nsz;
+                for &wpn in &lz.occ_wpn {
+                    occ_bits += ls * wpn * 64; // word-aligned occupancy storage
                 }
             });
         }

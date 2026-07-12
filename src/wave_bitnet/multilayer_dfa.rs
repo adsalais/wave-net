@@ -3,7 +3,6 @@
 //! the source layer's occupancy bitset (wired-rank order) instead of hashed via `target_of`.
 
 use crate::wave_bitnet::network::Network;
-use crate::wave_bitnet::synapse::decode_cell;
 
 /// One topology edge of a source layer, in the SAME order as the built `LayerConfig` topology, so
 /// `entries[z][e]` lines up with the layer's `e`-th topology level.
@@ -107,12 +106,9 @@ pub fn temporal_eligibility(net: &Network, entries: &[Vec<Edge>], rec: &TrialRec
                 let tz = tz_i as usize;
                 // targets for (layer z, level lvl) decoded from occupancy, wired-rank order (length ls*count)
                 let targets: Vec<usize> = net.with_layer(z, |lz| {
-                    let n = lz.neigh[lvl];
                     let mut ts = Vec::with_capacity(ls * count);
                     for ii in 0..ls {
-                        for c in lz.occupancy[lvl].iter_set_in(ii * n, n) {
-                            ts.push(decode_cell(c, ii as u32, edge.radius, size) as usize);
-                        }
+                        lz.for_wired(lvl, ii, |_r, c| ts.push(lz.decode(lvl, ii as u32, c, size) as usize));
                     }
                     ts
                 });

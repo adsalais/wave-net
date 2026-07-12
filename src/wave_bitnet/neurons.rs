@@ -1,10 +1,12 @@
 //! `neurons` — a `Layer`'s per-neuron state and its bitset weight representation. Topology is a
-//! per-neuron neighborhood occupancy bitset (filled once at startup); weights are 2-bit (a `nonzero`
-//! mask + a `sign` bit) with an `f32` training shadow. Neuron/eligibility state mirrors `wave_net`.
+//! per-neuron neighborhood occupancy bitset, stored **word-aligned** (each neuron gets whole `u64`
+//! words) so the forward pass can iterate only set bits via `trailing_zeros` instead of scanning the
+//! whole neighborhood. Weights are 2-bit (a `nonzero` mask + a `sign` bit) with an `f32` training
+//! shadow. A per-level offset LUT turns a cell index into a (dx, dy) with no integer div/mod.
 
 use crate::wave_bitnet::bits::BitSet;
 use crate::wave_bitnet::config::LayerConfig;
-use crate::wave_bitnet::synapse::{key, map_range, mix, neigh_size, sample_distinct_cells, Synapse, TopologyLevel, P_TARGET, P_THRESHOLD};
+use crate::wave_bitnet::synapse::{key, local_of, map_range, mix, neigh_size, sample_distinct_cells, wrap, xy_of, Synapse, TopologyLevel, P_TARGET, P_THRESHOLD};
 
 /// Fixed-point scale for `adapt`: it holds the effective threshold contribution × `2^ADAPT_SHIFT`.
 /// Bounded by the i32 overflow limit on the bump-add (`2·ADAPT_MAX = i16::MAX << (SHIFT+1)` must fit
@@ -34,14 +36,17 @@ pub struct Layer {
     pub readout: bool,
     pub ternary_threshold: f32,
     // derived layout
-    pub total_slots: usize,     // Σ count
-    pub slot_bases: Vec<usize>, // per level: Σ_{ℓ'<ℓ} count
-    pub neigh: Vec<usize>,      // per level: (2r+1)²
-    // BITSET representation
-    pub occupancy: Vec<BitSet>, // per level: ls·neigh[ℓ] bits
-    pub w_nonzero: BitSet,      // ls·total_slots bits
-    pub w_sign: BitSet,         // ls·total_slots bits
-    pub shadow: Vec<f32>,       // ls·total_slots
+    pub total_slots: usize,          // Σ count
+    pub slot_bases: Vec<usize>,      // per level: Σ_{ℓ'<ℓ} count
+    pub neigh: Vec<usize>,           // per level: (2r+1)²  (logical neighborhood size)
+    pub occ_wpn: Vec<usize>,         // per level: u64 words per neuron = ceil(neigh/64)
+    // TOPOLOGY: per-neuron occupancy, word-aligned. occ[ℓ] has ls·occ_wpn[ℓ] words; neuron i at [i·wpn..].
+    pub occ: Vec<Vec<u64>>,
+    pub offsets: Vec<Vec<(i8, i8)>>, // per level: cell -> (dx, dy) LUT (length neigh[ℓ])
+    // WEIGHTS (rank-indexed: the r-th wired cell of a neuron in ascending cell order)
+    pub w_nonzero: BitSet, // ls·total_slots bits
+    pub w_sign: BitSet,    // ls·total_slots bits
+    pub shadow: Vec<f32>,  // ls·total_slots
 }
 
 impl Layer {
@@ -59,6 +64,34 @@ impl Layer {
         } else {
             -1
         }
+    }
+
+    /// Iterate the wired cells of neuron `i` at level `lvl`, in ascending cell order, calling
+    /// `f(rank, cell)`. Word-scan: only set bits are visited (`trailing_zeros` + clear-lowest-set).
+    #[inline]
+    pub fn for_wired(&self, lvl: usize, i: usize, mut f: impl FnMut(usize, usize)) {
+        let wpn = self.occ_wpn[lvl];
+        let words = &self.occ[lvl][i * wpn..i * wpn + wpn];
+        let mut rank = 0usize;
+        for (wi, &w0) in words.iter().enumerate() {
+            let mut word = w0;
+            let cbase = wi * 64;
+            while word != 0 {
+                let bit = word.trailing_zeros() as usize;
+                f(rank, cbase + bit);
+                rank += 1;
+                word &= word - 1;
+            }
+        }
+    }
+
+    /// Decode a neighborhood `cell` of a source at `src_local` to its target local index, via the
+    /// per-level (dx, dy) offset LUT + toroidal wrap (no integer div/mod on the hot path).
+    #[inline]
+    pub fn decode(&self, lvl: usize, src_local: u32, cell: usize, size: u32) -> u32 {
+        let (sx, sy) = xy_of(src_local, size);
+        let (dx, dy) = self.offsets[lvl][cell];
+        local_of(wrap(sx, dx as i32, size), wrap(sy, dy as i32, size), size)
     }
 
     #[inline]
@@ -98,13 +131,24 @@ impl Layer {
         let base = layer_index as usize * ls;
         let n_levels = cfg.topology.len();
 
-        // derived layout
+        // derived layout + per-level occupancy word count + offset LUT
         let mut slot_bases = Vec::with_capacity(n_levels);
         let mut neigh = Vec::with_capacity(n_levels);
+        let mut occ_wpn = Vec::with_capacity(n_levels);
+        let mut offsets: Vec<Vec<(i8, i8)>> = Vec::with_capacity(n_levels);
         let mut total_slots = 0usize;
         for t in &cfg.topology {
             slot_bases.push(total_slots);
-            neigh.push(neigh_size(t.radius));
+            let n = neigh_size(t.radius);
+            neigh.push(n);
+            occ_wpn.push((n + 63) / 64);
+            let span = 2 * t.radius + 1;
+            let r = t.radius as i32;
+            offsets.push(
+                (0..n)
+                    .map(|c| (((c as u32 % span) as i32 - r) as i8, ((c as u32 / span) as i32 - r) as i8))
+                    .collect(),
+            );
             total_slots += t.count as usize;
         }
 
@@ -113,23 +157,24 @@ impl Layer {
         for (local, th) in threshold.iter_mut().enumerate() {
             let global = (base + local) as u32;
             let h = mix(key(seed, global, 0, 0, P_THRESHOLD));
-            let jitter = map_range(h as u32, cfg.threshold_jitter as u32) as i32; // [0, jitter)
+            let jitter = map_range(h as u32, cfg.threshold_jitter as u32) as i32;
             *th = (cfg.baseline_init as i32 + jitter).clamp(1, i16::MAX as i32) as i16;
         }
 
-        // occupancy: fill `count` distinct cells per neuron per level
-        let mut occupancy: Vec<BitSet> = neigh.iter().map(|&n| BitSet::zeros(ls * n)).collect();
+        // occupancy: fill `count` distinct cells per neuron per level, word-aligned
+        let mut occ: Vec<Vec<u64>> = occ_wpn.iter().map(|&wpn| vec![0u64; ls * wpn]).collect();
         for (li, t) in cfg.topology.iter().enumerate() {
-            let n = neigh[li];
+            let wpn = occ_wpn[li];
             for i in 0..ls {
                 let sg = (base + i) as u32;
                 for &cell in &sample_distinct_cells(seed, sg, t.level, t.radius, t.count) {
-                    occupancy[li].set(i * n + cell as usize);
+                    let c = cell as usize;
+                    occ[li][i * wpn + c / 64] |= 1u64 << (c % 64);
                 }
             }
         }
 
-        // shadow init: ±1 sign from inhibitor_ratio (wave_net's rule; index the r-th wired synapse by r)
+        // shadow init: ±1 sign from inhibitor_ratio (rank r = r-th wired synapse)
         let mut shadow = vec![0f32; ls * total_slots];
         for i in 0..ls {
             let sg = (base + i) as u32;
@@ -162,7 +207,9 @@ impl Layer {
             total_slots,
             slot_bases,
             neigh,
-            occupancy,
+            occ_wpn,
+            occ,
+            offsets,
             w_nonzero: BitSet::zeros(ls * total_slots),
             w_sign: BitSet::zeros(ls * total_slots),
             shadow,
@@ -193,10 +240,25 @@ mod tests {
         let b = Layer::new(&cfg, 7, 0, size);
         assert_eq!(a.total_slots, 16);
         for i in 0..ls {
-            let set = a.occupancy[0].iter_set_in(i * a.neigh[0], a.neigh[0]).count();
-            assert_eq!(set, 16, "neuron {i} wires exactly count cells");
+            let mut cnt = 0usize;
+            let mut cells = Vec::new();
+            a.for_wired(0, i, |_r, c| {
+                cnt += 1;
+                cells.push(c);
+            });
+            assert_eq!(cnt, 16, "neuron {i} wires exactly count cells");
+            assert!(cells.windows(2).all(|w| w[0] < w[1]), "for_wired yields ascending cell order");
         }
-        assert_eq!(a.occupancy[0].count_ones(), b.occupancy[0].count_ones());
+        assert_eq!(a.occ, b.occ, "deterministic occupancy");
+    }
+
+    #[test]
+    fn decode_matches_offset_lut() {
+        let size = 8u32;
+        let cfg = lc(vec![TopologyLevel { level: 1, radius: 2, count: 4 }]);
+        let l = Layer::new(&cfg, 7, 0, size);
+        // center cell (index 12 for span 5) decodes to self at dx=dy=0
+        assert_eq!(l.decode(0, crate::wave_bitnet::synapse::local_of(3, 4, size), 12, size), crate::wave_bitnet::synapse::local_of(3, 4, size));
     }
 
     #[test]
@@ -204,8 +266,6 @@ mod tests {
         let size = 8u32;
         let cfg = lc(vec![TopologyLevel { level: 1, radius: 2, count: 4 }]);
         let mut l = Layer::new(&cfg, 7, 0, size);
-        // neuron 0 row shadow [2.0, -3.0, 0.05, 0.0]; γ = 1.2625; t=0.5
-        // |x|/γ: 1.58, 2.38, 0.04, 0.0 -> nonzero [1,1,0,0], signs [+,-,.,.]
         let ts = l.total_slots;
         l.shadow[0 * ts + 0] = 2.0;
         l.shadow[0 * ts + 1] = -3.0;

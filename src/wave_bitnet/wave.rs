@@ -4,7 +4,7 @@
 //! (No `seed` argument — targets are materialized at construction.)
 
 use crate::wave_bitnet::neurons::{Layer, ADAPT_MAX, ADAPT_SHIFT};
-use crate::wave_bitnet::synapse::{decode_cell, Synapse};
+use crate::wave_bitnet::synapse::{local_of, wrap, xy_of, Synapse};
 
 pub fn process_layer(
     layer: &mut Layer,
@@ -84,25 +84,43 @@ pub fn process_layer(
         layer.adapt[i] -= layer.adapt[i] >> adapt_decay;
     }
 
-    // 4. generate outgoing synapses via the occupancy bitset scan — no hashing.
+    // 4. generate outgoing synapses via a WORD-SCAN of the occupancy bitset — visit only set bits
+    // (trailing_zeros + clear-lowest), decode via the offset LUT (no hashing, no div/mod).
     let layer_count = deliveries.len() as i32;
     for &local in fired.iter() {
-        let li_local = local as usize;
-        for (lvl_idx, entry) in layer.topology.iter().enumerate() {
+        let li = local as usize;
+        let (sx, sy) = xy_of(local, size);
+        for (lvl, entry) in layer.topology.iter().enumerate() {
             let tl = layer_index as i32 + entry.level;
             if tl < 0 || tl >= layer_count {
                 continue;
             }
-            let n = layer.neigh[lvl_idx];
-            let wbase = li_local * layer.total_slots + layer.slot_bases[lvl_idx];
-            let radius = entry.radius;
-            let mut r = 0usize;
-            for c in layer.occupancy[lvl_idx].iter_set_in(li_local * n, n) {
-                let w = layer.weight_at(wbase + r);
-                r += 1;
-                if w != 0 {
-                    let target = decode_cell(c, local, radius, size);
-                    deliveries[tl as usize].push(Synapse { target, weight: w as i16 });
+            let tl = tl as usize;
+            let wpn = layer.occ_wpn[lvl];
+            let words = &layer.occ[lvl][li * wpn..li * wpn + wpn];
+            let wbase = li * layer.total_slots + layer.slot_bases[lvl];
+            let lut = &layer.offsets[lvl];
+            let mut rank = 0usize;
+            for (wi, &w0) in words.iter().enumerate() {
+                let mut word = w0;
+                let cbase = wi * 64;
+                while word != 0 {
+                    let bit = word.trailing_zeros() as usize;
+                    let widx = wbase + rank;
+                    let w: i8 = if !layer.w_nonzero.get(widx) {
+                        0
+                    } else if layer.w_sign.get(widx) {
+                        1
+                    } else {
+                        -1
+                    };
+                    if w != 0 {
+                        let (dx, dy) = lut[cbase + bit];
+                        let target = local_of(wrap(sx, dx as i32, size), wrap(sy, dy as i32, size), size);
+                        deliveries[tl].push(Synapse { target, weight: w as i16 });
+                    }
+                    rank += 1;
+                    word &= word - 1;
                 }
             }
         }
@@ -114,7 +132,7 @@ mod tests {
     use super::*;
     use crate::wave_bitnet::config::LayerConfig;
     use crate::wave_bitnet::neurons::Layer;
-    use crate::wave_bitnet::synapse::{decode_cell, Synapse, TopologyLevel};
+    use crate::wave_bitnet::synapse::{Synapse, TopologyLevel};
 
     #[test]
     fn firing_neuron_delivers_nonzero_synapses_to_decoded_targets() {
@@ -128,16 +146,13 @@ mod tests {
         l.potential[0] = 100;
         // build expected: iterate neuron 0's wired cells (rank order), decode, skip weight 0
         let base = l.slot_base(0);
-        let n = l.neigh[0];
         let mut expect: Vec<Synapse> = Vec::new();
-        let mut r = 0;
-        for c in l.occupancy[0].iter_set_in(0 * n, n) {
+        l.for_wired(0, 0, |r, cell| {
             let w = l.weight_at(0 * l.total_slots + base + r);
-            r += 1;
             if w != 0 {
-                expect.push(Synapse { target: decode_cell(c, 0, 1, size), weight: w as i16 });
+                expect.push(Synapse { target: l.decode(0, 0, cell, size), weight: w as i16 });
             }
-        }
+        });
         let mut acc = vec![0i32; ls];
         let mut deliveries: Vec<Vec<Synapse>> = vec![Vec::new(); 2];
         let mut fired = Vec::new();
