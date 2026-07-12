@@ -166,6 +166,14 @@ pub(crate) mod harness {
     pub(crate) const CUE_P: u64 = 0xC0E;
     pub(crate) const P_DFA: u64 = 61; // fixed random DFA feedback (copied from rsnn — no rsnn dep)
 
+    /// Default ALIF adaptation strength (`adapt_bump`) for the DFA-trained nets' COMPUTATIONAL layers —
+    /// L0 is always forced to a non-adapting input transducer by `Network::new`, so this only touches L1..Ltop.
+    /// **5** (not the earlier 20) is the confirmed default: at 20 the hub adaptation-locks after the first cue,
+    /// so pure ±1 ternary can't drive later cues (side-car parity ≈ chance); at 5 the stack relays every cue.
+    /// 3-seed confirmed — side-car parity pure 494→1000, feed-forward XOR/depth unchanged (XOR just converges
+    /// slower). Both fixes for pure recurrence are equivalent: raise gain (scaled ternary) or lower ALIF (this).
+    pub(crate) const DEFAULT_ADAPT_BUMP: i16 = 5;
+
     /// Deterministic, class-distinct L0 spike pattern (~25% density), stable across waves.
     pub(crate) fn cue_sites(task_seed: u64, size: u32, class: usize) -> Vec<u32> {
         let ls = (size * size) as u32;
@@ -644,8 +652,8 @@ mod tests {
 
     #[test]
     fn run_trial_records_are_shaped_and_deterministic() {
-        let (mut net1, _e) = make_ff(7, 8, 3, 12, 3, 20, 6);
-        let (mut net2, _e2) = make_ff(7, 8, 3, 12, 3, 20, 6);
+        let (mut net1, _e) = make_ff(7, 8, 3, 12, 3, DEFAULT_ADAPT_BUMP, 6);
+        let (mut net2, _e2) = make_ff(7, 8, 3, 12, 3, DEFAULT_ADAPT_BUMP, 6);
         let (act1, rec1) = run_trial(&mut net1, 8, &[0, 1], 7, 4, 2, 4);
         let (act2, rec2) = run_trial(&mut net2, 8, &[0, 1], 7, 4, 2, 4);
         let l = 3;
@@ -674,7 +682,7 @@ mod tests {
         // the target regime. If this dips below ~600, raise up_count/size/trials — do NOT lower the bar
         // toward chance (500).
         let seed = 0xE9_0B_0A17u64;
-        let (mut net, entries) = make_ff(seed, 16, 4, 32, 3, 20, 6);
+        let (mut net, entries) = make_ff(seed, 16, 4, 32, 3, DEFAULT_ADAPT_BUMP, 6);
         let mut cfg = ff_cfg(400, 0.004, 0.0);
         cfg.size = 16;
         let acc = train_and_eval(&mut net, &entries, seed, seed, &cfg, single_task);
@@ -687,7 +695,7 @@ mod tests {
         // point is bit-reproducibility of the whole loop.
         let seed = 0x1234_5678u64;
         let run = |beta: f32| {
-            let (mut net, entries) = make_ff(seed, 8, 3, 32, 3, 20, 6);
+            let (mut net, entries) = make_ff(seed, 8, 3, 32, 3, DEFAULT_ADAPT_BUMP, 6);
             train_and_eval(&mut net, &entries, seed, seed, &ff_cfg(120, 0.004, beta), single_task)
         };
         assert_eq!(run(0.0), run(0.0), "membrane-eligibility training must be deterministic");
@@ -700,7 +708,7 @@ mod tests {
         // Temporal XOR (memory across a gap): FF-readout-only is ~chance; training every layer (ALIF +
         // rate_reg, generous fan-in) must clear it.
         let seed = 0xE9_0B_0A17u64;
-        let (mut net, entries) = make_ff(seed, 16, 4, 32, 3, 20, 6);
+        let (mut net, entries) = make_ff(seed, 16, 4, 32, 3, DEFAULT_ADAPT_BUMP, 6);
         let mut cfg = ff_cfg(1500, 0.004, 0.4);
         cfg.size = 16;
         cfg.delay = 8;
@@ -717,7 +725,7 @@ mod tests {
         // only flips once the shadow crosses ±0.5, which the small DFA signal need not do in a short run).
         let seed = 0xE9_0B_0A17u64;
         let (uc, n) = (32u32, 12u32);
-        let (mut net, entries) = make_hidden_rec(seed, 8, uc, 3, n, 3, 20, 6);
+        let (mut net, entries) = make_hidden_rec(seed, 8, uc, 3, n, 3, DEFAULT_ADAPT_BUMP, 6);
         // L1 out_shadow layout: total_slots = uc + n; the level-0 (recurrent) slots are [uc .. uc+n) per source.
         let rec_shadow = |net: &Network| -> Vec<f32> {
             net.with_layer(1, |lz| {
@@ -748,7 +756,7 @@ mod tests {
         use crate::wave_net::neurons::WeightQuant;
         // Ternary weights must still train a separable 2-class task above chance (generous fan-in).
         let seed = 0xE9_0B_0A17u64;
-        let (mut net, entries) = make_ff(seed, 16, 4, 32, 3, 20, 6);
+        let (mut net, entries) = make_ff(seed, 16, 4, 32, 3, DEFAULT_ADAPT_BUMP, 6);
         net.set_weight_quant(WeightQuant::Ternary);
         let mut cfg = ff_cfg(400, 0.004, 0.0);
         cfg.size = 16;
@@ -762,7 +770,7 @@ mod tests {
     #[test]
     fn train_and_eval_best_returns_peak_and_speed() {
         let seed = 0xE9_0B_0A17u64;
-        let (mut net, entries) = make_ff(seed, 16, 4, 32, 3, 20, 6);
+        let (mut net, entries) = make_ff(seed, 16, 4, 32, 3, DEFAULT_ADAPT_BUMP, 6);
         let mut cfg = ff_cfg(0, 0.004, 0.0);
         cfg.size = 16;
         let (best, at) = train_and_eval_best(&mut net, &entries, seed, seed, &cfg, single_task, 100, 3, 1000);

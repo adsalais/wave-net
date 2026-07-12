@@ -52,7 +52,7 @@ mod tests {
             for &(ur, uc) in &[(3u32, 16u32), (4, 48)] {
                 let (mut curves, mut sig_sum, mut rates0) = (Vec::new(), 0.0f64, Vec::new());
                 for (si, &s) in SEEDS.iter().enumerate() {
-                    let (mut net, entries) = make_ff(s, 32, depth, uc, ur, 20, 6);
+                    let (mut net, entries) = make_ff(s, 32, depth, uc, ur, DEFAULT_ADAPT_BUMP, 6);
                     sig_sum += sigma_ratio(&mut net, s ^ 0x5A5A);
                     let mut cfg = ff_cfg(0, 0.004, 0.0);
                     cfg.size = 32;
@@ -82,7 +82,7 @@ mod tests {
         for &(ur, uc) in &[(3u32, 16u32), (4, 64)] {
             let (mut curves, mut sig_sum, mut rates0) = (Vec::new(), 0.0f64, Vec::new());
             for (si, &s) in SEEDS.iter().enumerate() {
-                let (mut net, entries) = make_ff(s, 32, 4, uc, ur, 20, 6);
+                let (mut net, entries) = make_ff(s, 32, 4, uc, ur, DEFAULT_ADAPT_BUMP, 6);
                 sig_sum += sigma_ratio(&mut net, s ^ 0x5A5A);
                 let mut cfg = ff_cfg(0, 0.004, 0.4);
                 cfg.size = 32;
@@ -113,7 +113,7 @@ mod tests {
         for &(rr, rc) in &[(3u32, 8u32), (4, 16), (4, 24)] {
             let (mut curves, mut sig_sum, mut rates0) = (Vec::new(), 0.0f64, Vec::new());
             for (si, &s) in SEEDS.iter().enumerate() {
-                let (mut net, entries) = make_sidecar(s, 32, fuc, fur, rc, rr, 20, 6);
+                let (mut net, entries) = make_sidecar(s, 32, fuc, fur, rc, rr, DEFAULT_ADAPT_BUMP, 6);
                 sig_sum += sigma_ratio(&mut net, s ^ 0x5A5A);
                 let mut cfg = ff_cfg(0, 0.004, 0.4);
                 cfg.size = 32;

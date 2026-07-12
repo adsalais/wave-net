@@ -41,7 +41,7 @@ mod tests {
             for &(_name, q) in &QUANTS {
                 let (mut bests, mut sp0) = (Vec::new(), 0.0);
                 for (si, &s) in SEEDS.iter().enumerate() {
-                    let (mut net, entries) = make_ff(s, 32, 4, uc, ur, 20, 6);
+                    let (mut net, entries) = make_ff(s, 32, 4, uc, ur, DEFAULT_ADAPT_BUMP, 6);
                     if let Some(qq) = q {
                         net.set_weight_quant(qq);
                     }
@@ -75,7 +75,7 @@ mod tests {
             for &(_name, q) in &QUANTS {
                 let (mut bests, mut sp0) = (Vec::new(), 0.0);
                 for (si, &s) in SEEDS.iter().enumerate() {
-                    let (mut net, entries) = make_ff(s, 32, depth, uc, ur, 20, 6);
+                    let (mut net, entries) = make_ff(s, 32, depth, uc, ur, DEFAULT_ADAPT_BUMP, 6);
                     if let Some(qq) = q {
                         net.set_weight_quant(qq);
                     }
@@ -110,7 +110,7 @@ mod tests {
             for &(_name, q) in &QUANTS {
                 let (mut bests, mut sp0) = (Vec::new(), 0.0);
                 for (si, &s) in SEEDS.iter().enumerate() {
-                    let (mut net, entries) = make_sidecar(s, 32, fuc, fur, rc, rr, 20, 6);
+                    let (mut net, entries) = make_sidecar(s, 32, fuc, fur, rc, rr, DEFAULT_ADAPT_BUMP, 6);
                     if let Some(qq) = q {
                         net.set_weight_quant(qq);
                     }
@@ -147,7 +147,7 @@ mod tests {
             for &(ur, uc) in &[(3u32, 48u32), (4, 64), (5, 96), (5, 128)] {
                 let (mut cells, mut sp) = (Vec::new(), Vec::new());
                 for &(_name, q) in &QUANTS {
-                    let (mut net, entries) = make_ff(seed, 32, depth, uc, ur, 20, 6);
+                    let (mut net, entries) = make_ff(seed, 32, depth, uc, ur, DEFAULT_ADAPT_BUMP, 6);
                     if let Some(qq) = q {
                         net.set_weight_quant(qq);
                     }
@@ -177,7 +177,7 @@ mod tests {
         for &uc in &[48u32, 56, 64, 72, 80, 96] {
             let (mut cells, mut sp) = (Vec::new(), Vec::new());
             for &(_name, q) in &QUANTS {
-                let (mut net, entries) = make_ff(seed, 32, 8, uc, 4, 20, 6);
+                let (mut net, entries) = make_ff(seed, 32, 8, uc, 4, DEFAULT_ADAPT_BUMP, 6);
                 if let Some(qq) = q {
                     net.set_weight_quant(qq);
                 }
@@ -206,7 +206,7 @@ mod tests {
         for &rc in &[24u32, 32, 48] {
             let (mut cells, mut sp) = (Vec::new(), Vec::new());
             for &(_name, q) in &QUANTS {
-                let (mut net, entries) = make_sidecar(seed, 32, fuc, fur, rc, 4, 20, 6);
+                let (mut net, entries) = make_sidecar(seed, 32, fuc, fur, rc, 4, DEFAULT_ADAPT_BUMP, 6);
                 if let Some(qq) = q {
                     net.set_weight_quant(qq);
                 }
@@ -236,7 +236,7 @@ mod tests {
         eprintln!("r/c    thr   int8       pure                scaled");
         for &(ur, uc) in &[(4u32, 56u32), (4, 64), (4, 80)] {
             let (i8b, i8a) = {
-                let (mut net, entries) = make_ff(seed, 32, 8, uc, ur, 20, 6);
+                let (mut net, entries) = make_ff(seed, 32, 8, uc, ur, DEFAULT_ADAPT_BUMP, 6);
                 let mut cfg = ff_cfg(0, 0.004, 0.0);
                 cfg.size = 32;
                 cfg.present = 8;
@@ -246,7 +246,7 @@ mod tests {
             for &thr in &[0.7f32] {
                 let mut cell = Vec::new();
                 for q in [WeightQuant::Ternary, WeightQuant::TernaryScaled] {
-                    let (mut net, entries) = make_ff(seed, 32, 8, uc, ur, 20, 6);
+                    let (mut net, entries) = make_ff(seed, 32, 8, uc, ur, DEFAULT_ADAPT_BUMP, 6);
                     net.set_weight_quant(q);
                     net.set_ternary_threshold(thr);
                     let mut cfg = ff_cfg(0, 0.004, 0.0);
@@ -281,13 +281,13 @@ mod tests {
             c
         };
         let (i8b, i8a) = {
-            let (mut net, entries) = make_sidecar(seed, 32, fuc, fur, 24, 4, 20, 6);
+            let (mut net, entries) = make_sidecar(seed, 32, fuc, fur, 24, 4, DEFAULT_ADAPT_BUMP, 6);
             train_and_eval_best(&mut net, &entries, seed, seed, &base_cfg(), |sd, t| task_parity(sd, t, 3), ee, pat, max)
         };
         for &thr in &[0.7f32] {
             let mut cell = Vec::new();
             for q in [WeightQuant::Ternary, WeightQuant::TernaryScaled] {
-                let (mut net, entries) = make_sidecar(seed, 32, fuc, fur, 24, 4, 20, 6);
+                let (mut net, entries) = make_sidecar(seed, 32, fuc, fur, 24, 4, DEFAULT_ADAPT_BUMP, 6);
                 net.set_weight_quant(q);
                 net.set_ternary_threshold(thr);
                 let (best, at) = train_and_eval_best(&mut net, &entries, seed, seed, &base_cfg(), |sd, t| task_parity(sd, t, 3), ee, pat, max);
