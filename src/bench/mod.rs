@@ -7,3 +7,4 @@
 pub mod multilayer_dfa;
 pub mod multilayer_dfa_bench;
 pub mod multilayer_dfa_bitnet_bench;
+pub mod wave_bitnet_bench;
