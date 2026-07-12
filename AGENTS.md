@@ -295,7 +295,16 @@ fan-out under dedup.
 - Rust, edition 2024. **Standard library only by default** — the one optional dependency (`blake3`) is
 behind a test-only feature. This is a **library crate** (no binary); experiments are `#[ignore]`d tests.
 - **Standard library only** in `src/` (the sole optional dep, `blake3`, is a test-only feature);
-  **no `unsafe`**; **warning-free build**.
+  **warning-free build**.
+- **No `unsafe` — with ONE documented exception (2026-07-13).** `wave_bitnet::wave::process_layer`'s
+  forward hot loop uses `get_unchecked`/`get_unchecked_mut` for four accesses: the per-neuron occupancy-word
+  slice, the offset LUT, the packed weight-code word, and the delivery-target accumulator. Each index is
+  **provably in-bounds** from the word-scan invariants and carries a `SAFETY:` comment: a *set* occupancy bit
+  is always a sampled cell `< neigh == lut.len()`; `widx < ls·total_slots ⇒ widx>>5 < codes.len()`;
+  `target = decode_cell(..) < size² == ls`; and `tl` is range-checked before the loop. It removed ~7% of
+  bounds-check overhead on the throughput-critical path. This is the **only** `unsafe` in the tree and is
+  confined to that loop — **do not add `unsafe` anywhere else** without an equally airtight, commented
+  justification.
 - **Determinism is a hard requirement** — results are a pure function of `(seed, config, input)`.
   Currently single-threaded; any future threading must stay deterministic.
 - **Keep `wave_state_machine` frozen** — it is the reference the historical findings are pinned to.
