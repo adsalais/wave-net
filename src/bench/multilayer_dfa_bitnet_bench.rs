@@ -228,7 +228,7 @@ mod tests {
     #[ignore] // expensive; run manually in --release
     fn bitnet_ff_depth8_threshold() {
         // Raise the prune threshold (more zeros/sparsity) — does it help/hurt ternary at depth 8? Configs
-        // 4/56, 4/64, 4/80; threshold 0.5/0.7/0.9; pure + scaled (int8 baseline, threshold-independent).
+        // 4/56, 4/64, 4/80; threshold 0.7 (the sweet spot); pure + scaled (int8 baseline, threshold-independent).
         // single seed. Cell = best@trials(sparsity%).
         let seed = 0xE9_0B_0A17u64;
         let (ee, pat, max) = (300usize, 3usize, 3000usize);
@@ -243,7 +243,7 @@ mod tests {
                 cfg.read = 8;
                 train_and_eval_best(&mut net, &entries, seed, seed, &cfg, single_task, ee, pat, max)
             };
-            for &thr in &[0.5f32, 0.7, 0.9] {
+            for &thr in &[0.7f32] {
                 let mut cell = Vec::new();
                 for q in [WeightQuant::Ternary, WeightQuant::TernaryScaled] {
                     let (mut net, entries) = make_ff(seed, 32, 8, uc, ur, 20, 6);
@@ -264,8 +264,8 @@ mod tests {
     #[test]
     #[ignore] // expensive; run manually in --release
     fn bitnet_sidecar_threshold() {
-        // Prune-threshold sweep on the recurrent parity task (rec 4/24, forward r4/c48): does more sparsity
-        // help/hurt where scaled trains and pure fails? threshold 0.5/0.7/0.9; pure + scaled + int8. 1 seed.
+        // Prune threshold on the recurrent parity task (rec 4/24, forward r4/c48): does more sparsity
+        // help/hurt where scaled trains and pure fails? threshold 0.7 (the sweet spot); pure + scaled + int8. 1 seed.
         let (fur, fuc) = (4u32, 48u32);
         let seed = 0xE9_0B_0A17u64;
         let (ee, pat, max) = (500usize, 3usize, 5000usize);
@@ -284,7 +284,7 @@ mod tests {
             let (mut net, entries) = make_sidecar(seed, 32, fuc, fur, 24, 4, 20, 6);
             train_and_eval_best(&mut net, &entries, seed, seed, &base_cfg(), |sd, t| task_parity(sd, t, 3), ee, pat, max)
         };
-        for &thr in &[0.5f32, 0.7, 0.9] {
+        for &thr in &[0.7f32] {
             let mut cell = Vec::new();
             for q in [WeightQuant::Ternary, WeightQuant::TernaryScaled] {
                 let (mut net, entries) = make_sidecar(seed, 32, fuc, fur, 24, 4, 20, 6);
