@@ -19,7 +19,8 @@ So the project moved from "pure procedural, train thresholds" to the **GeNN hybr
 2021): keep the procedural static structure, but **store and train the plastic weights**.
 
 **Current state:** that hybrid *works*. A **feed-forward + ALIF** network with e-prop / multi-layer-DFA
-credit is a **reliable learner** (held-out, multi-seed), usable to ~16 layers, and `rate_reg` reliably keeps
+credit is a **reliable learner** (held-out, multi-seed) — a plain stack reaches ~12 layers and a half-count
++2 residual skip extends it to **depth 24+** (see Headline results) — and `rate_reg` reliably keeps
 deep stacks alive. **Trained recurrence now robustly beats feed-forward** — with the completed ALIF
 eligibility on the backward-fed **side-car** topology (recurrent layer isolated from the forward path): a
 strict improvement over FF across every benchmark and seed (XOR/flip-flop tie at ceiling; distractor-XOR
@@ -146,9 +147,15 @@ across every benchmark and seed (a strict improvement, no downside).** Headline 
   learning signal from a trained readout updates the stored weights through the `f32` shadow. Held-out and
   multi-seed, it clears the bar threshold-only training failed. A trained readout on the full reservoir
   (classic LSM) is also a reliable baseline.
-- **Multi-layer DFA credit makes depth usable to ~16 layers.** Train *every* layer: the top gets symmetric
-  readout feedback, deeper layers get Direct Feedback Alignment (fixed random hash-derived feedback of the
-  output error), with width to match. The wall beyond ~16 is DFA feedback noise, not the substrate.
+- **Multi-layer DFA credit trains deep stacks — the depth reach is TOPOLOGY-bound, not a fixed ~16.** Train
+  *every* layer: the top gets symmetric readout feedback, deeper layers get Direct Feedback Alignment (fixed
+  random hash-derived feedback of the output error), with width to match. A plain +1 feed-forward stack tops
+  out ~12 layers (single-cue separable, adapt_bump=5: clean to 12, marginal by 16 — signal decays through
+  depth), but a **half-count +2 residual SKIP roughly DOUBLES that**: pure ternary trains a clean 1000/1000 to
+  **depth 24+** with `+2 = ½·count` at moderate fan-in (r3/c32 + r3/c16), 3 seeds (2026-07-12). So the earlier
+  "~16 = DFA feedback-noise wall" was **topology-specific, NOT fundamental** — route signal around layers and
+  it keeps going. Fan-in has a floor *and* a ceiling that narrows with depth (count is the lever, radius stays
+  tight ~4; too much fan-in over-drives and collapses the stack). See the BitNet/ternary bullet + `docs/experiments_results.md`.
 - **`rate_reg` is a *conclusive* liveness rescue for feed-forward depth.** A soft per-neuron term
   `c_reg·(rate − target)` folded into the e-prop learning signal — the LSNN/e-prop mechanism,
   `RsnnConfig.rate_reg` — reliably revives a *liveness-starved* deep FF stack: chance → ~980 on temporal
@@ -185,6 +192,20 @@ across every benchmark and seed (a strict improvement, no downside).** Headline 
   reading the recurrent layer *directly* beats a dedicated read layer. **Blocker: the single-threaded integer
   engine is too slow to run these sweeps multi-seed at size ≥ 64 — the immediate next work is performance
   optimization, then resume the systematic scaling / forward-topology exploration.**
+- **BitNet-style ternary weights — pure ±1/0 is competitive-to-better than int8, and ALIF strength is the key
+  knob (2026-07-12).** `wave_net` has quant modes (`Layer.weight_quant`: Int8 / Ternary pure ±1/0 / TernaryScaled
+  ±g/0) + a tunable prune threshold `t` (`|shadow|/γ < t → 0`; default 0.5 = round, sweet spot ~0.7). **The
+  DFA-net computational-layer `adapt_bump` default is now 5, not 20** (`harness::DEFAULT_ADAPT_BUMP`): at 20 the
+  recurrent hub adaptation-LOCKS after the first cue so pure ±1 can't drive later cues — this is why pure
+  *looked* unable to recurse; at 5 it relays every cue and **pure ternary solves side-car parity (3-seed
+  494→1000/1000/1000)**. **CORRECTS the earlier "pure ternary can't do recurrence / scaled ±g gain is required"
+  allegation — that was an ALIF artifact, not a magnitude limit.** Pure ±1 does BOTH feed-forward and
+  recurrence; lower ALIF *or* scaled gain are equivalent fixes. **At depth, pure ternary BEATS int8**: with the
+  +2 skip pure holds 1000/1000 to depth 24 while int8 wobbles by ~16–20 (fixed ±1 is collapse-robust). Sparsity
+  is a **surplus-capacity dividend** — it appears only when fan-in exceeds the task's needs (deep nets prune
+  ~nothing; wide/recurrent nets prune 20–30% for free at t=0.7). **Gotcha: L0 is a forced non-adapting input
+  transducer (`Network::new` sets threshold i16::MAX + adapt_bump 0) — NEVER give L0 adaptation or it swallows
+  cue injections and collapses the whole net.** See `docs/experiments_results.md`.
 
 ## Reading & training: the multi-wave rule
 
