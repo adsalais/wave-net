@@ -191,7 +191,7 @@ mod tests {
             net.with_layer(z, |lz| {
                 let n = lz.shadow.len(); // ls * total_slots
                 total += n;
-                zeros += n - lz.w_nonzero.count_ones();
+                zeros += (0..n).filter(|&s| lz.weight_at(s) == 0).count();
             });
         }
         if total == 0 { 0.0 } else { zeros as f64 / total as f64 }

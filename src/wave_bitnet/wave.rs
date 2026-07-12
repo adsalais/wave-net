@@ -3,7 +3,7 @@
 //! fly, it scans the occupancy bitset and decodes each wired cell, delivering the packed ±1/0 weight.
 //! (No `seed` argument — targets are materialized at construction.)
 
-use crate::wave_bitnet::neurons::{Layer, ADAPT_MAX, ADAPT_SHIFT};
+use crate::wave_bitnet::neurons::{Layer, ADAPT_MAX, ADAPT_SHIFT, WCODE};
 use crate::wave_bitnet::synapse::{local_of, wrap, xy_of};
 
 pub fn process_layer(
@@ -95,9 +95,13 @@ pub fn process_layer(
             }
             let tl = tl as usize;
             let wpn = layer.occ_wpn[lvl];
-            let words = &layer.occ[lvl][li * wpn..li * wpn + wpn];
+            // SAFETY: li < ls and occ[lvl].len() == ls*wpn, so [li*wpn, li*wpn+wpn) is in bounds.
+            let words = unsafe { layer.occ.get_unchecked(lvl).get_unchecked(li * wpn..li * wpn + wpn) };
             let wbase = li * layer.total_slots + layer.slot_bases[lvl];
-            let lut = &layer.offsets[lvl];
+            let lut = unsafe { layer.offsets.get_unchecked(lvl) };
+            let codes = &layer.codes;
+            // SAFETY: tl was range-checked above (0 <= tl < layer_count == deliv.len()).
+            let target_deliv = unsafe { deliv.get_unchecked_mut(tl) };
             let mut rank = 0usize;
             for (wi, &w0) in words.iter().enumerate() {
                 let mut word = w0;
@@ -105,17 +109,15 @@ pub fn process_layer(
                 while word != 0 {
                     let bit = word.trailing_zeros() as usize;
                     let widx = wbase + rank;
-                    let w: i8 = if !layer.w_nonzero.get(widx) {
-                        0
-                    } else if layer.w_sign.get(widx) {
-                        1
-                    } else {
-                        -1
-                    };
+                    // SAFETY: widx < ls*total_slots => widx>>5 < codes.len() (ceil(../32) words).
+                    let code = (unsafe { *codes.get_unchecked(widx >> 5) } >> ((widx & 31) * 2)) & 0b11;
+                    let w = WCODE[code as usize];
                     if w != 0 {
-                        let (dx, dy) = lut[cbase + bit];
-                        let target = local_of(wrap(sx, dx as i32, size), wrap(sy, dy as i32, size), size);
-                        deliv[tl][target as usize] += w as i32; // scatter-add into the target accumulator
+                        // SAFETY: cbase+bit is a SET occupancy bit => a sampled cell < neigh == lut.len().
+                        let (dx, dy) = unsafe { *lut.get_unchecked(cbase + bit) };
+                        let target = local_of(wrap(sx, dx as i32, size), wrap(sy, dy as i32, size), size) as usize;
+                        // SAFETY: target = decode_cell(..) < size^2 == ls == target_deliv.len().
+                        unsafe { *target_deliv.get_unchecked_mut(target) += w as i32 };
                     }
                     rank += 1;
                     word &= word - 1;

@@ -3,7 +3,6 @@
 //! occupancy bitset (no per-wave hashing). `wave_net` is the frozen reference; duplication is intended.
 //! Spec: docs/superpowers/specs/2026-07-12-wave-bitnet-design.md.
 
-pub mod bits;
 pub mod config;
 pub mod multilayer_dfa;
 pub mod network;

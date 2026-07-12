@@ -4,7 +4,6 @@
 //! whole neighborhood. Weights are 2-bit (a `nonzero` mask + a `sign` bit) with an `f32` training
 //! shadow. A per-level offset LUT turns a cell index into a (dx, dy) with no integer div/mod.
 
-use crate::wave_bitnet::bits::BitSet;
 use crate::wave_bitnet::config::LayerConfig;
 use crate::wave_bitnet::synapse::{key, local_of, map_range, mix, neigh_size, sample_distinct_cells, wrap, xy_of, TopologyLevel, P_TARGET, P_THRESHOLD};
 
@@ -14,6 +13,9 @@ use crate::wave_bitnet::synapse::{key, local_of, map_range, mix, neigh_size, sam
 pub const ADAPT_SHIFT: u32 = 12;
 /// Ceiling for `adapt`, so the effective contribution never exceeds `i16::MAX` (overflow guard).
 pub const ADAPT_MAX: i32 = (i16::MAX as i32) << ADAPT_SHIFT;
+
+/// 2-bit weight code decode LUT: `0b00`→0, `0b01`→+1, `0b11`→−1 (`0b10` unused → 0).
+pub(crate) const WCODE: [i8; 4] = [0, 1, 0, -1];
 
 pub struct Layer {
     // neuron state (identical to wave_net::neurons::Layer)
@@ -43,10 +45,9 @@ pub struct Layer {
     // TOPOLOGY: per-neuron occupancy, word-aligned. occ[ℓ] has ls·occ_wpn[ℓ] words; neuron i at [i·wpn..].
     pub occ: Vec<Vec<u64>>,
     pub offsets: Vec<Vec<(i8, i8)>>, // per level: cell -> (dx, dy) LUT (length neigh[ℓ])
-    // WEIGHTS (rank-indexed: the r-th wired cell of a neuron in ascending cell order)
-    pub w_nonzero: BitSet, // ls·total_slots bits
-    pub w_sign: BitSet,    // ls·total_slots bits
-    pub shadow: Vec<f32>,  // ls·total_slots
+    // WEIGHTS (rank-indexed): 2-bit codes packed 32 per u64 — 0b00=0, 0b01=+1, 0b11=−1.
+    pub codes: Vec<u64>,  // ceil(ls·total_slots / 32) words
+    pub shadow: Vec<f32>, // ls·total_slots
 }
 
 impl Layer {
@@ -57,13 +58,7 @@ impl Layer {
 
     #[inline]
     pub fn weight_at(&self, widx: usize) -> i8 {
-        if !self.w_nonzero.get(widx) {
-            0
-        } else if self.w_sign.get(widx) {
-            1
-        } else {
-            -1
-        }
+        WCODE[((self.codes[widx >> 5] >> ((widx & 31) * 2)) & 0b11) as usize]
     }
 
     /// Iterate the wired cells of neuron `i` at level `lvl`, in ascending cell order, calling
@@ -95,13 +90,14 @@ impl Layer {
     }
 
     #[inline]
-    fn set_weight_bits(&mut self, idx: usize, nonzero: bool, sign: bool) {
-        self.w_nonzero.put(idx, nonzero);
-        self.w_sign.put(idx, sign);
+    fn set_code(&mut self, idx: usize, code: u64) {
+        let w = idx >> 5;
+        let shift = (idx & 31) * 2;
+        self.codes[w] = (self.codes[w] & !(0b11u64 << shift)) | (code << shift);
     }
 
-    /// Requantise neuron `i`'s row (all `total_slots` shadow values) into `w_nonzero`/`w_sign`:
-    /// γ = mean(|shadow|) over the row; `|shadow|/γ < t → 0`, else sign(shadow).
+    /// Requantise neuron `i`'s row (all `total_slots` shadow values) into the 2-bit `codes` array:
+    /// γ = mean(|shadow|) over the row; `|shadow|/γ < t → 0` (0b00), else sign(shadow) (+1=0b01, −1=0b11).
     pub fn repack_row(&mut self, i: usize) {
         let ts = self.total_slots;
         if ts == 0 {
@@ -117,12 +113,8 @@ impl Layer {
         for s in 0..ts {
             let sh = self.shadow[base + s];
             let x = if gamma <= 0.0 { 0.0 } else { sh / gamma };
-            let idx = base + s;
-            if x.abs() < t {
-                self.set_weight_bits(idx, false, false);
-            } else {
-                self.set_weight_bits(idx, true, x > 0.0);
-            }
+            let code: u64 = if x.abs() < t { 0b00 } else if x > 0.0 { 0b01 } else { 0b11 };
+            self.set_code(base + s, code);
         }
     }
 
@@ -210,8 +202,7 @@ impl Layer {
             occ_wpn,
             occ,
             offsets,
-            w_nonzero: BitSet::zeros(ls * total_slots),
-            w_sign: BitSet::zeros(ls * total_slots),
+            codes: vec![0u64; (ls * total_slots + 31) / 32],
             shadow,
         };
         for i in 0..ls {
