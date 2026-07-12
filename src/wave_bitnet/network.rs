@@ -99,6 +99,12 @@ impl Network {
         }
     }
 
+    /// Toggle e-prop eligibility recording (default on). Turn it off for a pure forward pass
+    /// (inference / throughput) to skip the per-neuron decide/elig snapshots.
+    pub fn set_record_eligibility(&mut self, on: bool) {
+        self.record_eligibility = on;
+    }
+
     pub fn reset_state(&mut self) {
         for g in self.layers.iter_mut() {
             g.potential.iter_mut().for_each(|p| *p = 0);

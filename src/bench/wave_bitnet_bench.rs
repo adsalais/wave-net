@@ -240,6 +240,34 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // diagnostic: find a threshold that keeps a uniform 5-layer FF alive (no critical_init)
+    fn bitnet_rate_sweep() {
+        use crate::wave_net::critical_init::random_l0_input;
+        let (size, seed) = (32u32, 0xC0FFEE_1234_5678u64);
+        for &bi in &[0i16, 1, 2, 3, 4, 6] {
+            let lc = LayerConfig { topology: vec![TopologyLevel { level: 1, radius: 3, count: 32 }], leak: (3, 5), cooldown_base: 2, inhibitor_ratio: 0, threshold_jitter: 32, baseline_init: bi, adapt_bump: 5, adapt_decay: 6 };
+            let mut net = Network::new(Config { seed, size, layers: vec![lc; 5] });
+            net.set_record_eligibility(false);
+            let input = random_l0_input(seed, size, 20000);
+            let l = net.layer_count();
+            let counts = Arc::new(Mutex::new(vec![0u64; l]));
+            for z in 0..l {
+                let c = counts.clone();
+                net.on_layer(z, Box::new(move |_w, f: &[u32]| c.lock().unwrap()[z] += f.len() as u64));
+            }
+            net.reset_state();
+            for w in 0..32 { net.wave(&input(w)); }
+            counts.lock().unwrap().iter_mut().for_each(|x| *x = 0);
+            for w in 0..128 { net.wave(&input(32 + w)); }
+            net.clear_listeners();
+            let counts = std::mem::take(&mut *counts.lock().unwrap());
+            let ls = (size as u64) * (size as u64);
+            let pct: Vec<f64> = counts.iter().map(|&s| (s as f64 / (ls * 128) as f64 * 1000.0).round() / 10.0).collect();
+            eprintln!("baseline_init {bi}: per-layer rate % {pct:?}");
+        }
+    }
+
+    #[test]
     fn wave_bitnet_trains_above_chance() {
         // 4-layer FF, size 16, generous fan-in; 2-class separable task must beat chance. Integration proof
         // that the whole bitset engine (forward + eligibility + shadow update + repack) trains end-to-end.
