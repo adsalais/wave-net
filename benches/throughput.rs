@@ -109,20 +109,26 @@ fn assert_operating_point(net: &mut Network) {
     }
 }
 
-fn bench_throughput(c: &mut Criterion) {
-    // Setup (not measured): build, calibrate to 10%, assert the regime is live.
-    let mut net = setup_net();
-    assert_operating_point(&mut net);
+/// Build the SAME ±1 net WITHOUT critical_init — an uncalibrated, sub-critical operating point. This
+/// mirrors `throughput_bitnet.rs` exactly (fixed ±1 weights, no σ≈1 scaling), so the two engines run
+/// at a MATCHED spike load and the `waves/s` gap reflects pure engine cost (hash vs bitset word-scan),
+/// not the calibrated-vs-uncalibrated difference.
+fn setup_net_uncalibrated() -> Network {
+    let mut net = Network::new(build_config());
+    net.set_record_eligibility(false);
+    net
+}
 
-    // Pre-generate the fixed noise ring OUTSIDE the timed loop so we measure the pure engine,
-    // not the input-hash RNG.
+fn bench_throughput(c: &mut Criterion) {
     let input = random_l0_input(SEED, SIZE, NOISE_FRACTION_Q16);
     let noise: Vec<Vec<u32>> = (0..WAVES_PER_ITER as usize).map(&input).collect();
 
-    // Measured region: replay the ring continuously (no per-iteration reset). ALIF adaptation stays
-    // in its self-regulated ~10% regime across iterations, so each batch reflects steady state.
     let mut group = c.benchmark_group("throughput");
     group.throughput(Throughput::Elements(WAVES_PER_ITER));
+
+    // (1) Calibrated (σ≈1, ~live-through-depth) — wave_net's realistic operating point.
+    let mut net = setup_net();
+    assert_operating_point(&mut net);
     group.bench_function("ff_32x32x5", |b| {
         b.iter(|| {
             for v in &noise {
@@ -130,6 +136,20 @@ fn bench_throughput(c: &mut Criterion) {
             }
         })
     });
+
+    // (2) Uncalibrated (matches throughput_bitnet's operating point) — for the fair, matched-load compare.
+    let mut net_u = setup_net_uncalibrated();
+    let rates_u = measure_rates(&mut net_u, 32, 128, &random_l0_input(SEED, SIZE, NOISE_FRACTION_Q16));
+    let pct_u: Vec<f64> = rates_u.iter().map(|r| (r * 1000.0).round() / 10.0).collect();
+    println!("wave_net (UNCALIBRATED) 32x32x5 FF per-layer firing rate (%): {pct_u:?}");
+    group.bench_function("ff_32x32x5_uncalibrated", |b| {
+        b.iter(|| {
+            for v in &noise {
+                net_u.wave(v);
+            }
+        })
+    });
+
     group.finish();
 }
 
