@@ -49,8 +49,10 @@ pub fn process_layer(
         return;
     }
 
-    // 3. per-neuron step (fused): cooldown decay, decide against ALIF effective threshold, fire-reset +
-    // adapt-bump, leak, adapt-decay; plus e-prop eligibility accrual. Identical to wave_net.
+    // 3. per-neuron step, same dynamics as wave_net but split into passes so the hot arithmetic
+    // vectorizes and the inference path carries no eligibility branch: (A0) eligibility snapshot
+    // [record only], (A) decide/fire/adapt-bump [scalar — diverges + compacts `fired`], (A2)
+    // eligibility pre-trace bump [record only], (B) elementwise leak + adapt-decay [auto-vectorized].
     const PSI_BAND: i32 = 8;
     let (la, lb) = layer.leak;
     let adapt_decay = layer.adapt_decay;
@@ -62,37 +64,53 @@ pub fn process_layer(
     let decide_eff = &mut layer.decide_eff[..ls];
     let elig_pre = &mut layer.elig_pre[..ls];
     let elig_post = &mut layer.elig_post[..ls];
-    for i in 0..ls {
-        let c = cooldown[i].saturating_sub(1); // cooldown decay
-        let p = potential[i];
-        let pi = p as i32;
-        let eff = threshold[i] as i32 + (adapt[i] >> ADAPT_SHIFT);
-
-        if record_elig {
+    // (A0) eligibility snapshot — hoisted out of the fire loop so the inference path skips it entirely.
+    // Reads potential/adapt BEFORE the fire loop mutates them, capturing the pre-fire-reset state.
+    if record_elig {
+        for i in 0..ls {
+            let p = potential[i];
+            let eff = threshold[i] as i32 + (adapt[i] >> ADAPT_SHIFT);
             decide_potential[i] = p; // snapshot pre fire-reset/leak
             decide_eff[i] = eff; // pre-bump effective threshold
-            if (pi - eff).abs() <= PSI_BAND {
+            if (p as i32 - eff).abs() <= PSI_BAND {
                 elig_post[i] += 1;
             }
         }
+    }
 
-        let mut pot = p;
+    // (A) decide + fire (scalar: diverges on the fire branch and compacts `fired`). Writes the
+    // POST-FIRE potential (0 if fired, else left as-is) so (B)'s leak reads it; adapt is bumped here
+    // (pre-decay) and decayed in (B). No `record_elig` branch — eligibility lives in (A0)/(A2).
+    for i in 0..ls {
+        let c = cooldown[i].saturating_sub(1); // cooldown decay
+        let pi = potential[i] as i32;
+        let eff = threshold[i] as i32 + (adapt[i] >> ADAPT_SHIFT);
         if c == 0 && pi >= eff {
-            pot = 0;
+            potential[i] = 0;
             cooldown[i] = cooldown_base;
             let bumped = adapt[i] + (adapt_bump << ADAPT_SHIFT);
             adapt[i] = bumped.clamp(0, ADAPT_MAX);
-            if record_elig {
-                elig_pre[i] += 1;
-            }
             fired.push(i as u32);
         } else {
             cooldown[i] = c;
         }
+    }
 
+    // (A2) eligibility pre-trace bump for the neurons that just fired — record path only.
+    if record_elig {
+        for &i in fired.iter() {
+            elig_pre[i as usize] += 1;
+        }
+    }
+
+    // (B) elementwise tails, each in its own loop so LLVM auto-vectorizes them: the leak (each neuron
+    // reads only its own post-fire potential) and the ALIF adapt-decay (pure elementwise).
+    for i in 0..ls {
+        let pot = potential[i];
         let decay = (pot >> la) + (pot >> lb);
         potential[i] = pot - if pot > 0 { decay.max(1) } else { decay };
-
+    }
+    for i in 0..ls {
         adapt[i] -= adapt[i] >> adapt_decay;
     }
 
