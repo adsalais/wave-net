@@ -120,18 +120,20 @@ pub fn process_layer(
                     // SAFETY: widx < ls*total_slots => widx>>5 < codes.len() (ceil(../32) words).
                     let code = (unsafe { *codes.get_unchecked(widx >> 5) } >> ((widx & 31) * 2)) & 0b11;
                     let w = WCODE[code as usize];
-                    if w != 0 {
-                        // SAFETY (both arms): `cell` is a SET occupancy bit => a sampled cell < neigh, which
-                        // is the length of both `flat` and `lut`; the resulting target is < ls.
-                        let target = if interior {
-                            (li_i + unsafe { *flat.get_unchecked(cell) }) as usize
-                        } else {
-                            let (dx, dy) = unsafe { *lut.get_unchecked(cell) };
-                            local_of(wrap(sx, dx as i32, size), wrap(sy, dy as i32, size), size) as usize
-                        };
-                        // SAFETY: target < ls == target_deliv.len().
-                        unsafe { *target_deliv.get_unchecked_mut(target) += w as i32 };
-                    }
+                    // Branchless delivery: a pruned synapse (w == 0) scatter-adds 0 — a harmless no-op — so
+                    // we drop the data-dependent `if w != 0`. This pays only while sparsity stays low
+                    // (~6-7% at r4/c48, the trained default); a high-sparsity config wants the branch back
+                    // (or an active-occupancy scan) so pruned synapses skip the decode + write entirely.
+                    // SAFETY (both arms): `cell` is a SET occupancy bit => a sampled cell < neigh, which
+                    // is the length of both `flat` and `lut`; the resulting target is < ls.
+                    let target = if interior {
+                        (li_i + unsafe { *flat.get_unchecked(cell) }) as usize
+                    } else {
+                        let (dx, dy) = unsafe { *lut.get_unchecked(cell) };
+                        local_of(wrap(sx, dx as i32, size), wrap(sy, dy as i32, size), size) as usize
+                    };
+                    // SAFETY: target < ls == target_deliv.len().
+                    unsafe { *target_deliv.get_unchecked_mut(target) += w as i32 };
                     rank += 1;
                     word &= word - 1;
                 }
