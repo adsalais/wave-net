@@ -6,7 +6,7 @@
 
 use crate::wave_bitnet::bits::BitSet;
 use crate::wave_bitnet::config::LayerConfig;
-use crate::wave_bitnet::synapse::{key, local_of, map_range, mix, neigh_size, sample_distinct_cells, wrap, xy_of, Synapse, TopologyLevel, P_TARGET, P_THRESHOLD};
+use crate::wave_bitnet::synapse::{key, local_of, map_range, mix, neigh_size, sample_distinct_cells, wrap, xy_of, TopologyLevel, P_TARGET, P_THRESHOLD};
 
 /// Fixed-point scale for `adapt`: it holds the effective threshold contribution × `2^ADAPT_SHIFT`.
 /// Bounded by the i32 overflow limit on the bump-add (`2·ADAPT_MAX = i16::MAX << (SHIFT+1)` must fit
@@ -21,7 +21,7 @@ pub struct Layer {
     pub cooldown: Vec<u8>,
     pub adapt: Vec<i32>,
     pub threshold: Vec<i16>,
-    pub inbox: Vec<Synapse>,
+    pub pending: Vec<i32>, // per-target incoming accumulator (scatter-add target); folded in step 1
     // eligibility / decide-step state (identical to wave_net)
     pub elig_pre: Vec<i32>,
     pub elig_post: Vec<i32>,
@@ -192,7 +192,7 @@ impl Layer {
             cooldown: vec![0u8; ls],
             adapt: vec![0i32; ls],
             threshold,
-            inbox: Vec::new(),
+            pending: vec![0i32; ls],
             elig_pre: vec![0i32; ls],
             elig_post: vec![0i32; ls],
             decide_potential: vec![0i16; ls],

@@ -4,31 +4,28 @@
 //! (No `seed` argument — targets are materialized at construction.)
 
 use crate::wave_bitnet::neurons::{Layer, ADAPT_MAX, ADAPT_SHIFT};
-use crate::wave_bitnet::synapse::{local_of, wrap, xy_of, Synapse};
+use crate::wave_bitnet::synapse::{local_of, wrap, xy_of};
 
 pub fn process_layer(
     layer: &mut Layer,
     layer_index: u32,
     size: u32,
     input: &[u32],
-    acc: &mut [i32],
-    deliveries: &mut [Vec<Synapse>],
+    deliv: &mut [Vec<i32>],
     fired: &mut Vec<u32>,
     record_elig: bool,
 ) {
     let ls = (size as usize) * (size as usize);
 
-    // 1. drain inbox: sum deliveries in i32, fold into potential, narrow to i16 (overflow guard).
-    for a in acc[..ls].iter_mut() {
-        *a = 0;
-    }
-    for s in layer.inbox.iter() {
-        acc[s.target as usize] += s.weight as i32;
-    }
-    layer.inbox.clear();
+    // 1. drain: fold this wave's incoming per-target accumulator (`pending`, scatter-added into last
+    // wave) into potential, then clear it. Deliveries are pre-summed by target — no per-synapse inbox.
     for i in 0..ls {
-        let v = layer.potential[i] as i32 + acc[i];
-        layer.potential[i] = v.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+        let d = layer.pending[i];
+        if d != 0 {
+            let v = layer.potential[i] as i32 + d;
+            layer.potential[i] = v.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+            layer.pending[i] = 0;
+        }
     }
 
     // 2. inject forced-fire input (L0 only). L0 is the input transducer (baseline i16::MAX, no adapt).
@@ -84,9 +81,10 @@ pub fn process_layer(
         layer.adapt[i] -= layer.adapt[i] >> adapt_decay;
     }
 
-    // 4. generate outgoing synapses via a WORD-SCAN of the occupancy bitset — visit only set bits
-    // (trailing_zeros + clear-lowest), decode via the offset LUT (no hashing, no div/mod).
-    let layer_count = deliveries.len() as i32;
+    // 4. generate outgoing deliveries via a WORD-SCAN of the occupancy bitset — visit only set bits
+    // (trailing_zeros + clear-lowest), decode via the offset LUT, and SCATTER-ADD each weight into the
+    // target layer's per-target accumulator (no per-synapse Vec, no hashing, no div/mod).
+    let layer_count = deliv.len() as i32;
     for &local in fired.iter() {
         let li = local as usize;
         let (sx, sy) = xy_of(local, size);
@@ -117,7 +115,7 @@ pub fn process_layer(
                     if w != 0 {
                         let (dx, dy) = lut[cbase + bit];
                         let target = local_of(wrap(sx, dx as i32, size), wrap(sy, dy as i32, size), size);
-                        deliveries[tl].push(Synapse { target, weight: w as i16 });
+                        deliv[tl][target as usize] += w as i32; // scatter-add into the target accumulator
                     }
                     rank += 1;
                     word &= word - 1;
@@ -132,10 +130,10 @@ mod tests {
     use super::*;
     use crate::wave_bitnet::config::LayerConfig;
     use crate::wave_bitnet::neurons::Layer;
-    use crate::wave_bitnet::synapse::{Synapse, TopologyLevel};
+    use crate::wave_bitnet::synapse::TopologyLevel;
 
     #[test]
-    fn firing_neuron_delivers_nonzero_synapses_to_decoded_targets() {
+    fn firing_neuron_scatters_nonzero_weights_to_decoded_targets() {
         let size = 4u32;
         let ls = (size * size) as usize;
         let cfg = LayerConfig { topology: vec![TopologyLevel { level: 1, radius: 1, count: 3 }], leak: (3, 5), cooldown_base: 2, inhibitor_ratio: 0, threshold_jitter: 0, baseline_init: 6, adapt_bump: 0, adapt_decay: 6 };
@@ -144,20 +142,19 @@ mod tests {
         l.threshold.iter_mut().for_each(|t| *t = 1);
         l.cooldown.iter_mut().for_each(|c| *c = 0);
         l.potential[0] = 100;
-        // build expected: iterate neuron 0's wired cells (rank order), decode, skip weight 0
+        // expected: sum decoded nonzero weights per target
         let base = l.slot_base(0);
-        let mut expect: Vec<Synapse> = Vec::new();
+        let mut expect = vec![0i32; ls];
         l.for_wired(0, 0, |r, cell| {
             let w = l.weight_at(0 * l.total_slots + base + r);
             if w != 0 {
-                expect.push(Synapse { target: l.decode(0, 0, cell, size), weight: w as i16 });
+                expect[l.decode(0, 0, cell, size) as usize] += w as i32;
             }
         });
-        let mut acc = vec![0i32; ls];
-        let mut deliveries: Vec<Vec<Synapse>> = vec![Vec::new(); 2];
+        let mut deliv: Vec<Vec<i32>> = vec![vec![0i32; ls]; 2];
         let mut fired = Vec::new();
-        process_layer(&mut l, 0, size, &[], &mut acc, &mut deliveries, &mut fired, true);
+        process_layer(&mut l, 0, size, &[], &mut deliv, &mut fired, true);
         assert_eq!(fired, vec![0], "only neuron 0 fires");
-        assert_eq!(deliveries[1], expect, "delivers decoded nonzero synapses to layer 1");
+        assert_eq!(deliv[1], expect, "scatter-adds decoded nonzero weights into layer 1's accumulator");
     }
 }

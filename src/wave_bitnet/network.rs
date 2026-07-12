@@ -5,7 +5,6 @@
 
 use crate::wave_bitnet::config::Config;
 use crate::wave_bitnet::neurons::Layer;
-use crate::wave_bitnet::synapse::Synapse;
 use crate::wave_bitnet::wave::process_layer;
 
 pub struct Network {
@@ -21,9 +20,8 @@ pub struct Network {
 /// Reusable per-wave scratch: `deliveries[z]` accumulates synapses bound for layer `z` next wave; it is
 /// disjoint from every `inbox`, so each layer's drained `inbox` is swapped with its `deliveries` at wave end.
 struct Scratch {
-    acc: Vec<i32>,
     fired: Vec<u32>,
-    deliveries: Vec<Vec<Synapse>>,
+    deliv: Vec<Vec<i32>>, // per layer: dense per-target incoming accumulator for the NEXT wave
 }
 
 impl Network {
@@ -60,9 +58,8 @@ impl Network {
             layers,
             wave_id: 0,
             scratch: Scratch {
-                acc: vec![0i32; ls],
                 fired: Vec::new(),
-                deliveries: (0..l).map(|_| Vec::new()).collect(),
+                deliv: (0..l).map(|_| vec![0i32; ls]).collect(),
             },
             record_eligibility: true,
             listeners: (0..l).map(|_| None).collect(),
@@ -76,16 +73,18 @@ impl Network {
         let size = self.size;
         let record_elig = self.record_eligibility;
         let Self { layers, scratch, listeners, .. } = self;
-        let Scratch { acc, fired, deliveries } = scratch;
+        let Scratch { fired, deliv } = scratch;
         for z in 0..l {
             let inp: &[u32] = if z == 0 { input } else { &[] };
-            process_layer(&mut layers[z], z as u32, size, inp, acc, deliveries, fired, record_elig);
+            process_layer(&mut layers[z], z as u32, size, inp, deliv, fired, record_elig);
             if let Some(listener) = &listeners[z] {
                 listener(w, fired);
             }
         }
+        // Swap each layer's (now drained-and-cleared) `pending` with the accumulator just scattered
+        // into for it — so next wave folds this wave's deliveries, and `deliv` returns to all-zeros.
         for i in 0..l {
-            std::mem::swap(&mut layers[i].inbox, &mut deliveries[i]);
+            std::mem::swap(&mut layers[i].pending, &mut deliv[i]);
         }
     }
 
@@ -113,10 +112,10 @@ impl Network {
             g.elig_pre.iter_mut().for_each(|e| *e = 0);
             g.elig_post.iter_mut().for_each(|e| *e = 0);
             g.decide_potential.iter_mut().for_each(|p| *p = 0);
-            g.inbox.clear();
+            g.pending.iter_mut().for_each(|p| *p = 0);
         }
-        for d in self.scratch.deliveries.iter_mut() {
-            d.clear();
+        for d in self.scratch.deliv.iter_mut() {
+            d.iter_mut().for_each(|x| *x = 0);
         }
         self.wave_id = 0;
     }
