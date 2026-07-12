@@ -4,4 +4,6 @@
 //! Spec: docs/superpowers/specs/2026-07-12-wave-bitnet-design.md.
 
 pub mod bits;
+pub mod config;
+pub mod neurons;
 pub mod synapse;
