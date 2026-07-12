@@ -27,13 +27,13 @@ pub fn process_layer(
 
     // 1. drain: fold this wave's incoming per-target accumulator (`pending`, scatter-added into last
     // wave) into potential, then clear it. Deliveries are pre-summed by target — no per-synapse inbox.
+    // Branchless (no `if d != 0`) so it auto-vectorizes: adding 0 then clamping an already-in-range
+    // i16 is a no-op, and pending is zeroed unconditionally (it must end all-zero for the wave-end
+    // swap). The i32→i16 saturating clamp maps to a packed pack-with-saturation.
     for i in 0..ls {
-        let d = pending[i];
-        if d != 0 {
-            let v = potential[i] as i32 + d;
-            potential[i] = v.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-            pending[i] = 0;
-        }
+        let v = potential[i] as i32 + pending[i];
+        potential[i] = v.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+        pending[i] = 0;
     }
 
     // 2. inject forced-fire input (L0 only). L0 is the input transducer (baseline i16::MAX, no adapt).
