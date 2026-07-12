@@ -5,6 +5,7 @@
 
 pub mod bits;
 pub mod config;
+pub mod multilayer_dfa;
 pub mod network;
 pub mod neurons;
 pub mod synapse;
