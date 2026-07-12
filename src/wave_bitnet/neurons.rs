@@ -44,7 +44,8 @@ pub struct Layer {
     pub occ_wpn: Vec<usize>,         // per level: u64 words per neuron = ceil(neigh/64)
     // TOPOLOGY: per-neuron occupancy, word-aligned. occ[ℓ] has ls·occ_wpn[ℓ] words; neuron i at [i·wpn..].
     pub occ: Vec<Vec<u64>>,
-    pub offsets: Vec<Vec<(i8, i8)>>, // per level: cell -> (dx, dy) LUT (length neigh[ℓ])
+    pub offsets: Vec<Vec<(i8, i8)>>, // per level: cell -> (dx, dy) LUT (for the wrapping edge path)
+    pub off_flat: Vec<Vec<i32>>,     // per level: cell -> dy·size + dx (flat delta, interior fast path)
     // WEIGHTS (rank-indexed): 2-bit codes packed 32 per u64 — 0b00=0, 0b01=+1, 0b11=−1.
     pub codes: Vec<u64>,  // ceil(ls·total_slots / 32) words
     pub shadow: Vec<f32>, // ls·total_slots
@@ -128,6 +129,7 @@ impl Layer {
         let mut neigh = Vec::with_capacity(n_levels);
         let mut occ_wpn = Vec::with_capacity(n_levels);
         let mut offsets: Vec<Vec<(i8, i8)>> = Vec::with_capacity(n_levels);
+        let mut off_flat: Vec<Vec<i32>> = Vec::with_capacity(n_levels);
         let mut total_slots = 0usize;
         for t in &cfg.topology {
             slot_bases.push(total_slots);
@@ -139,6 +141,15 @@ impl Layer {
             offsets.push(
                 (0..n)
                     .map(|c| (((c as u32 % span) as i32 - r) as i8, ((c as u32 / span) as i32 - r) as i8))
+                    .collect(),
+            );
+            off_flat.push(
+                (0..n)
+                    .map(|c| {
+                        let dx = (c as u32 % span) as i32 - r;
+                        let dy = (c as u32 / span) as i32 - r;
+                        dy * size as i32 + dx
+                    })
                     .collect(),
             );
             total_slots += t.count as usize;
@@ -202,6 +213,7 @@ impl Layer {
             occ_wpn,
             occ,
             offsets,
+            off_flat,
             codes: vec![0u64; (ls * total_slots + 31) / 32],
             shadow,
         };

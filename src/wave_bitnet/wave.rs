@@ -99,24 +99,37 @@ pub fn process_layer(
             let words = unsafe { layer.occ.get_unchecked(lvl).get_unchecked(li * wpn..li * wpn + wpn) };
             let wbase = li * layer.total_slots + layer.slot_bases[lvl];
             let lut = unsafe { layer.offsets.get_unchecked(lvl) };
+            let flat = unsafe { layer.off_flat.get_unchecked(lvl) };
             let codes = &layer.codes;
             // SAFETY: tl was range-checked above (0 <= tl < layer_count == deliv.len()).
             let target_deliv = unsafe { deliv.get_unchecked_mut(tl) };
+            // Interior source (>= radius from every toroidal edge) => no synapse wraps => the target is a
+            // single add `li + flat[cell]`. `interior` is loop-invariant (perfect prediction / unswitchable).
+            let r = entry.radius;
+            let hi = size.saturating_sub(r);
+            let interior = sx >= r && sx < hi && sy >= r && sy < hi;
+            let li_i = li as i32;
             let mut rank = 0usize;
             for (wi, &w0) in words.iter().enumerate() {
                 let mut word = w0;
                 let cbase = wi * 64;
                 while word != 0 {
                     let bit = word.trailing_zeros() as usize;
+                    let cell = cbase + bit;
                     let widx = wbase + rank;
                     // SAFETY: widx < ls*total_slots => widx>>5 < codes.len() (ceil(../32) words).
                     let code = (unsafe { *codes.get_unchecked(widx >> 5) } >> ((widx & 31) * 2)) & 0b11;
                     let w = WCODE[code as usize];
                     if w != 0 {
-                        // SAFETY: cbase+bit is a SET occupancy bit => a sampled cell < neigh == lut.len().
-                        let (dx, dy) = unsafe { *lut.get_unchecked(cbase + bit) };
-                        let target = local_of(wrap(sx, dx as i32, size), wrap(sy, dy as i32, size), size) as usize;
-                        // SAFETY: target = decode_cell(..) < size^2 == ls == target_deliv.len().
+                        // SAFETY (both arms): `cell` is a SET occupancy bit => a sampled cell < neigh, which
+                        // is the length of both `flat` and `lut`; the resulting target is < ls.
+                        let target = if interior {
+                            (li_i + unsafe { *flat.get_unchecked(cell) }) as usize
+                        } else {
+                            let (dx, dy) = unsafe { *lut.get_unchecked(cell) };
+                            local_of(wrap(sx, dx as i32, size), wrap(sy, dy as i32, size), size) as usize
+                        };
+                        // SAFETY: target < ls == target_deliv.len().
                         unsafe { *target_deliv.get_unchecked_mut(target) += w as i32 };
                     }
                     rank += 1;
