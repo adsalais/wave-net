@@ -17,21 +17,30 @@ pub fn process_layer(
 ) {
     let ls = (size as usize) * (size as usize);
 
+    // Reslice the per-neuron arrays to exactly `ls` once. Each `[..ls]` is a SINGLE bounds check;
+    // indexing `arr[i]` for i in 0..ls afterwards is check-free (the compiler proves i < len == ls),
+    // eliding the per-access bounds checks in these hot loops. Disjoint fields => the borrows coexist,
+    // and NLL drops them before the generate step reborrows `layer`. No `unsafe` needed.
+    let pending = &mut layer.pending[..ls];
+    let potential = &mut layer.potential[..ls];
+    let cooldown = &mut layer.cooldown[..ls];
+
     // 1. drain: fold this wave's incoming per-target accumulator (`pending`, scatter-added into last
     // wave) into potential, then clear it. Deliveries are pre-summed by target — no per-synapse inbox.
     for i in 0..ls {
-        let d = layer.pending[i];
+        let d = pending[i];
         if d != 0 {
-            let v = layer.potential[i] as i32 + d;
-            layer.potential[i] = v.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-            layer.pending[i] = 0;
+            let v = potential[i] as i32 + d;
+            potential[i] = v.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+            pending[i] = 0;
         }
     }
 
     // 2. inject forced-fire input (L0 only). L0 is the input transducer (baseline i16::MAX, no adapt).
+    // (`a` is input-sourced, not 0..ls, so these stay bounds-checked — negligible: L0 only, few sites.)
     for &a in input {
-        layer.potential[a as usize] = i16::MAX;
-        layer.cooldown[a as usize] = 0;
+        potential[a as usize] = i16::MAX;
+        cooldown[a as usize] = 0;
     }
 
     // A readout layer is a non-spiking drain-only integrator: return after the fold.
@@ -47,38 +56,44 @@ pub fn process_layer(
     let adapt_decay = layer.adapt_decay;
     let cooldown_base = layer.cooldown_base;
     let adapt_bump = layer.adapt_bump as i32;
+    let threshold = &layer.threshold[..ls];
+    let adapt = &mut layer.adapt[..ls];
+    let decide_potential = &mut layer.decide_potential[..ls];
+    let decide_eff = &mut layer.decide_eff[..ls];
+    let elig_pre = &mut layer.elig_pre[..ls];
+    let elig_post = &mut layer.elig_post[..ls];
     for i in 0..ls {
-        let c = layer.cooldown[i].saturating_sub(1); // cooldown decay
-        let p = layer.potential[i];
+        let c = cooldown[i].saturating_sub(1); // cooldown decay
+        let p = potential[i];
         let pi = p as i32;
-        let eff = layer.threshold[i] as i32 + (layer.adapt[i] >> ADAPT_SHIFT);
+        let eff = threshold[i] as i32 + (adapt[i] >> ADAPT_SHIFT);
 
         if record_elig {
-            layer.decide_potential[i] = p; // snapshot pre fire-reset/leak
-            layer.decide_eff[i] = eff; // pre-bump effective threshold
+            decide_potential[i] = p; // snapshot pre fire-reset/leak
+            decide_eff[i] = eff; // pre-bump effective threshold
             if (pi - eff).abs() <= PSI_BAND {
-                layer.elig_post[i] += 1;
+                elig_post[i] += 1;
             }
         }
 
         let mut pot = p;
         if c == 0 && pi >= eff {
             pot = 0;
-            layer.cooldown[i] = cooldown_base;
-            let bumped = layer.adapt[i] + (adapt_bump << ADAPT_SHIFT);
-            layer.adapt[i] = bumped.clamp(0, ADAPT_MAX);
+            cooldown[i] = cooldown_base;
+            let bumped = adapt[i] + (adapt_bump << ADAPT_SHIFT);
+            adapt[i] = bumped.clamp(0, ADAPT_MAX);
             if record_elig {
-                layer.elig_pre[i] += 1;
+                elig_pre[i] += 1;
             }
             fired.push(i as u32);
         } else {
-            layer.cooldown[i] = c;
+            cooldown[i] = c;
         }
 
         let decay = (pot >> la) + (pot >> lb);
-        layer.potential[i] = pot - if pot > 0 { decay.max(1) } else { decay };
+        potential[i] = pot - if pot > 0 { decay.max(1) } else { decay };
 
-        layer.adapt[i] -= layer.adapt[i] >> adapt_decay;
+        adapt[i] -= adapt[i] >> adapt_decay;
     }
 
     // 4. generate outgoing deliveries via a WORD-SCAN of the occupancy bitset — visit only set bits
