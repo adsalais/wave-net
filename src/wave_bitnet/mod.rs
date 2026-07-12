@@ -7,3 +7,4 @@ pub mod bits;
 pub mod config;
 pub mod neurons;
 pub mod synapse;
+pub mod wave;
