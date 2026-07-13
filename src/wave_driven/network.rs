@@ -5,6 +5,7 @@
 use crate::wave_driven::config::Config;
 use crate::wave_driven::frontier::Frontier;
 use crate::wave_driven::neurons::Layer;
+use crate::wave_driven::synapse::{local_of, wrap, xy_of};
 use crate::wave_driven::training::EligParams;
 use crate::wave_driven::wave::{process_layer, Work};
 
@@ -104,11 +105,16 @@ impl Network {
                 for &a in input {
                     self.frontier[0].push(a);
                 }
-                let Self { layers, deliv, fired, frontier, frontier_next, listeners, .. } = self;
+                let training = self.is_training();
+                let Self { layers, deliv, fired, frontier, frontier_next, fired_by_layer, listeners, .. } = self;
                 for z in 0..l {
                     let inp: &[u32] = if z == 0 { input } else { &[] };
                     let cur = &frontier[z].list;
                     process_layer(&mut layers[z], z as u32, size, inp, w, Work::Sparse { cur, frontier_next }, deliv, fired);
+                    if training {
+                        fired_by_layer[z].clear();
+                        fired_by_layer[z].extend_from_slice(fired);
+                    }
                     if let Some(cb) = &listeners[z] {
                         cb(w as usize, fired);
                     }
@@ -123,6 +129,9 @@ impl Network {
                     f.clear();
                 }
             }
+        }
+        if self.mode == Mode::Sparse && self.is_training() {
+            self.accrue_eligibility();
         }
     }
 
@@ -170,6 +179,104 @@ impl Network {
     /// Per-neuron spike count accumulated since the last reset (for rate_reg). Requires training.
     pub fn layer_spike_count(&self, z: usize) -> &[u32] {
         &self.layers[z].train.as_ref().expect("layer_spike_count requires training enabled").spike_count
+    }
+
+    /// Accrue membrane spike-ψ eligibility for this wave (source-driven scan). Called after the wave's
+    /// layer step, when training. `e_ij += pretr_i` for every synapse whose target fired this wave.
+    fn accrue_eligibility(&mut self) {
+        let size = self.size;
+        let l = self.layers.len();
+        let decay = 1.0 - 1.0 / self.elig_params.rec_tau.max(1.0);
+        let eps = self.elig_params.epsilon;
+        let Self { layers, fired_by_layer, fired_bitset, pretr_active, dirty_rows, .. } = self;
+
+        // 1. fired bitset + spike_count
+        for z in 0..l {
+            for &j in &fired_by_layer[z] {
+                fired_bitset[z][(j >> 6) as usize] |= 1u64 << (j & 63);
+            }
+            if let Some(t) = layers[z].train.as_mut() {
+                for &j in &fired_by_layer[z] {
+                    t.spike_count[j as usize] += 1;
+                }
+            }
+        }
+
+        // 2. pretr update: decay -> eps-drop -> bump firers (canonical order; matches the dense oracle)
+        for z in 0..l {
+            let Some(t) = layers[z].train.as_mut() else { continue };
+            let pretr = &mut t.pretr;
+            let old: Vec<u32> = std::mem::take(&mut pretr_active[z].list);
+            for &i in &old {
+                pretr_active[z].mark[(i >> 6) as usize] &= !(1u64 << (i & 63));
+            }
+            for &i in &old {
+                let iu = i as usize;
+                pretr[iu] *= decay;
+                if pretr[iu] < eps {
+                    pretr[iu] = 0.0;
+                } else {
+                    pretr_active[z].push(i);
+                }
+            }
+            for &j in &fired_by_layer[z] {
+                pretr[j as usize] += 1.0;
+                pretr_active[z].push(j);
+            }
+        }
+
+        // 3. accrue: for each source with a live trace, scan its fan-out, add pretr where target fired
+        for z in 0..l {
+            if layers[z].train.is_none() {
+                continue;
+            }
+            let ts = layers[z].total_slots;
+            let Layer { topology, slot_bases, occ_wpn, occ, offsets, train, .. } = &mut layers[z];
+            let tr = train.as_mut().unwrap();
+            for &iu in &pretr_active[z].list {
+                let i = iu as usize;
+                let pr = tr.pretr[i];
+                if pr == 0.0 {
+                    continue;
+                }
+                let (sx, sy) = xy_of(iu, size);
+                for (e_idx, entry) in topology.iter().enumerate() {
+                    let tz_i = z as i32 + entry.level;
+                    if tz_i < 0 || tz_i as usize >= l {
+                        continue;
+                    }
+                    let tz = tz_i as usize;
+                    let sbase = slot_bases[e_idx];
+                    let wpn = occ_wpn[e_idx];
+                    let words = &occ[e_idx][i * wpn..i * wpn + wpn];
+                    let fb = &fired_bitset[tz];
+                    let mut rank = 0usize;
+                    for (wi, &w0) in words.iter().enumerate() {
+                        let mut word = w0;
+                        let cbase = wi * 64;
+                        while word != 0 {
+                            let bit = word.trailing_zeros() as usize;
+                            let cell = cbase + bit;
+                            let (dx, dy) = offsets[e_idx][cell];
+                            let j = local_of(wrap(sx, dx as i32, size), wrap(sy, dy as i32, size), size);
+                            if fb[(j >> 6) as usize] & (1u64 << (j & 63)) != 0 {
+                                tr.elig[i * ts + sbase + rank] += pr;
+                                dirty_rows[z].push(iu);
+                            }
+                            rank += 1;
+                            word &= word - 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4. clear this wave's fired bitset for reuse next wave
+        for z in 0..l {
+            for &j in &fired_by_layer[z] {
+                fired_bitset[z][(j >> 6) as usize] &= !(1u64 << (j & 63));
+            }
+        }
     }
 
     /// Clear all per-trial training accumulators (elig over dirty rows, pretr over the active set,
@@ -295,6 +402,30 @@ mod tests {
         net.with_layer(0, |l| assert_eq!(l.train.as_ref().unwrap().shadow.len(), l.synapse_count()));
         net.disable_training();
         assert!(!net.is_training());
+    }
+
+    #[test]
+    fn accrual_marks_eligibility_and_is_deterministic() {
+        let cfg = {
+            let up = LayerConfig { topology: vec![TopologyLevel { level: 1, radius: 2, count: 8 }], leak: (3, 5), cooldown_base: 2, inhibitor_ratio: 0, threshold_jitter: 0, baseline_init: 3, adapt_bump: 0, adapt_decay: 6 };
+            let top = LayerConfig { topology: vec![], ..up.clone() };
+            Config { seed: 21, size: 8, layers: vec![up, top] }
+        };
+        let mut a = Network::new(cfg.clone());
+        let mut b = Network::new(cfg);
+        a.enable_training();
+        b.enable_training();
+        for _ in 0..12 {
+            a.wave(&[0, 1, 2, 8, 9, 10]);
+            b.wave(&[0, 1, 2, 8, 9, 10]);
+        }
+        a.with_layer(0, |la| {
+            b.with_layer(0, |lb| {
+                assert_eq!(la.train.as_ref().unwrap().elig, lb.train.as_ref().unwrap().elig, "deterministic elig");
+            })
+        });
+        let any = a.with_layer(0, |l| l.train.as_ref().unwrap().elig.iter().any(|&e| e > 0.0));
+        assert!(any, "some L0->L1 eligibility accrued once L1 neurons fire");
     }
 
     #[test]
