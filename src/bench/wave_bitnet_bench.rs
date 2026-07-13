@@ -242,7 +242,7 @@ mod tests {
     #[test]
     #[ignore] // diagnostic: find a threshold that keeps a uniform 5-layer FF alive (no critical_init)
     fn bitnet_rate_sweep() {
-        use crate::wave_net::critical_init::random_l0_input;
+        use crate::wave_bitnet::synapse::random_l0_input;
         let (size, seed) = (32u32, 0xC0FFEE_1234_5678u64);
         for &bi in &[0i16, 1, 2, 3, 4, 6] {
             let lc = LayerConfig { topology: vec![TopologyLevel { level: 1, radius: 3, count: 32 }], leak: (3, 5), cooldown_base: 2, inhibitor_ratio: 0, threshold_jitter: 32, baseline_init: bi, adapt_bump: 5, adapt_decay: 6 };

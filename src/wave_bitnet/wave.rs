@@ -1,7 +1,6 @@
-//! `wave` — one layer's per-wave step. Neuron dynamics (drain → inject → decide/fire/ALIF/leak) are
-//! identical to `wave_net`; only the synapse-generation step differs: instead of hashing targets on the
-//! fly, it scans the occupancy bitset and decodes each wired cell, delivering the packed ±1/0 weight.
-//! (No `seed` argument — targets are materialized at construction.)
+//! `wave` — one layer's per-wave step: drain → inject → decide/fire/ALIF/leak, then synapse generation.
+//! Synapse generation scans the per-neuron occupancy bitset and decodes each wired cell, delivering the
+//! packed ±1/0 weight (no per-wave hashing; targets are materialized at construction, so no `seed`).
 
 use crate::wave_bitnet::neurons::{Layer, ADAPT_MAX, ADAPT_SHIFT, WCODE};
 use crate::wave_bitnet::synapse::{local_of, wrap, xy_of};
@@ -49,7 +48,7 @@ pub fn process_layer(
         return;
     }
 
-    // 3. per-neuron step, same dynamics as wave_net but split into passes so the hot arithmetic
+    // 3. per-neuron step, split into passes so the hot arithmetic
     // vectorizes and the inference path carries no eligibility branch: (A0) eligibility snapshot
     // [record only], (A) decide/fire/adapt-bump [scalar — diverges + compacts `fired`], (A2)
     // eligibility pre-trace bump [record only], (B) elementwise leak + adapt-decay [auto-vectorized].

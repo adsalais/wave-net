@@ -1,7 +1,6 @@
 //! `network` — owns the layer stack, drives each wave, routes generated synapses into target inboxes.
-//! Mirrors `wave_net::network`, minus the runtime seed (targets are materialized in each `Layer`'s
-//! occupancy bitset at construction, so no hashing happens at wave time). Adds the shadow-based
-//! `eprop_update_synaptic` whose targets are decoded from the occupancy.
+//! Targets are materialized in each `Layer`'s occupancy bitset at construction, so no hashing happens at
+//! wave time. Provides the shadow-based `eprop_update_synaptic` whose targets are decoded from the occupancy.
 
 use crate::wave_bitnet::config::Config;
 use crate::wave_bitnet::neurons::Layer;

@@ -18,13 +18,11 @@ use std::sync::{Arc, Mutex};
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 
-// `random_l0_input` is an engine-agnostic L0 spike-site generator (input locations only), reused to
-// keep the drive byte-identical to the FF baseline in `throughput.rs`.
+// `random_l0_input` is an engine-agnostic L0 spike-site generator (input locations only).
 use wave_net::wave_bitnet::config::{Config, LayerConfig};
 use wave_net::wave_bitnet::multilayer_dfa::{multilayer_dfa_step, Edge, EligParams, TrialRecords, PSI_WIDTH};
 use wave_net::wave_bitnet::network::Network;
-use wave_net::wave_bitnet::synapse::{key, mix, TopologyLevel};
-use wave_net::wave_net::critical_init::random_l0_input;
+use wave_net::wave_bitnet::synapse::{key, mix, random_l0_input, TopologyLevel};
 
 const SIZE: u32 = 32;
 const SEED: u64 = 0xC0FFEE_1234_5678;
@@ -50,7 +48,7 @@ fn cache_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("wave_bitnet_sidecar_s32_par3.wbm")
 }
 
-// ---- side-car builder (ported from the wave_net `multilayer_dfa` harness `make_sidecar`) ----
+// ---- side-car builder (backward-fed 5-layer side-car; duplicated from the bench harness) ----
 // L0→L1(+1); L1→L3(+2 skip); L2 self(0)+→L3(+1); L3→L2(−1)+→L4(+1); L4 read. Forward/skip use (uc, ur);
 // the recurrent side-car uses (n, r). `entries` mirror the built topology order so DFA credit lines up.
 fn make_sidecar(seed: u64, size: u32, uc: u32, ur: u32, n: u32, r: u32, adapt_bump: i16, adapt_decay: u8) -> (Network, Vec<Vec<Edge>>) {

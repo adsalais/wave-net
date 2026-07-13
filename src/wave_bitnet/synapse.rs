@@ -1,4 +1,4 @@
-//! `synapse` — hash helpers (copied verbatim from `wave_net::synapse`) plus the two routines that
+//! `synapse` — hash helpers plus the two routines that
 //! replace procedural target generation: `decode_cell` (neighborhood cell → target local, arithmetic)
 //! and `sample_distinct_cells` (startup fill of `count` distinct cells via partial Fisher-Yates).
 
@@ -51,6 +51,23 @@ pub fn key(seed: u64, idx: u32, dz: i32, slot: u32, purpose: u64) -> u64 {
     k = k.wrapping_mul(GOLDEN).wrapping_add(slot as u64);
     k = k.wrapping_mul(GOLDEN).wrapping_add(purpose);
     k
+}
+
+/// Deterministic random L0 spike-site generator: returns a closure mapping a wave index to the L0
+/// local addresses that fire that wave (each of the `size²` sites fires iff its per-(seed, site, wave)
+/// hash falls below `fraction_q16` in Q16). Engine-agnostic input drive for throughput/profiling.
+pub fn random_l0_input(seed: u64, size: u32, fraction_q16: u32) -> impl Fn(usize) -> Vec<u32> {
+    let ls = size * size;
+    move |wave: usize| {
+        let mut v = Vec::new();
+        for local in 0..ls {
+            let h = mix(key(seed, local, 0, wave as u32, P_INPUT));
+            if ((h & 0xFFFF) as u32) < fraction_q16 {
+                v.push(local);
+            }
+        }
+        v
+    }
 }
 
 /// Map 32 random bits to `0..span` with no modulo bias (Lemire multiply-shift).

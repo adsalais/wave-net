@@ -64,13 +64,13 @@ pub(crate) fn derive_layout(topology: &[TopologyLevel], size: u32) -> DerivedLay
 }
 
 pub struct Layer {
-    // neuron state (identical to wave_net::neurons::Layer)
+    // neuron state
     pub potential: Vec<i16>,
     pub cooldown: Vec<u8>,
     pub adapt: Vec<i32>,
     pub threshold: Vec<i16>,
     pub pending: Vec<i32>, // per-target incoming accumulator (scatter-add target); folded in step 1
-    // eligibility / decide-step state (identical to wave_net)
+    // eligibility / decide-step state
     pub elig_pre: Vec<i32>,
     pub elig_post: Vec<i32>,
     pub decide_potential: Vec<i16>,
@@ -248,7 +248,7 @@ impl Layer {
         let DerivedLayout { total_slots, slot_bases, neigh, occ_wpn, offsets, off_flat } =
             derive_layout(&cfg.topology, size);
 
-        // threshold: baseline_init + rand(0..threshold_jitter), clamp(1, i16::MAX)  (verbatim wave_net)
+        // threshold: baseline_init + rand(0..threshold_jitter), clamp(1, i16::MAX)
         let mut threshold = vec![0i16; ls];
         for (local, th) in threshold.iter_mut().enumerate() {
             let global = (base + local) as u32;

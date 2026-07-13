@@ -10,9 +10,6 @@ blake3 = { version = "1", optional = true }
 # seed-fragility. `cargo test --features strong_hash`. The engine stays dependency-free by default.
 [features]
 strong_hash = ["dep:blake3"]
-# Test-only: procedural random-magnitude synapse weights (sign × 1..=16) instead of ±1, to test whether a
-# richer fixed random projection improves learnability. Default build stays ±1.
-random_weights = []
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -21,10 +18,6 @@ criterion = { version = "0.5", features = ["html_reports"] }
 [profile.profiling]
 inherits = "release"
 debug = true
-
-[[bench]]
-name = "throughput"
-harness = false
 
 [[bench]]
 name = "throughput_bitnet"

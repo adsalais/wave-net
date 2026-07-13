@@ -7,8 +7,7 @@
 
 use wave_net::wave_bitnet::config::{Config, LayerConfig};
 use wave_net::wave_bitnet::network::Network;
-use wave_net::wave_bitnet::synapse::TopologyLevel;
-use wave_net::wave_net::critical_init::random_l0_input;
+use wave_net::wave_bitnet::synapse::{random_l0_input, TopologyLevel};
 
 fn main() {
     let n_waves: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(400_000);

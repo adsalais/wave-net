@@ -1,6 +1,6 @@
 //! `multilayer_dfa` — the temporal multi-topology multi-layer-DFA training engine for `wave_bitnet`.
-//! Ported from `wave_net::multilayer_dfa`; the only change is that a synapse's target is DECODED from
-//! the source layer's occupancy bitset (wired-rank order) instead of hashed via `target_of`.
+//! A synapse's target is DECODED from the source layer's occupancy bitset (wired-rank order), so credit
+//! assignment reuses the same materialized topology the forward pass iterates.
 
 use crate::wave_bitnet::network::Network;
 

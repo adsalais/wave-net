@@ -1,6 +1,6 @@
 //! Construction input for the engine: a shared square `size`, a seed, and one `LayerConfig` per layer.
-//! Thresholds are computed per neuron in `Layer::new`. (Copied from `wave_net::config`; `validate`
-//! additionally enforces `count <= (2r+1)²` because the fork stores topology as a per-cell bitset.)
+//! Thresholds are computed per neuron in `Layer::new`. `validate` enforces `count <= (2r+1)²` because
+//! the engine stores topology as a per-cell occupancy bitset (fan-in is capped at the neighborhood size).
 
 use crate::wave_bitnet::synapse::TopologyLevel;
 
