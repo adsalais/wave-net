@@ -6,7 +6,7 @@ use crate::wave_driven::config::Config;
 use crate::wave_driven::frontier::Frontier;
 use crate::wave_driven::neurons::Layer;
 use crate::wave_driven::synapse::{local_of, wrap, xy_of};
-use crate::wave_driven::training::EligParams;
+use crate::wave_driven::training::{Edge, EligParams};
 use crate::wave_driven::wave::{process_layer, Work};
 
 #[derive(Clone, Copy, PartialEq)]
@@ -279,6 +279,63 @@ impl Network {
         }
     }
 
+    /// Apply one multi-layer-DFA update from the accumulated eligibility: for each trainable edge
+    /// (`tz = z + level ∈ [1, L)`), `shadow[i,edge,r] += −lr·signal[tz][j]·elig[i,edge,r]` over the
+    /// dirty rows, then repack each touched row. Targets decoded from the occupancy (inlined).
+    pub fn dfa_update(&mut self, entries: &[Vec<Edge>], signal: &[Vec<f32>], lr: f32) {
+        let size = self.size;
+        let l = self.layers.len();
+        let Self { layers, dirty_rows, .. } = self;
+        for z in 0..l {
+            if layers[z].train.is_none() {
+                continue;
+            }
+            for ri in 0..dirty_rows[z].list.len() {
+                let iu = dirty_rows[z].list[ri];
+                let i = iu as usize;
+                let mut touched = false;
+                {
+                    let ts = layers[z].total_slots;
+                    let Layer { slot_bases, occ_wpn, occ, offsets, train, .. } = &mut layers[z];
+                    let tr = train.as_mut().unwrap();
+                    let (sx, sy) = xy_of(iu, size);
+                    for (e_idx, edge) in entries[z].iter().enumerate() {
+                        let tz_i = z as i32 + edge.level;
+                        if tz_i < 1 || tz_i as usize >= l {
+                            continue;
+                        }
+                        let tz = tz_i as usize;
+                        let sbase = slot_bases[e_idx];
+                        let wpn = occ_wpn[e_idx];
+                        let words = &occ[e_idx][i * wpn..i * wpn + wpn];
+                        let mut rank = 0usize;
+                        for (wi, &w0) in words.iter().enumerate() {
+                            let mut word = w0;
+                            let cbase = wi * 64;
+                            while word != 0 {
+                                let bit = word.trailing_zeros() as usize;
+                                let cell = cbase + bit;
+                                let (dx, dy) = offsets[e_idx][cell];
+                                let j = local_of(wrap(sx, dx as i32, size), wrap(sy, dy as i32, size), size) as usize;
+                                let widx = i * ts + sbase + rank;
+                                let e = tr.elig[widx];
+                                if e != 0.0 {
+                                    tr.shadow[widx] += -lr * signal[tz][j] * e;
+                                    touched = true;
+                                }
+                                rank += 1;
+                                word &= word - 1;
+                            }
+                        }
+                    }
+                }
+                if touched {
+                    layers[z].repack_row(i);
+                }
+            }
+        }
+    }
+
     /// Clear all per-trial training accumulators (elig over dirty rows, pretr over the active set,
     /// spike_count densely) and the per-wave work-sets. Called by `reset_state`.
     pub fn reset_eligibility(&mut self) {
@@ -402,6 +459,36 @@ mod tests {
         net.with_layer(0, |l| assert_eq!(l.train.as_ref().unwrap().shadow.len(), l.synapse_count()));
         net.disable_training();
         assert!(!net.is_training());
+    }
+
+    #[test]
+    fn dfa_update_with_negative_signal_raises_eligible_synapse() {
+        let cfg = {
+            let up = LayerConfig { topology: vec![TopologyLevel { level: 1, radius: 2, count: 8 }], leak: (3, 5), cooldown_base: 2, inhibitor_ratio: 0, threshold_jitter: 0, baseline_init: 3, adapt_bump: 0, adapt_decay: 6 };
+            let top = LayerConfig { topology: vec![], ..up.clone() };
+            Config { seed: 5, size: 8, layers: vec![up, top] }
+        };
+        let entries = vec![vec![Edge { level: 1, count: 8, radius: 2 }], vec![]];
+        let mut net = Network::new(cfg);
+        net.enable_training();
+        // zero L0 row 0's shadow then repack -> fully pruned
+        net.with_layer_mut_test(0, |l| {
+            let ts = l.total_slots;
+            for s in 0..ts {
+                l.train.as_mut().unwrap().shadow[s] = 0.0;
+            }
+            l.repack_row(0);
+        });
+        net.reset_state();
+        for _ in 0..12 {
+            net.wave(&[0, 1, 2, 8, 9, 10]);
+        }
+        let ls = 64usize;
+        let signal = vec![vec![0f32; ls], vec![-1.0f32; ls]];
+        let before: f32 = net.with_layer(0, |l| l.train.as_ref().unwrap().shadow[0..l.total_slots].iter().sum());
+        net.dfa_update(&entries, &signal, 0.05);
+        let after: f32 = net.with_layer(0, |l| l.train.as_ref().unwrap().shadow[0..l.total_slots].iter().sum());
+        assert!(after > before, "negative target signal + positive eligibility raises L0 row-0 shadow: {before}->{after}");
     }
 
     #[test]
