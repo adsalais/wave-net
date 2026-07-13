@@ -268,4 +268,58 @@ mod tests {
         let src = crate::wave_driven::synapse::local_of(3, 4, size);
         assert_eq!(l.decode(0, src, 12, size), src, "center cell (idx 12, span 5) maps to self");
     }
+
+    #[test]
+    fn decayed_adapt_at_gap_zero_is_adapt_ref() {
+        let size = 8u32;
+        let cfg = lc(vec![TopologyLevel { level: 1, radius: 2, count: 4 }]);
+        let mut l = Layer::new(&cfg, 7, 0, size);
+        l.adapt_ref[0] = 5 << ADAPT_SHIFT;
+        l.fire_wave[0] = 100;
+        // gap 0 → POW[0] = 2^FRAC → returns adapt_ref exactly
+        assert_eq!(l.decayed_adapt(0, 100), 5 << ADAPT_SHIFT);
+    }
+
+    #[test]
+    fn decayed_adapt_is_monotonic_nonincreasing_and_hits_zero() {
+        let size = 8u32;
+        let cfg = lc(vec![TopologyLevel { level: 1, radius: 2, count: 4 }]);
+        let mut l = Layer::new(&cfg, 7, 0, size); // adapt_decay 6
+        l.adapt_ref[0] = ADAPT_MAX;
+        l.fire_wave[0] = 0;
+        let mut prev = i32::MAX;
+        for w in 0..l.pow_decay.len() as u32 {
+            let a = l.decayed_adapt(0, w);
+            assert!(a <= prev, "non-increasing at w={w}: {a} > {prev}");
+            assert!(a >= 0);
+            prev = a;
+        }
+        // beyond the horizon it is exactly 0
+        assert_eq!(l.decayed_adapt(0, l.pow_decay.len() as u32 + 1), 0);
+    }
+
+    #[test]
+    fn decayed_adapt_path_independent_across_reads() {
+        // Reading at intermediate waves must not change the value at a later wave (pure fn of anchor+w):
+        // this is the property that makes dense (reads every wave) == sparse (reads only on wake).
+        let size = 8u32;
+        let cfg = lc(vec![TopologyLevel { level: 1, radius: 2, count: 4 }]);
+        let mut l = Layer::new(&cfg, 7, 0, size);
+        l.adapt_ref[0] = 3 << ADAPT_SHIFT;
+        l.fire_wave[0] = 0;
+        let one_jump = l.decayed_adapt(0, 15);
+        let mut acc = 0;
+        for w in 0..=15 { acc = l.decayed_adapt(0, w); } // reads at every wave; state never mutated
+        assert_eq!(one_jump, acc, "value at w=15 is independent of intermediate reads");
+    }
+
+    #[test]
+    fn pow_decay_matches_geometric_within_rounding() {
+        let table = build_pow_decay(6);
+        let rho = 1.0f64 - 2f64.powi(-6);
+        for (k, &p) in table.iter().enumerate().take(200) {
+            let want = (rho.powi(k as i32) * (1i64 << FRAC) as f64).round() as i64;
+            assert!((p - want).abs() <= 2, "POW[{k}] {p} vs geometric {want}");
+        }
+    }
 }
