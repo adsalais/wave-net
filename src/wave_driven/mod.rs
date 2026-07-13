@@ -7,3 +7,4 @@ pub mod config;
 pub mod frontier;
 pub mod neurons;
 pub mod synapse;
+pub mod wave;
