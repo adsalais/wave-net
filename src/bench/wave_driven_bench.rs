@@ -422,4 +422,70 @@ mod tests {
         // No hard assertion: this is the research readout. Interpret per the spec's convergence ladder
         // (σ super-critical ⇒ dynamics collapse, density too high; healthy σ + poor acc ⇒ credit-limited).
     }
+
+    #[test]
+    #[ignore] // validation: multi-seed, all-benchmark, matched-FF-baseline recurrence confirmation (--release, ~tens of min)
+    fn wave_driven_recurrence_confirmation() {
+        let seeds = [0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF];
+        let size = 32u32;
+        let rec = 8u32;
+        eprintln!("== wave_driven recurrence confirmation — size {size}, rec {rec}, spike-ψ εᵃ (β=0.4), {} seeds ==", seeds.len());
+        eprintln!("   {:<15} | FF w/mean | side-car w/mean | σ", "task");
+
+        struct B {
+            name: &'static str,
+            present: usize,
+            delay: usize,
+            read: usize,
+            task: Box<dyn Fn(u64, usize) -> (Vec<usize>, usize)>,
+        }
+        let benches: Vec<B> = vec![
+            B { name: "temporal-XOR", present: 6, delay: 8, read: 8, task: Box::new(|s, t| task_parity(s, t, 2)) },
+            B { name: "parity-4", present: 6, delay: 8, read: 8, task: Box::new(|s, t| task_parity(s, t, 4)) },
+            B { name: "distractor-XOR", present: 6, delay: 20, read: 8, task: Box::new(|s, t| task_distractor(s, t)) },
+            B { name: "flip-flop", present: 6, delay: 12, read: 8, task: Box::new(|s, t| task_flipflop(s, t, 4)) },
+        ];
+
+        let mut sidecar_xor_worst = 0u64;
+        let mut beats = 0usize;
+        for b in &benches {
+            let mkcfg = || {
+                let mut c = ff_cfg();
+                c.size = size;
+                c.present = b.present;
+                c.delay = b.delay;
+                c.read = b.read;
+                c.holdout = 200;
+                c
+            };
+            let (mut ff_bests, mut sc_bests, mut sigmas) = (Vec::new(), Vec::new(), Vec::new());
+            for &s in &seeds {
+                // FF baseline (5-layer, membrane β=0), best-checkpointed to its ceiling
+                let (mut ffn, fe) = make_ff(s, size, 5, 32, 3, 5, 6);
+                let (fb, _) = train_and_eval_best(&mut ffn, &fe, s, s, &mkcfg(), b.task.as_ref(), 300, 3, 2400);
+                ff_bests.push(fb);
+                // side-car (rec 8, spike-ψ εᵃ β=0.4), same budget
+                let (mut scn, se) = make_sidecar(s, size, 32, 3, rec, 4, 5, 6);
+                let (sb, _) = train_and_eval_best(&mut scn, &se, s, s, &mkcfg(), b.task.as_ref(), 300, 3, 2400);
+                sc_bests.push(sb);
+                let (_p, sigma) = rate_profile(&mut scn, size, s, 0, 16, 64);
+                sigmas.push(sigma);
+            }
+            let ffw = *ff_bests.iter().min().unwrap();
+            let ffm = ff_bests.iter().sum::<u64>() / ff_bests.len() as u64;
+            let scw = *sc_bests.iter().min().unwrap();
+            let scm = sc_bests.iter().sum::<u64>() / sc_bests.len() as u64;
+            let sig = sigmas.iter().sum::<f64>() / sigmas.len() as f64;
+            eprintln!("   {:<15} | {ffw:>4}/{ffm:<4} | {scw:>4}/{scm:<4}      | {sig:.2}", b.name);
+            if scw >= ffw {
+                beats += 1;
+            }
+            if b.name == "temporal-XOR" {
+                sidecar_xor_worst = scw;
+            }
+        }
+        eprintln!("== recurrence beats FF (worst-seed) on {beats}/{} tasks ==", benches.len());
+        // plumbing sanity gate only: the side-car demonstrably solves temporal XOR
+        assert!(sidecar_xor_worst > 700, "side-car should clear chance on temporal XOR (worst {sidecar_xor_worst}); harness broken?");
+    }
 }
