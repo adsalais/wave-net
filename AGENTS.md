@@ -39,9 +39,17 @@ by a dense-vs-sparse oracle. **Phase 1 (inference) and Phase 2a (training) are l
 too, via **online, activity-scaled** multi-layer-DFA — membrane e-prop eligibility with **spike-ψ**
 accrued on the frontier during `wave()` (`e_ij = Σ_{t: j fires} pretr_i`), validated by a **bit-exact
 online-vs-dense** eligibility oracle and end-to-end FF training (single-cue above chance; pure-ternary
-depth-8 → 1000/1000/1000). The ALIF `εᵃ` term + bump-ψ + recurrence-beats-FF is **Phase 2b** (not yet
-built). Specs: `docs/superpowers/specs/2026-07-13-wave-driven-event-active-set-design.md` (Phase 1),
-`docs/superpowers/specs/2026-07-13-wave-driven-phase2-training-design.md` (Phase 2a).
+depth-8 → 1000/1000/1000). **Phase 2b adds the ALIF adaptation-eligibility term `εᵃ`** (spike-ψ,
+`elig_beta`): a per-synapse `eps_a` trace recursed at the target layer's ρ, with the silent-source
+coupling `−β·εᵃ`, accrued online over an `elig_active` set; `β=0` reduces exactly to Phase 2a, and the
+dense oracle is extended to stay **bit-exact** with `εᵃ`. A `#[ignore]` side-car experiment
+(`wave_driven_sidecar_vs_ff`) tests whether spike-ψ+`εᵃ` unlocks recurrence, sweeping recurrent
+**width × rec_count** with **σ + spiking-profile** instrumentation (density above the historical bump-ψ
+cliff is tested, since that cliff may be a bump-ψ credit-starvation artifact, not a dynamics limit).
+**bump-ψ (decide snapshots) remains a deferred fast-follow.** Specs (Phase 1 / 2a / 2b):
+`docs/superpowers/specs/2026-07-13-wave-driven-event-active-set-design.md`,
+`docs/superpowers/specs/2026-07-13-wave-driven-phase2-training-design.md`,
+`docs/superpowers/specs/2026-07-13-wave-driven-phase2b-adaptation-eligibility-design.md`.
 
 - **`wave_bitnet/` — the engine.** A memory-lean integer spiking engine: topology is materialized once
   into a per-neuron neighborhood **occupancy bitset** (no per-wave hashing), and weights are stored as
@@ -319,7 +327,7 @@ src/
     frontier.rs          # Frontier: worklist Vec + dedup mark bitset (GPU unique-append primitive; reused for pretr_active/dirty_rows)
     wave.rs              # process_layer(Work::Sparse|Dense) — frontier step + the dense equivalence oracle
     network.rs           # Network: sparse/dense orchestration, injection-into-frontier, deferred one-hop swap, online eligibility accrual + dfa_update
-    training.rs          # online activity-scaled multi-layer-DFA: EligParams/Edge, spike-ψ membrane eligibility + bit-exact dense_eligibility oracle
+    training.rs          # online activity-scaled multi-layer-DFA: EligParams(β,εᵃ)/Edge, spike-ψ membrane + ALIF εᵃ eligibility + bit-exact dense_eligibility oracle
     equivalence_tests.rs # (test-only) sparse==dense oracle + adapt_bump==0 wave_bitnet cross-check
   bench/                 # experiment harness (public-API only, test-only) — the learning rules + tasks
     wave_bitnet_bench.rs # FF + side-car training harness (run_trial, build_signal, train_and_eval_best, tasks) + smoke benchmark
