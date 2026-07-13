@@ -30,7 +30,13 @@ distractor-XOR 700→995, parity N=4 587→837). The open questions are generali
 
 ## The two modules (read this before touching code)
 
-The crate is `wave_bitnet` + `bench` (`src/lib.rs` wires them up):
+The crate is `wave_bitnet` + `bench` (`src/lib.rs` wires them up), plus a second, independent
+**inference-only** engine `wave_driven` (Phase 1) that trades size-bound sweeps for **activity-bound**
+ones — each wave processes only a per-layer frontier of non-quiescent neurons with lazy fire-anchored
+adaptation, so cost scales with activity rather than layer size. `wave_bitnet` remains the trainable
+engine; `wave_driven` is a free redefinition of its dynamics (not bit-exact — but it *is* bit-exact
+when `adapt_bump = 0`, which the equivalence tests assert) validated by a dense-vs-sparse oracle. Spec:
+`docs/superpowers/specs/2026-07-13-wave-driven-event-active-set-design.md`.
 
 - **`wave_bitnet/` — the engine.** A memory-lean integer spiking engine: topology is materialized once
   into a per-neuron neighborhood **occupancy bitset** (no per-wave hashing), and weights are stored as
@@ -292,7 +298,7 @@ destructive action or a real change of scope.
 
 ```
 src/
-  lib.rs                 # wires up the two modules
+  lib.rs                 # wires up the modules
   wave_bitnet/           # the engine — materialized bitset topology + 2-bit ternary weights + optional f32 training shadow
     synapse.rs           # hash helpers, square-grid index, TopologyLevel, sample_distinct_cells, cell decode, random_l0_input
     config.rs            # Config, LayerConfig (leak, cooldown, inhibitor_ratio, adapt_bump/decay, …), demo, validate (count ≤ (2r+1)²)
@@ -301,6 +307,14 @@ src/
     network.rs           # Network — orchestration, routing, deferred swap, listeners, readout layer, eprop_update_synaptic, enable/disable_training, from_layers
     multilayer_dfa.rs    # temporal multi-layer-DFA training engine (temporal_eligibility + multilayer_dfa_step; targets decoded from occupancy)
     persist.rs           # save/load — self-contained model (.wbm) + runtime overlay (.wbr) + model_fingerprint
+  wave_driven/           # NEW engine (Phase 1): event-driven active-set INFERENCE, independent of wave_bitnet
+    synapse.rs           # copied hash/topology helpers
+    config.rs            # copied Config/LayerConfig (adapt_decay now sets ρ = 1 − 2^−decay; no dead-zone bound)
+    neurons.rs           # Layer SoA state + occupancy bitset + 2-bit codes + fire-anchored adapt (adapt_ref/fire_wave) + geometric decay table
+    frontier.rs          # Frontier: worklist Vec + dedup mark bitset (GPU unique-append primitive)
+    wave.rs              # process_layer(Work::Sparse|Dense) — frontier step + the dense equivalence oracle
+    network.rs           # Network: sparse/dense orchestration, injection-into-frontier, deferred one-hop swap
+    equivalence_tests.rs # (test-only) sparse==dense oracle + adapt_bump==0 wave_bitnet cross-check
   bench/                 # experiment harness (public-API only, test-only) — the learning rules + tasks
     wave_bitnet_bench.rs # FF + side-car training harness (run_trial, build_signal, train_and_eval_best, tasks) + smoke benchmark
 docs/

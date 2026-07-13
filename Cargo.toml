@@ -22,3 +22,7 @@ debug = true
 [[bench]]
 name = "throughput_bitnet"
 harness = false
+
+[[bench]]
+name = "throughput_driven"
+harness = false
