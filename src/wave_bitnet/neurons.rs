@@ -165,6 +165,81 @@ impl Layer {
         }
     }
 
+    /// Build a `Layer` directly from persisted parts (bypassing seed-based generation): rebuild the
+    /// derived LUTs from `topology`+`size`, reconstruct `shadow` as the per-slot decode of `codes`
+    /// (codes are authoritative for inference), and zero all runtime arrays. Validates array shapes;
+    /// returns `Err(msg)` on any mismatch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_parts(
+        topology: Vec<TopologyLevel>,
+        leak: (u8, u8),
+        cooldown_base: u8,
+        adapt_bump: i16,
+        adapt_decay: u8,
+        readout: bool,
+        ternary_threshold: f32,
+        threshold: Vec<i16>,
+        occ: Vec<Vec<u64>>,
+        codes: Vec<u64>,
+        size: u32,
+    ) -> Result<Layer, String> {
+        let ls = (size as usize) * (size as usize);
+        let DerivedLayout { total_slots, slot_bases, neigh, occ_wpn, offsets, off_flat } =
+            derive_layout(&topology, size);
+        if threshold.len() != ls {
+            return Err(format!("threshold length {} != ls {ls}", threshold.len()));
+        }
+        if occ.len() != topology.len() {
+            return Err(format!("occ levels {} != topology levels {}", occ.len(), topology.len()));
+        }
+        for (li, t) in topology.iter().enumerate() {
+            if t.count as usize > neigh[li] {
+                return Err(format!("level {li}: count {} exceeds neighborhood {}", t.count, neigh[li]));
+            }
+            let want = ls * occ_wpn[li];
+            if occ[li].len() != want {
+                return Err(format!("occ[{li}] length {} != ls*occ_wpn {want}", occ[li].len()));
+            }
+        }
+        let want_codes = (ls * total_slots + 31) / 32;
+        if codes.len() != want_codes {
+            return Err(format!("codes length {} != {want_codes}", codes.len()));
+        }
+        // shadow = per-slot decode of codes (inference-authoritative; not the training master)
+        let n = ls * total_slots;
+        let mut shadow = vec![0f32; n];
+        for s in 0..n {
+            shadow[s] = WCODE[((codes[s >> 5] >> ((s & 31) * 2)) & 0b11) as usize] as f32;
+        }
+        Ok(Layer {
+            potential: vec![0i16; ls],
+            cooldown: vec![0u8; ls],
+            adapt: vec![0i32; ls],
+            threshold,
+            pending: vec![0i32; ls],
+            elig_pre: vec![0i32; ls],
+            elig_post: vec![0i32; ls],
+            decide_potential: vec![0i16; ls],
+            decide_eff: vec![0i32; ls],
+            leak,
+            cooldown_base,
+            topology,
+            adapt_bump,
+            adapt_decay,
+            readout,
+            ternary_threshold,
+            total_slots,
+            slot_bases,
+            neigh,
+            occ_wpn,
+            occ,
+            offsets,
+            off_flat,
+            codes,
+            shadow,
+        })
+    }
+
     pub fn new(cfg: &LayerConfig, seed: u64, layer_index: u32, size: u32) -> Layer {
         let ls = (size as usize) * (size as usize);
         let base = layer_index as usize * ls;
@@ -288,6 +363,61 @@ mod tests {
             assert!(cells.windows(2).all(|w| w[0] < w[1]), "for_wired yields ascending cell order");
         }
         assert_eq!(a.occ, b.occ, "deterministic occupancy");
+    }
+
+    #[test]
+    fn from_parts_reproduces_built_layer() {
+        let size = 8u32;
+        let cfg = lc(vec![
+            TopologyLevel { level: 1, radius: 2, count: 8 },
+            TopologyLevel { level: 0, radius: 1, count: 3 },
+        ]);
+        let mut built = Layer::new(&cfg, 7, 1, size);
+        // make neuron 0's row non-trivial (+1 / -1 / 0 mix) then repack so codes differ from init
+        let ts = built.total_slots;
+        for s in 0..ts {
+            built.shadow[s] = match s % 3 { 0 => 0.0, 1 => 2.0, _ => -2.0 };
+        }
+        built.repack_row(0);
+        let rebuilt = Layer::from_parts(
+            built.topology.clone(),
+            built.leak,
+            built.cooldown_base,
+            built.adapt_bump,
+            built.adapt_decay,
+            built.readout,
+            built.ternary_threshold,
+            built.threshold.clone(),
+            built.occ.clone(),
+            built.codes.clone(),
+            size,
+        )
+        .unwrap();
+        assert_eq!(rebuilt.topology, built.topology);
+        assert_eq!(rebuilt.threshold, built.threshold);
+        assert_eq!(rebuilt.occ, built.occ);
+        assert_eq!(rebuilt.codes, built.codes);
+        assert_eq!(rebuilt.total_slots, built.total_slots);
+        assert_eq!(rebuilt.slot_bases, built.slot_bases);
+        assert_eq!(rebuilt.neigh, built.neigh);
+        assert_eq!(rebuilt.occ_wpn, built.occ_wpn);
+        assert_eq!(rebuilt.offsets, built.offsets);
+        assert_eq!(rebuilt.off_flat, built.off_flat);
+        // shadow is the decode of codes (inference-authoritative), runtime zeroed
+        for s in 0..rebuilt.shadow.len() {
+            assert_eq!(rebuilt.shadow[s], rebuilt.weight_at(s) as f32);
+        }
+        assert!(rebuilt.potential.iter().all(|&p| p == 0));
+        assert!(rebuilt.adapt.iter().all(|&a| a == 0));
+    }
+
+    #[test]
+    fn from_parts_rejects_bad_lengths() {
+        let size = 8u32;
+        let topo = vec![TopologyLevel { level: 1, radius: 2, count: 8 }];
+        // threshold length 10 != ls 64
+        let r = Layer::from_parts(topo, (3, 5), 2, 5, 6, false, 0.5, vec![0i16; 10], vec![vec![0u64; 64]], vec![0u64; 16], size);
+        assert!(r.is_err());
     }
 
     #[test]
