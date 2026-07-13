@@ -17,6 +17,16 @@ pub const HORIZON_CAP: usize = 1 << 16;
 /// 2-bit weight code decode LUT: 0b00→0, 0b01→+1, 0b11→−1.
 pub(crate) const WCODE: [i8; 4] = [0, 1, 0, -1];
 
+/// Per-layer TRAINING state — allocated only while training (see `enable_training`). `shadow` is the
+/// f32 master requantized into `codes` by `repack_row`; `elig` is the per-synapse eligibility
+/// accumulated over a trial (SAME layout as `shadow`); `pretr`/`spike_count` are per-neuron.
+pub struct TrainState {
+    pub shadow: Vec<f32>,      // ls * total_slots
+    pub elig: Vec<f32>,        // ls * total_slots
+    pub pretr: Vec<f32>,       // ls
+    pub spike_count: Vec<u32>, // ls
+}
+
 pub(crate) struct DerivedLayout {
     pub total_slots: usize,
     pub slot_bases: Vec<usize>,
@@ -95,6 +105,8 @@ pub struct Layer {
     pub codes: Vec<u64>, // 2-bit ±1/0 codes, 32 per u64
     // lazy adaptation decay table (per adapt_decay)
     pub pow_decay: Vec<i64>,
+    // TRAINING state — present only while training is enabled (None on an inference-lean net).
+    pub train: Option<TrainState>,
 }
 
 impl Layer {
@@ -216,6 +228,56 @@ impl Layer {
             off_flat,
             codes,
             pow_decay: build_pow_decay(cfg.adapt_decay),
+            train: None,
+        }
+    }
+
+    pub fn enable_training(&mut self) {
+        if self.train.is_some() {
+            return;
+        }
+        let n = self.synapse_count();
+        let ls = self.threshold.len();
+        let mut shadow = vec![0f32; n];
+        for s in 0..n {
+            shadow[s] = self.weight_at(s) as f32;
+        }
+        self.train = Some(TrainState { shadow, elig: vec![0f32; n], pretr: vec![0f32; ls], spike_count: vec![0u32; ls] });
+    }
+
+    pub fn disable_training(&mut self) {
+        self.train = None;
+    }
+
+    #[inline]
+    fn set_code(&mut self, idx: usize, code: u64) {
+        let w = idx >> 5;
+        let shift = (idx & 31) * 2;
+        self.codes[w] = (self.codes[w] & !(0b11u64 << shift)) | (code << shift);
+    }
+
+    /// Requantise neuron `i`'s row into `codes`: γ = mean(|shadow|); `|shadow|/γ < ternary_threshold → 0`,
+    /// else sign. Requires training enabled.
+    pub fn repack_row(&mut self, i: usize) {
+        let ts = self.total_slots;
+        if ts == 0 {
+            return;
+        }
+        let base = i * ts;
+        let t = self.ternary_threshold;
+        let gamma = {
+            let shadow = &self.train.as_ref().expect("repack_row requires training enabled").shadow;
+            let mut sum = 0.0f32;
+            for s in 0..ts {
+                sum += shadow[base + s].abs();
+            }
+            sum / ts as f32
+        };
+        for s in 0..ts {
+            let sh = self.train.as_ref().unwrap().shadow[base + s];
+            let x = if gamma <= 0.0 { 0.0 } else { sh / gamma };
+            let code: u64 = if x.abs() < t { 0b00 } else if x > 0.0 { 0b01 } else { 0b11 };
+            self.set_code(base + s, code);
         }
     }
 }
@@ -321,5 +383,55 @@ mod tests {
             let want = (rho.powi(k as i32) * (1i64 << FRAC) as f64).round() as i64;
             assert!((p - want).abs() <= 2, "POW[{k}] {p} vs geometric {want}");
         }
+    }
+
+    #[test]
+    fn enable_training_builds_shadow_from_codes_and_zeros_the_rest() {
+        let size = 8u32;
+        let cfg = lc(vec![TopologyLevel { level: 1, radius: 2, count: 8 }]);
+        let mut l = Layer::new(&cfg, 3, 0, size);
+        assert!(l.train.is_none(), "fresh layer is inference-lean");
+        l.enable_training();
+        let t = l.train.as_ref().unwrap();
+        assert_eq!(t.shadow.len(), l.synapse_count());
+        assert_eq!(t.elig.len(), l.synapse_count());
+        assert_eq!(t.pretr.len(), l.threshold.len());
+        assert_eq!(t.spike_count.len(), l.threshold.len());
+        for s in 0..t.shadow.len() {
+            assert_eq!(t.shadow[s], l.weight_at(s) as f32, "shadow == decode(codes)");
+        }
+        assert!(t.elig.iter().all(|&e| e == 0.0) && t.pretr.iter().all(|&p| p == 0.0));
+    }
+
+    #[test]
+    fn repack_row_roundtrips_shadow_to_ternary() {
+        let size = 8u32;
+        let cfg = lc(vec![TopologyLevel { level: 1, radius: 2, count: 4 }]);
+        let mut l = Layer::new(&cfg, 7, 0, size);
+        l.enable_training();
+        let ts = l.total_slots;
+        {
+            let sh = &mut l.train.as_mut().unwrap().shadow;
+            sh[0] = 2.0;
+            sh[1] = -3.0;
+            sh[2] = 0.05;
+            sh[3] = 0.0;
+        }
+        l.repack_row(0);
+        assert_eq!(l.weight_at(0), 1);
+        assert_eq!(l.weight_at(1), -1);
+        assert_eq!(l.weight_at(2), 0);
+        assert_eq!(l.weight_at(3), 0);
+        let _ = ts;
+    }
+
+    #[test]
+    fn disable_training_frees_state() {
+        let size = 8u32;
+        let cfg = lc(vec![TopologyLevel { level: 1, radius: 2, count: 4 }]);
+        let mut l = Layer::new(&cfg, 7, 0, size);
+        l.enable_training();
+        l.disable_training();
+        assert!(l.train.is_none());
     }
 }
