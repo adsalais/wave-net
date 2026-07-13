@@ -9,11 +9,13 @@
 pub struct EligParams {
     pub rec_tau: f32,
     pub epsilon: f32,
+    pub elig_beta: f32, // β: ALIF adaptation-eligibility coupling (0 = membrane-only = Phase 2a)
+    pub epsilon_a: f32, // εᵃ magnitude cutoff (bounds εᵃ + keeps the offline oracle exact)
 }
 
 impl Default for EligParams {
     fn default() -> Self {
-        EligParams { rec_tau: 6.0, epsilon: 1.0 / 1024.0 }
+        EligParams { rec_tau: 6.0, epsilon: 1.0 / 1024.0, elig_beta: 0.0, epsilon_a: 1.0 / 1024.0 }
     }
 }
 
@@ -28,9 +30,11 @@ pub struct Edge {
 
 use crate::wave_driven::network::Network;
 
-/// Offline reference eligibility from full fired records: `e_ij = Σ_t pretr_i(t)·[j fires at t]`,
-/// `pretr` maintained with the canonical decay → ε-drop → bump order. Returns per-layer `elig`-layout
-/// vectors (`ls·total_slots`) for direct comparison to the engine's online `elig`.
+/// Offline reference eligibility from full fired records. Membrane (β=0): `e_ij = Σ_t pretr_i·[j fires]`.
+/// With `β≠0`, adds the ALIF adaptation eligibility `εᵃ` (spike-ψ): `e_ij += pretr_i − β·εᵃ_ij` on a
+/// target spike, `εᵃ_ij` recursed at the target layer's `ρ`. Uses the identical `pretr`/`εᵃ` order and
+/// cutoffs as `Network::accrue_eligibility`, so it matches the engine's online `elig` bit-for-bit.
+/// Returns per-layer `elig`-layout vectors (`ls·total_slots`).
 pub fn dense_eligibility(net: &Network, entries: &[Vec<Edge>], fired: &[Vec<Vec<u32>>], p: &EligParams) -> Vec<Vec<f32>> {
     let size = net.size();
     let ls = (size as usize) * (size as usize);
@@ -38,7 +42,12 @@ pub fn dense_eligibility(net: &Network, entries: &[Vec<Edge>], fired: &[Vec<Vec<
     let ttot = fired.iter().map(|f| f.len()).max().unwrap_or(0);
     let decay = 1.0 - 1.0 / p.rec_tau.max(1.0);
     let eps = p.epsilon;
+    let beta = p.elig_beta;
+    let eps_a_cut = p.epsilon_a;
+    let use_ea = beta != 0.0;
+    let rho: Vec<f32> = (0..l).map(|z| net.with_layer(z, |lz| 1.0 - 2f32.powi(-(lz.adapt_decay as i32)))).collect();
     let mut out: Vec<Vec<f32>> = (0..l).map(|z| net.with_layer(z, |lz| vec![0f32; ls * lz.total_slots])).collect();
+    let mut epsa: Vec<Vec<f32>> = if use_ea { out.iter().map(|o| vec![0f32; o.len()]).collect() } else { Vec::new() };
     let mut pretr = vec![vec![0f32; ls]; l];
     for t in 0..ttot {
         // pretr: decay -> eps-drop -> bump firers (identical order to Network::accrue_eligibility)
@@ -64,34 +73,72 @@ pub fn dense_eligibility(net: &Network, entries: &[Vec<Edge>], fired: &[Vec<Vec<
                 }
             }
         }
-        // accrue: source-driven, add pretr where the target fired
+        // accrue
         for z in 0..l {
+            let out_z = &mut out[z];
+            let epsa_z = if use_ea { Some(&mut epsa[z]) } else { None };
             net.with_layer(z, |lz| {
                 let ts = lz.total_slots;
-                for (e_idx, edge) in entries[z].iter().enumerate() {
-                    let tz_i = z as i32 + edge.level;
-                    if tz_i < 0 || tz_i as usize >= l {
-                        continue;
-                    }
-                    let tz = tz_i as usize;
-                    let sbase = lz.slot_bases[e_idx];
-                    for i in 0..ls {
-                        let pr = pretr[z][i];
-                        if pr == 0.0 {
-                            continue;
-                        }
-                        lz.for_wired(e_idx, i, |r, c| {
-                            let j = lz.decode(e_idx, i as u32, c, size);
-                            if fb[tz][(j >> 6) as usize] & (1u64 << (j & 63)) != 0 {
-                                out[z][i * ts + sbase + r] += pr;
-                            }
-                        });
-                    }
-                }
+                accrue_dense_layer(lz, z, l, size, entries, &pretr[z], &fb, &rho, beta, eps_a_cut, use_ea, ts, out_z, epsa_z);
             });
         }
     }
     out
+}
+
+/// One layer's dense accrual for wave `t` — mirrors `Network::accrue_eligibility` line-for-line (both
+/// membrane and `εᵃ` branches), so the offline result is bit-exact to the online one.
+#[allow(clippy::too_many_arguments)]
+fn accrue_dense_layer(
+    lz: &crate::wave_driven::neurons::Layer,
+    z: usize,
+    l: usize,
+    size: u32,
+    entries: &[Vec<Edge>],
+    pretr_z: &[f32],
+    fb: &[Vec<u64>],
+    rho: &[f32],
+    beta: f32,
+    eps_a_cut: f32,
+    use_ea: bool,
+    ts: usize,
+    out_z: &mut [f32],
+    mut epsa_z: Option<&mut Vec<f32>>,
+) {
+    let ls = (size as usize) * (size as usize);
+    for (e_idx, edge) in entries[z].iter().enumerate() {
+        let tz_i = z as i32 + edge.level;
+        if tz_i < 0 || tz_i as usize >= l {
+            continue;
+        }
+        let tz = tz_i as usize;
+        let r_tz = rho[tz];
+        let sbase = lz.slot_bases[e_idx];
+        for i in 0..ls {
+            let pr = pretr_z[i];
+            if !use_ea && pr == 0.0 {
+                continue;
+            }
+            lz.for_wired(e_idx, i, |r, c| {
+                let j = lz.decode(e_idx, i as u32, c, size);
+                let fired = fb[tz][(j >> 6) as usize] & (1u64 << (j & 63)) != 0;
+                let widx = i * ts + sbase + r;
+                if use_ea {
+                    let epsa_z = epsa_z.as_deref_mut().unwrap();
+                    let ea = epsa_z[widx];
+                    let new_ea = if fired {
+                        out_z[widx] += pr - beta * ea;
+                        pr + (r_tz - beta) * ea
+                    } else {
+                        r_tz * ea
+                    };
+                    epsa_z[widx] = if new_ea.abs() < eps_a_cut { 0.0 } else { new_ea };
+                } else if fired {
+                    out_z[widx] += pr;
+                }
+            });
+        }
+    }
 }
 
 #[cfg(test)]
@@ -125,7 +172,7 @@ mod tests {
         let (cfg, entries) = deep_cfg(size);
         let mut net = Network::new(cfg);
         net.enable_training();
-        net.set_elig_params(EligParams { rec_tau: 6.0, epsilon: 1.0 / 1024.0 });
+        net.set_elig_params(EligParams { rec_tau: 6.0, epsilon: 1.0 / 1024.0, elig_beta: 0.0, epsilon_a: 1.0 / 1024.0 });
 
         // record fired per layer per wave via listeners, in lockstep with the online accrual
         let l = net.layer_count();
@@ -142,10 +189,61 @@ mod tests {
         net.clear_listeners();
         let fired = rec.lock().unwrap().clone();
 
-        let dense = dense_eligibility(&net, &entries, &fired, &EligParams { rec_tau: 6.0, epsilon: 1.0 / 1024.0 });
+        let dense = dense_eligibility(&net, &entries, &fired, &EligParams { rec_tau: 6.0, epsilon: 1.0 / 1024.0, elig_beta: 0.0, epsilon_a: 1.0 / 1024.0 });
         for z in 0..l {
             net.with_layer(z, |lz| {
                 assert_eq!(lz.train.as_ref().unwrap().elig, &dense[z][..], "layer {z} online == dense elig (bit-exact)");
+            });
+        }
+    }
+
+    // Drive a training net for `waves`, recording fired per layer; return (net, fired-records).
+    fn drive_and_record(cfg: Config, params: EligParams, waves: usize) -> (Network, Vec<Vec<Vec<u32>>>) {
+        let size = cfg.size;
+        let mut net = Network::new(cfg);
+        net.set_elig_params(params);
+        net.enable_training();
+        let l = net.layer_count();
+        let rec: Arc<Mutex<Vec<Vec<Vec<u32>>>>> = Arc::new(Mutex::new(vec![Vec::new(); l]));
+        for z in 0..l {
+            let r = rec.clone();
+            net.on_layer(z, Box::new(move |_w, f: &[u32]| r.lock().unwrap()[z].push(f.to_vec())));
+        }
+        net.reset_state();
+        let input = random_l0_input(0x0E11, size, 15000);
+        for w in 0..waves {
+            net.wave(&input(w));
+        }
+        net.clear_listeners();
+        let fired = rec.lock().unwrap().clone();
+        (net, fired)
+    }
+
+    #[test]
+    fn online_equals_dense_eligibility_with_eps_a_bit_exact() {
+        let size = 16u32;
+        let (cfg, entries) = deep_cfg(size);
+        let params = EligParams { rec_tau: 6.0, epsilon: 1.0 / 1024.0, elig_beta: 0.4, epsilon_a: 1.0 / 1024.0 };
+        let (net, fired) = drive_and_record(cfg, params, 120);
+        let dense = dense_eligibility(&net, &entries, &fired, &params);
+        for z in 0..net.layer_count() {
+            net.with_layer(z, |lz| {
+                assert_eq!(lz.train.as_ref().unwrap().elig, &dense[z][..], "layer {z} online == dense elig with εᵃ (bit-exact)");
+            });
+        }
+    }
+
+    #[test]
+    fn beta_zero_dense_matches_membrane() {
+        // β=0 dense_eligibility must equal the Phase-2a membrane result (the regression gate).
+        let size = 16u32;
+        let (cfg, entries) = deep_cfg(size);
+        let membrane = EligParams { rec_tau: 6.0, epsilon: 1.0 / 1024.0, elig_beta: 0.0, epsilon_a: 1.0 / 1024.0 };
+        let (net, fired) = drive_and_record(cfg, membrane, 120);
+        let dense = dense_eligibility(&net, &entries, &fired, &membrane);
+        for z in 0..net.layer_count() {
+            net.with_layer(z, |lz| {
+                assert_eq!(lz.train.as_ref().unwrap().elig, &dense[z][..], "β=0 online==dense (membrane)");
             });
         }
     }

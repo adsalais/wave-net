@@ -172,7 +172,7 @@ mod tests {
         };
         let mut net = Network::new(Config { seed, size, layers: vec![lc; layers] });
         net.enable_training();
-        net.set_elig_params(EligParams { rec_tau: 6.0, epsilon: 1.0 / 1024.0 });
+        net.set_elig_params(EligParams { rec_tau: 6.0, epsilon: 1.0 / 1024.0, elig_beta: 0.0, epsilon_a: 1.0 / 1024.0 });
         let entries = (0..layers)
             .map(|z| if z == layers - 1 { vec![] } else { vec![Edge { level: 1, count: up_count as usize, radius: up_radius }] })
             .collect();
@@ -181,6 +181,69 @@ mod tests {
 
     fn ff_cfg() -> TaskCfg {
         TaskCfg { size: 16, present: 6, delay: 4, read: 6, holdout: 200, readout_lr: 0.02, hidden_lr: 0.004, rate_reg: 5.0, rate_target: 0.1 }
+    }
+
+    // Backward-fed side-car (ported from benches/throughput_bitnet.rs make_sidecar):
+    // L0→L1(+1); L1→L3(+2 skip); L2 self(0)+→L3(+1); L3→L2(−1)+→L4(+1); L4 read.
+    fn make_sidecar(seed: u64, size: u32, uc: u32, ur: u32, n: u32, r: u32, adapt_bump: i16, adapt_decay: u8) -> (Network, Vec<Vec<Edge>>) {
+        let mk = |topology| LayerConfig { topology, leak: (3, 5), cooldown_base: 2, inhibitor_ratio: 0, threshold_jitter: 32, baseline_init: 6, adapt_bump, adapt_decay };
+        let layers = vec![
+            mk(vec![TopologyLevel { level: 1, radius: ur, count: uc }]),
+            mk(vec![TopologyLevel { level: 2, radius: ur, count: uc }]),
+            mk(vec![TopologyLevel { level: 0, radius: r, count: n }, TopologyLevel { level: 1, radius: r, count: n }]),
+            mk(vec![TopologyLevel { level: -1, radius: r, count: n }, TopologyLevel { level: 1, radius: ur, count: uc }]),
+            mk(vec![]),
+        ];
+        let mut net = Network::new(Config { seed, size, layers });
+        net.set_elig_params(EligParams { rec_tau: 20.0, epsilon: 1.0 / 1024.0, elig_beta: 0.4, epsilon_a: 1.0 / 1024.0 });
+        net.enable_training();
+        let entries = vec![
+            vec![Edge { level: 1, count: uc as usize, radius: ur }],
+            vec![Edge { level: 2, count: uc as usize, radius: ur }],
+            vec![Edge { level: 0, count: n as usize, radius: r }, Edge { level: 1, count: n as usize, radius: r }],
+            vec![Edge { level: -1, count: n as usize, radius: r }, Edge { level: 1, count: uc as usize, radius: ur }],
+            vec![],
+        ];
+        (net, entries)
+    }
+
+    /// N-bit sequential parity: N deterministic cue bits, label = their XOR. (N=2 is temporal XOR.)
+    fn task_parity(seed: u64, t: usize, n: usize) -> (Vec<usize>, usize) {
+        let bits: Vec<usize> = (0..n).map(|i| (mix(key(seed, t as u32, 0, i as u32, 51)) & 1) as usize).collect();
+        let label = bits.iter().fold(0usize, |a, &b| a ^ b);
+        (bits, label)
+    }
+
+    /// Per-layer firing rate (%/neuron/wave) over a window, and a coarse σ (mean consecutive-layer spike
+    /// ratio) — the dynamics diagnostic that separates σ-supercritical collapse from credit collapse.
+    fn rate_profile(net: &mut Network, size: u32, task_seed: u64, class: usize, warmup: usize, waves: usize) -> (Vec<f64>, f64) {
+        let l = net.layer_count();
+        let counts = Arc::new(Mutex::new(vec![0u64; l]));
+        for z in 0..l {
+            let c = counts.clone();
+            net.on_layer(z, Box::new(move |_w, f: &[u32]| c.lock().unwrap()[z] += f.len() as u64));
+        }
+        net.reset_state();
+        let sites = cue_sites(task_seed, size, class);
+        for _ in 0..warmup {
+            net.wave(&sites);
+        }
+        counts.lock().unwrap().iter_mut().for_each(|x| *x = 0);
+        for _ in 0..waves {
+            net.wave(&sites);
+        }
+        net.clear_listeners();
+        let counts = std::mem::take(&mut *counts.lock().unwrap());
+        let denom = ((size as u64) * (size as u64) * waves as u64) as f64;
+        let pct: Vec<f64> = counts.iter().map(|&s| (s as f64 / denom * 1000.0).round() / 10.0).collect();
+        let mut ratios = Vec::new();
+        for z in 1..l - 1 {
+            if counts[z] > 0 {
+                ratios.push(counts[z + 1] as f64 / counts[z] as f64);
+            }
+        }
+        let sigma = if ratios.is_empty() { 0.0 } else { ratios.iter().sum::<f64>() / ratios.len() as f64 };
+        (pct, sigma)
     }
 
     #[test]
@@ -258,10 +321,69 @@ mod tests {
                 }
                 net2.clear_listeners();
                 let fired = rec.lock().unwrap().clone();
-                let _e = dense_eligibility(&net2, &entries2, &fired, &EligParams { rec_tau: 6.0, epsilon: 1.0 / 1024.0 });
+                let _e = dense_eligibility(&net2, &entries2, &fired, &EligParams { rec_tau: 6.0, epsilon: 1.0 / 1024.0, elig_beta: 0.0, epsilon_a: 1.0 / 1024.0 });
             }
             let offline = t1.elapsed().as_secs_f64();
             eprintln!("size {size}: online {:.1} trials/s, offline-eligibility {:.1} trials/s ({:.1}x)", trials as f64 / online, trials as f64 / offline, offline / online);
         }
+    }
+
+    #[test]
+    #[ignore] // experiment: does spike-ψ εᵃ unlock recurrence? (run in --release; minutes)
+    fn wave_driven_sidecar_vs_ff() {
+        let seeds = [0xE9_0B_0A17u64, 0x1234_5678];
+        eprintln!("== wave_driven side-car vs FF (spike-ψ εᵃ, β=0.4) — width × rec_count, σ-instrumented ==");
+        for &parity_n in &[2usize, 4usize] {
+            eprintln!("-- parity N={parity_n} ({}) --", if parity_n == 2 { "temporal XOR" } else { "parity-4" });
+            let task = move |s: u64, t: usize| task_parity(s, t, parity_n);
+            for &size in &[16u32, 32u32] {
+                // FF baseline (β=0, membrane) at this width
+                let mut ff_bests = Vec::new();
+                for &s in &seeds {
+                    let (mut net, entries) = make_ff(s, size, 5, 32, 3, 5, 6);
+                    let mut cfg = ff_cfg();
+                    cfg.size = size;
+                    cfg.present = 6;
+                    cfg.delay = 8;
+                    cfg.read = 8;
+                    cfg.holdout = 200;
+                    let (best, _at) = train_and_eval_best(&mut net, &entries, s, s, &cfg, &task, 300, 3, 2400);
+                    ff_bests.push(best);
+                }
+                eprintln!("  size {size} FF          : worst {} mean {}", ff_bests.iter().min().unwrap(), ff_bests.iter().sum::<u64>() / ff_bests.len() as u64);
+
+                // side-car at a sweep of rec_count (into/beyond the historical bump-ψ cliff ~12)
+                for &rec_count in &[8u32, 16u32, 24u32] {
+                    let mut sc_bests = Vec::new();
+                    let mut sigmas = Vec::new();
+                    for &s in &seeds {
+                        let (mut net, entries) = make_sidecar(s, size, 32, 3, rec_count, 4, 5, 6);
+                        let mut cfg = ff_cfg();
+                        cfg.size = size;
+                        cfg.present = 6;
+                        cfg.delay = 8;
+                        cfg.read = 8;
+                        cfg.holdout = 200;
+                        let (best, _at) = train_and_eval_best(&mut net, &entries, s, s, &cfg, &task, 300, 3, 2400);
+                        sc_bests.push(best);
+                        let (_pct, sigma) = rate_profile(&mut net, size, s, 0, 16, 64);
+                        sigmas.push(sigma);
+                    }
+                    let profile = {
+                        let (mut net, _e) = make_sidecar(seeds[0], size, 32, 3, rec_count, 4, 5, 6);
+                        rate_profile(&mut net, size, seeds[0], 0, 16, 64).0
+                    };
+                    eprintln!(
+                        "  size {size} side rec{rec_count:>2}: worst {} mean {} | σ≈{:.2} | rate% {:?}",
+                        sc_bests.iter().min().unwrap(),
+                        sc_bests.iter().sum::<u64>() / sc_bests.len() as u64,
+                        sigmas.iter().sum::<f64>() / sigmas.len() as f64,
+                        profile
+                    );
+                }
+            }
+        }
+        // No hard assertion: this is the research readout. Interpret per the spec's convergence ladder
+        // (σ super-critical ⇒ dynamics collapse, density too high; healthy σ + poor acc ⇒ credit-limited).
     }
 }

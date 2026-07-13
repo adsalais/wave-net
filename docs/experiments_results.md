@@ -129,6 +129,31 @@ LSNN/e-prop literature). Tools: the task drivers + readout in `src/bench/wave_bi
 rule in `wave_bitnet::multilayer_dfa` (`temporal_eligibility`, `multilayer_dfa_step`,
 `EligParams{elig_beta, elig_psi_width, use_bump, rec_tau}`).
 
+### Reproduced on `wave_driven` with **spike-ψ** `εᵃ` — recurrence beats FF *without* bump-ψ (2026-07-14)
+
+The activity-scaled engine's Phase 2b (`wave_driven`, online `εᵃ`, **spike-ψ**, β=0.4) reproduces — and
+at width exceeds — the recurrence-beats-FF result, so bump-ψ is **not** required for it. Side-car vs FF,
+2 seeds, worst/mean (`bench::wave_driven_bench::wave_driven_sidecar_vs_ff`):
+
+| task | width | FF | **side-car (best rec_count)** | historical bump-ψ |
+|---|---|---|---|---|
+| temporal XOR (parity N=2) | 16 | 720 | **1000** (rec 8/16/24) | 990→1000 |
+| parity N=4 | 16 | 515 | **860** (rec 8) | 587→**837** |
+| parity N=4 | 32 | 595 | **1000** (rec 8/16) | — |
+
+**Findings.** (1) **spike-ψ `εᵃ` unlocks recurrence** — it beats FF decisively and, with width, *exceeds*
+the historical bump-ψ side-car (parity N=4: 595→**1000** at size 32 vs 837). So the graded near-threshold
+signal is **not** load-bearing here; the sparse spike-driven adaptation eligibility suffices. (2) **Width
+is the decisive lever** (parity N=4: 860 at size 16 → 1000 at size 32, rec 8), confirming width as a
+capacity floor for the hard task. (3) **Recurrence density has a real sweet spot at *sparse* rec_count
+(rec 8 best; rec 24 collapses back to ~FF baseline).** The rec_count sweep *above* the historical bump-ψ
+cliff (~12) was run precisely to test whether that cliff was a bump-ψ credit-starvation artifact — it is
+**not**: under spike-ψ, high density (rec 24) still collapses, and the σ / spiking-profile instrumentation
+shows a **dynamics** collapse (σ → ~0.9 sub-critical, the recurrent scratchpad's contribution dies),
+*not* credit starvation. So the operating point is **sparse recurrence + width**, and σ (not the credit
+rule) is the true density ceiling. *(2-seed; re-verify multi-seed.)* Correctness is anchored by a
+bit-exact online-vs-dense `εᵃ` oracle. bump-ψ remains a deferred fast-follow — now unlikely to be needed.
+
 ## Scaling study (in progress) — forward drive, width, and read-layer topology
 
 **Status: ongoing systematic exploration, mostly single-seed / preliminary** — the single-threaded integer
