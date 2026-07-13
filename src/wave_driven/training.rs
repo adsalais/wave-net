@@ -9,11 +9,13 @@
 pub struct EligParams {
     pub rec_tau: f32,
     pub epsilon: f32,
+    pub elig_beta: f32, // β: ALIF adaptation-eligibility coupling (0 = membrane-only = Phase 2a)
+    pub epsilon_a: f32, // εᵃ magnitude cutoff (bounds εᵃ + keeps the offline oracle exact)
 }
 
 impl Default for EligParams {
     fn default() -> Self {
-        EligParams { rec_tau: 6.0, epsilon: 1.0 / 1024.0 }
+        EligParams { rec_tau: 6.0, epsilon: 1.0 / 1024.0, elig_beta: 0.0, epsilon_a: 1.0 / 1024.0 }
     }
 }
 
@@ -125,7 +127,7 @@ mod tests {
         let (cfg, entries) = deep_cfg(size);
         let mut net = Network::new(cfg);
         net.enable_training();
-        net.set_elig_params(EligParams { rec_tau: 6.0, epsilon: 1.0 / 1024.0 });
+        net.set_elig_params(EligParams { rec_tau: 6.0, epsilon: 1.0 / 1024.0, elig_beta: 0.0, epsilon_a: 1.0 / 1024.0 });
 
         // record fired per layer per wave via listeners, in lockstep with the online accrual
         let l = net.layer_count();
@@ -142,7 +144,7 @@ mod tests {
         net.clear_listeners();
         let fired = rec.lock().unwrap().clone();
 
-        let dense = dense_eligibility(&net, &entries, &fired, &EligParams { rec_tau: 6.0, epsilon: 1.0 / 1024.0 });
+        let dense = dense_eligibility(&net, &entries, &fired, &EligParams { rec_tau: 6.0, epsilon: 1.0 / 1024.0, elig_beta: 0.0, epsilon_a: 1.0 / 1024.0 });
         for z in 0..l {
             net.with_layer(z, |lz| {
                 assert_eq!(lz.train.as_ref().unwrap().elig, &dense[z][..], "layer {z} online == dense elig (bit-exact)");

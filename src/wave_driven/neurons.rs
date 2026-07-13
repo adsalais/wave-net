@@ -23,6 +23,7 @@ pub(crate) const WCODE: [i8; 4] = [0, 1, 0, -1];
 pub struct TrainState {
     pub shadow: Vec<f32>,      // ls * total_slots
     pub elig: Vec<f32>,        // ls * total_slots
+    pub eps_a: Vec<f32>,       // ls * total_slots when β≠0, else empty (Phase 2a footprint)
     pub pretr: Vec<f32>,       // ls
     pub spike_count: Vec<u32>, // ls
 }
@@ -232,7 +233,7 @@ impl Layer {
         }
     }
 
-    pub fn enable_training(&mut self) {
+    pub fn enable_training(&mut self, alloc_eps_a: bool) {
         if self.train.is_some() {
             return;
         }
@@ -242,7 +243,8 @@ impl Layer {
         for s in 0..n {
             shadow[s] = self.weight_at(s) as f32;
         }
-        self.train = Some(TrainState { shadow, elig: vec![0f32; n], pretr: vec![0f32; ls], spike_count: vec![0u32; ls] });
+        let eps_a = if alloc_eps_a { vec![0f32; n] } else { Vec::new() };
+        self.train = Some(TrainState { shadow, elig: vec![0f32; n], eps_a, pretr: vec![0f32; ls], spike_count: vec![0u32; ls] });
     }
 
     pub fn disable_training(&mut self) {
@@ -391,12 +393,13 @@ mod tests {
         let cfg = lc(vec![TopologyLevel { level: 1, radius: 2, count: 8 }]);
         let mut l = Layer::new(&cfg, 3, 0, size);
         assert!(l.train.is_none(), "fresh layer is inference-lean");
-        l.enable_training();
+        l.enable_training(false);
         let t = l.train.as_ref().unwrap();
         assert_eq!(t.shadow.len(), l.synapse_count());
         assert_eq!(t.elig.len(), l.synapse_count());
         assert_eq!(t.pretr.len(), l.threshold.len());
         assert_eq!(t.spike_count.len(), l.threshold.len());
+        assert!(t.eps_a.is_empty(), "eps_a not allocated when alloc_eps_a=false");
         for s in 0..t.shadow.len() {
             assert_eq!(t.shadow[s], l.weight_at(s) as f32, "shadow == decode(codes)");
         }
@@ -408,7 +411,7 @@ mod tests {
         let size = 8u32;
         let cfg = lc(vec![TopologyLevel { level: 1, radius: 2, count: 4 }]);
         let mut l = Layer::new(&cfg, 7, 0, size);
-        l.enable_training();
+        l.enable_training(false);
         let ts = l.total_slots;
         {
             let sh = &mut l.train.as_mut().unwrap().shadow;
@@ -430,7 +433,7 @@ mod tests {
         let size = 8u32;
         let cfg = lc(vec![TopologyLevel { level: 1, radius: 2, count: 4 }]);
         let mut l = Layer::new(&cfg, 7, 0, size);
-        l.enable_training();
+        l.enable_training(false);
         l.disable_training();
         assert!(l.train.is_none());
     }

@@ -157,8 +157,9 @@ impl Network {
     }
 
     pub fn enable_training(&mut self) {
+        let alloc = self.elig_params.elig_beta != 0.0;
         for l in self.layers.iter_mut() {
-            l.enable_training();
+            l.enable_training(alloc);
         }
     }
 
