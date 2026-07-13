@@ -1,28 +1,51 @@
-# Experiment results — the `wave_net` RSNN
+# Experiment results — the `wave_bitnet` RSNN
 
-**What this is:** the standing record of results on `wave_net`, the stored-weight RSNN engine (`src/bench/`
-drives the experiments). Every number is held-out, multi-seed, and a pure function of `(seed, config,
-params)`. Design rationale lives under `docs/superpowers/specs/`; literature framing in `docs/related-work.md`.
+**What this is:** the standing record of results on `wave_bitnet`, a memory-lean, ternary-native integer
+spiking network. The harness in `src/bench/wave_bitnet_bench.rs` drives the experiments; the training rule
+itself lives in the engine's `wave_bitnet::multilayer_dfa` module. Every number is held-out, multi-seed,
+and a pure function of `(seed, config, params)`. Design rationale lives under `docs/superpowers/specs/`;
+literature framing in `docs/related-work.md`.
 
 ## Substrate
 
-The integer `wave_net` engine: synapse **addresses** stay procedural (hash-regenerated at fire time, free);
-**weights** are stored (`i8` + `f32` shadow) and trained. ALIF = per-neuron adaptive threshold (`adapt_bump >
-0`, Q12 fixed point, τ ≈ `2^adapt_decay` waves); LIF = `adapt_bump = 0`. Readouts are bench-side `f64`; the
-engine stays integer. One engine fix underlies everything: the potential leak is **floored at 1**
-(`p -= max((p>>a)+(p>>b), 1)`) — the old leak had a dead zone (`0` for `0 < p < 2^a`) that froze sub-threshold
-potentials forever (infinite passive memory); flooring gives a finite membrane time constant and caps how
-long a trace persists.
+`wave_bitnet` is a stack of square spiking layers (`size × size`, `size` a power of two, toroidal wrap).
+**Topology is materialized once at construction** into a per-neuron neighborhood **occupancy bitset** — one
+bit per `(2r+1)²` neighborhood cell — and the forward pass simply scans the set bits (`trailing_zeros` over
+word-aligned occupancy words + a per-level offset LUT that turns a cell into a `(dx, dy)`). There is no
+per-wave hashing and no re-derivation of synapse addresses at fire time.
 
-## The pivot: train weights, not thresholds
+**Weights are ternary.** Each wired synapse is a **2-bit packed code** (`0b00 = 0`, `0b01 = +1`, `0b11 = −1`
+— a nonzero mask plus a sign bit), 32 codes per `u64`, with a per-synapse `f32` **training shadow**. The
+shadow is the training master; each step it is requantised to the 2-bit `codes` per row (`repack_row`) via a
+prune threshold `t`: `γ = mean(|shadow|)` over the row, then `|shadow|/γ < t → 0`, else `sign(shadow)`.
+Default `t = 0.5` (round-to-nearest); the sweet spot is `t ≈ 0.7`. At rest and at inference you ship only the
+occupancy bitsets + the 2-bit codes (the memory win); training pays the `f32` shadow.
+
+Per neuron: `i16` potential (rest 0), `u8` cooldown, a per-neuron `i16` **baseline** threshold, and an `i32`
+**ALIF adaptation** state (Q12 fixed point, τ ≈ `2^adapt_decay` waves). ALIF = adaptive threshold
+(`adapt_bump > 0`); LIF = `adapt_bump = 0`. The computational-layer default is `adapt_bump = 5`. Propagation
+is **deferred, one hop per wave**; the engine is deterministic, single-threaded, and a pure function of
+`(seed, config, input)`. Readouts are bench-side `f64`; the engine stays integer.
+
+**L0 is a forced non-adapting input transducer** — `Network::new` sets its baseline to `i16::MAX` and
+`adapt_bump 0`, so it fires only on injection and never self-adapts (giving L0 adaptation makes it swallow cue
+injections and collapse the whole net). The **last layer can be a non-spiking, drain-only readout
+integrator** (folds its input into potential, never fires), giving a clean cumulative signal for a trained
+readout — the mirror of L0's transducer role.
+
+One engine fix underlies everything: the potential leak is **floored at 1** (`p -= max((p>>a)+(p>>b), 1)`).
+The old shift-only leak had a dead zone (`0` for `0 < p < 2^a`) that froze sub-threshold potentials forever
+(infinite passive memory); flooring gives a finite membrane time constant and caps how long a trace persists.
+
+## Train the weights, not the thresholds
 
 Training only per-neuron **thresholds** over a *fixed random ±1* projection does **not** reliably learn
 (held-out, multi-seed: works only when the reservoir×task seed pair aligns, ~1-in-3). Thresholds can only
-*gate* a fixed projection, never *shape* it — scaling width, a crypto hash (BLAKE3), and richer static
+*gate* a fixed projection, never *shape* it — scaling width, a stronger connectivity hash, and richer static
 weights all failed to rescue it. This is what GeNN (Knight & Nowotny 2021) predicts: procedural connectivity
-is *static*-only; **plastic weights must be stored**. So `wave_net` stores + trains the weights (the
-`wave_state_machine` fork stays the frozen pure-procedural reference), and **e-prop on the stored weights
-learns reliably** where thresholds failed:
+is *static*-only; **plastic weights must be stored**. So `wave_bitnet` **stores and trains the ternary
+weights** (moving the `f32` shadow, repacked to the 2-bit codes), and **e-prop on the stored weights learns
+reliably** where thresholds failed:
 
 | | s0 | s1 | s2 | s3 |
 |---|---|---|---|---|
@@ -31,7 +54,7 @@ learns reliably** where thresholds failed:
 
 (A trained readout on the *full* reservoir also hits 1000 on all seeds — the classic LSM.) Two facts carry
 forward: the class signal separates **less well the deeper** a fixed feed-forward stack runs, and **ALIF
-adaptation is a strong ~64-wave working memory** (the bar recurrence must beat).
+adaptation is a strong ~64-wave working memory** (the bar trained recurrence must beat).
 
 ## Depth is usable, and width sets how deep
 
@@ -55,13 +78,13 @@ fails.**
 
 Trained recurrence earns its keep once two things are in place: **the completed ALIF credit rule** and **a
 topology that isolates the recurrent layer from the forward path**. The winning architecture is the
-backward-fed **side-car** (`train_sidecar_task`, `engine_config_sidecar`): the forward signal **skips past**
-the recurrent layer (L1 → L3 via a +2 skip) while a separate **recurrent scratchpad** (L2: self-loop + a
-L2→L3 forward, with L3 feeding L2 back) holds state alongside — so the loop computes *without* injecting its
-reverberation into the clean forward projection. *(These numbers are the original **direct-read** side-car —
-the readout reads the recurrent layer **L3 directly**, so L3 is the top layer with clean symmetric feedback.
-The code's `engine_config_sidecar` has since been extended with a dedicated read layer L4 for the scaling
-study below; reading L3 directly scored higher — see "Scaling study".)*
+backward-fed **side-car**: the forward signal **skips past** the recurrent layer (L1 → L3 via a +2 skip)
+while a separate **recurrent scratchpad** (L2: self-loop + a L2→L3 forward, with L3 feeding L2 back) holds
+state alongside — so the loop computes *without* injecting its reverberation into the clean forward
+projection. *(These numbers are the original **direct-read** side-car — the readout reads the recurrent layer
+**L3 directly**, so L3 is the top layer with clean symmetric feedback. The side-car config has since been
+extended with a dedicated read layer L4 for the scaling study below; reading L3 directly scored higher — see
+"Scaling study".)*
 
 **Result (size 32, worst-seed / 3 seeds) — a strict improvement over feed-forward on every benchmark:**
 
@@ -80,11 +103,11 @@ the first robust, general result where trained recurrence beats feed-forward her
 **The credit rule that trains it.** Earlier recurrence tests used the **crude spike-timing** eligibility (only
 the fast membrane term `e = Σ_t ψ_j·εᵛ_i`). Textbook e-prop for ALIF neurons (Bellec 2020, Eq. 24–25) adds a
 **slow** adaptation eligibility `εᵃ`, recursed at the adaptation rate `ρ`: `e = ψ·(εᵛ − β·εᵃ)` — carrying
-credit over the ~64-wave adaptation horizon. It is now built and verified against the paper + reference
-implementation (`RsnnConfig.elig_beta` / `elig_bump_psi` / `elig_psi_width`; a decide-time `eff` snapshot
-`Layer.decide_eff`; a fixed-width bump ψ). Two ψ bugs fixed on the way: `eff` must be read at the decide step
-(before the fire-bump), and the bump needs a fixed absolute band (the θ≈1 baseline collapses ψ to ~0, since
-±1 drive overshoots `eff` by O(2–26)).
+credit over the ~64-wave adaptation horizon. It is now built and verified against the paper
+(`EligParams.elig_beta` / `elig_psi_width` / `use_bump`; a decide-time `eff` snapshot captured in
+`TrialRecords.effs`; a fixed-width bump ψ, `PSI_WIDTH`). Two ψ bugs fixed on the way: `eff` must be read at
+the decide step (before the fire-bump), and the bump needs a fixed absolute band (the θ≈1 baseline collapses ψ
+to ~0, since ±1 drive overshoots `eff` by O(2–26)).
 
 **What the sweeps found (hidden-recurrent stack, the route to the side-car):**
 
@@ -94,12 +117,17 @@ implementation (`RsnnConfig.elig_beta` / `elig_bump_psi` / `elig_psi_width`; a d
 - **Completed eligibility ≥ crude wherever it's trainable**, its edge largest where credit is hardest (light
   density / small width). But β·`elig_psi_width` tuning that helped the hidden-rec stack *hurt* the side-car
   (**topology >> hyperparameter tuning**) — the plain side-car (β 0.4, W 16) is best.
+- **ALIF strength gates the recurrent hub — `adapt_bump` default = 5.** At `adapt_bump 20` the recurrent hub
+  **adaptation-locks** after the first cue (pure ±1 then can't drive later cues → it *looks* as if ternary
+  can't recurse); at the default **5** it relays every cue and pure ternary solves the side-car parity task.
+  The limit was ALIF adaptation, not the ±1 magnitude.
 
 **Open:** generality to larger sizes; and *why* the side-car structure (forward skip + isolated recurrent
 scratchpad + backward loop) is what unlocks it — working hypothesis: isolating the loop from the forward path
 keeps the class projection clean while the scratchpad holds temporal state (a hypothesis to check against the
-LSNN/e-prop literature). Tools: `train_sidecar_task` / `train_hidden_rec_task` / `sequence_trial_layers`,
-`elig_beta` / `elig_bump_psi` / `elig_psi_width`, `hidden_rec_depth`.
+LSNN/e-prop literature). Tools: the task drivers + readout in `src/bench/wave_bitnet_bench.rs`; the credit
+rule in `wave_bitnet::multilayer_dfa` (`temporal_eligibility`, `multilayer_dfa_step`,
+`EligParams{elig_beta, elig_psi_width, use_bump, rec_tau}`).
 
 ## Scaling study (in progress) — forward drive, width, and read-layer topology
 
@@ -109,12 +137,12 @@ engine is too slow to run these sweeps multi-seed at the sizes needed. Recorded 
 
 **Topology note (direct-read vs read-layer).** The robust headline result above (parity N=4 = 837, plus
 XOR/flip-flop/distractor) is the **direct-read** side-car — readout on the recurrent layer **L3 directly** (L3
-is the top layer → clean symmetric readout feedback). The code's `engine_config_sidecar` now instead has a
-**dedicated read layer L4** (`… L3 → L4 (+1); L4 read`) — the *read-layer variant* used for this study.
-Reading L3 directly scored **higher** (parity N=4, same params: direct-read **837** vs read-layer **~700–765**
-single-seed): a separate read layer **demotes** the recurrent layer from symmetric feedback to noisy DFA
-(≈ −200). So *reading the recurrent computation directly is itself load-bearing.* The read-layer variant is
-kept because it cleanly separates "readout" from "computation" for the parameter sweeps.
+is the top layer → clean symmetric readout feedback). The side-car config now instead has a **dedicated read
+layer L4** (`… L3 → L4 (+1); L4 read`) — the *read-layer variant* used for this study. Reading L3 directly
+scored **higher** (parity N=4, same params: direct-read **837** vs read-layer **~700–765** single-seed): a
+separate read layer **demotes** the recurrent layer from symmetric feedback to noisy DFA (≈ −200). So
+*reading the recurrent computation directly is itself load-bearing.* The read-layer variant is kept because it
+cleanly separates "readout" from "computation" for the parameter sweeps.
 
 **Forward drive × width (read-layer variant, parity N=4, rec 16/r4, single seed 0xE9…):**
 
@@ -144,159 +172,46 @@ together**, and the **forward topology** (skip distances, where the side-car cou
 axis. **Immediate blocker → next step: engine performance optimization** (the single-threaded integer engine
 can't run these sweeps multi-seed at size ≥ 64), then resume the systematic scaling / forward-topology study.
 
-## Criticality init — homeostatic weight-training to σ≈1 (the calibration replacement; FF-validated)
+## Initialization — train from raw, no calibration
 
-**Motivation.** Firing-rate `calibrate` is a brittle *init*: it tunes per-layer **baselines**, but a
-threshold only *gates* a fixed projection — it can't manufacture drive that never arrives, so on a
-sub-critical (cue-dies-with-depth) stack, lowering a starved layer's threshold to 1 still can't revive it.
-And rate is only a **loose proxy for σ** (branching ratio), the real order parameter. Replaced by a
-**homeostatic weight-training init** (`bench::critical_init`) — e-prop-style, layer-wise greedy bottom-up —
-that shapes the stored *weights* (the gain), not the thresholds.
+**There is no calibration and no σ-init in `wave_bitnet`.** A pure fixed ±1 magnitude cannot be scaled to a
+target σ (branching ratio), so there is no edge-of-chaos gain controller and no firing-rate calibration pass —
+neither has anything to tune. Nets **train from raw**: weights initialise to the procedural ±1 sign (a fresh
+net is the pure-procedural LSM), and training moves the `f32` shadow, repacked to the 2-bit codes each step.
 
-**σ diagnostic.** `forward_avalanche` — per-hop single-spike **damage spreading**, `footprint[z+1]/
-footprint[z]` = the forward branching ratio σ_hop (a *burst* of injected spikes cuts the ratio noise). The
-whole-network `sigma_probe` **accumulates across layers** and mis-reads FF criticality (reads σ>1
-everywhere from cross-layer accumulation); the per-hop measure is the right one for a feed-forward stack.
-
-**Findings (32×32×5 FF, single-entry level+1, `adapt_bump 5`; multi-seed where noted).**
-
-1. **Weight-training revives what calibration can't.** A rate-homeostatic e-prop init (`rate_reg_init`,
-   `Δw ∝ −(r_j − r_target)·pre_i·ψ_j`, greedy) revives a sub-critical stack to σ≈1 where calibration dies
-   with depth (up_count 16: forward avalanche *maintained* `0.6→0.5` vs calibration's `dies to 0`).
-   Confirms the pivot mechanism — **weights set gain/σ; thresholds only gate.** ALIF is load-bearing (LIF →
-   dead: no near-threshold ψ → no gradient). ψ is load-bearing *for the rate rule* (dropping it breaks
-   low-density revival).
-
-2. **σ is a density property; ALIF masks super-criticality.** σ is set by fan-out/radius; there is a
-   **critical density** (~up_count 16 at radius 3 *with trained weights* — lower than the ±1 forward-drive
-   threshold ~32, because trained gain reaches σ=1 at lower fan-out). Below → sub-critical; above →
-   super-critical. Crucially, **ALIF holds the rate at target while σ runs >1** — a rate-stable net can be
-   super-critical, and the rate proxy hides it (LIF at high density goes overtly super-critical instead).
-
-3. **rate ≠ σ off the critical density.** Rate-targeting → *flat rate* but *super-critical* σ at high
-   density; σ-targeting → *σ≈1* but a *decaying rate*. They **coincide only at the critical density**
-   (there the simple rate init gives both flat rate and σ≈1 for free).
-
-4. **Rate-free σ-init.** `sigma_eprop_init` drives σ_hop→1 with a per-synapse update `Δw ∝ −(σ_hop−1)·pre_i`
-   (rate emergent, *no set-point*). A uniform gain-*scaling* controller fails at high density — int8
-   weights are all-or-nothing near the quantization floor → oscillation between super-critical and dead;
-   the per-synapse update's `pre_i` heterogeneity thins weights smoothly and fixes it. The f32 latent
-   shadow crossing zero makes **sign-flip to inhibition** available (unused here — sparsifying excitation
-   reaches σ≤1 first — but it is the lever for the planned BitNet **ternary** path, where magnitude is fixed).
-
-5. **σ≈1 is the robust computational target (multi-seed × two tasks).** Intrinsic top-layer quality
-   (held-out nearest-centroid accuracy + effective-dim), 5 seeds. On the **linear pattern** task, σ-eprop
-   wins at *every* density and the flat-rate init **craters toward chance where it goes super-critical**
-   (uc24: flat 334‰ vs σ 798‰; chance 250‰) — a rate-stable super-critical net is *computationally dead*
-   for linear readout. On the **nonlinear spatial-XOR** task both tie well above chance (super-critical
-   chaos *helps* nonlinear mixing). Textbook edge-of-chaos: **σ≈1 maximizes linear separation; super-critical
-   favors nonlinear mixing; σ≈1 is the safe general target.**
-
-**End-to-end FF training gate (2026-07-11) — σ≈1 does NOT cleanly beat calibration on *trained readout*
-accuracy.** Deep (5-layer), width-32 FF, full multi-layer e-prop + trained readout, `critical_init` vs
-the calibration fallback, 3 seeds (chance 500‰):
-
-| up_count | calibration | critical_init |
-|---|---|---|
-| 8  | 830‰ | **1000‰** |
-| 12 | **1000‰** | 820‰ |
-| 16 | 1000‰ | 1000‰ |
-| 32 | 1000‰ | 982‰ |
-
-Two lessons: (1) **training compensates for a brittle init** — `rate_reg`/e-prop revives a
-calibration-starved deep stack, so both hit ceiling at up_count ≥ 16 (the init barely matters once you
-train). (2) **σ≈1 is not the right target for a *readout*-based objective** — its emergent *rate decays
-with depth*, so the top layer can be too **sparse** to read, and `critical_init` *regresses* at up_count 12
-(820 vs 1000). It wins only where calibration is genuinely un-revivable (up_count 8). **Consequence: the FF default was
-NOT flipped to `critical_init`** — it stays an available init (a decisive revive for un-trainable
-sub-critical stacks), calibration stays the default.
-
-**Follow-up (2026-07-11) — the regression is NOT a sparse-top problem; density is not the lever.** The
-initial diagnosis ("σ≈1's decaying rate leaves the top too sparse for the readout") was **wrong**. The
-pre-training per-layer rate profiles (5-layer, width 32) show σ-init actually keeps the **densest, most
-alive top** of the σ/calibration pair (uc32 σ = `[30.6, 10.0, 4.0, 3.9, 4.4]` vs calibration
-`[30.6, 6.0, 2.0, 0.6, 0.4]`, whose top is *dead* pre-training and only revived by training's `rate_reg`).
-To test density directly, a third init — `Network::rate_match_init` (drive each layer's rate to the layer
-below, `rate[z]→rate[z-1]`, via the same e-prop weight update; converged at rounds 100 / lr 0.15) —
-produces a **flat, dense, alive** profile everywhere (uc8 top **11%**, uc12 **15%**, uc32 **16%**), by far
-the densest of the three. Its trained accuracy: `[819, 832, 988, 992]‰` over uc `[8,12,16,32]` — the
-**worst or tied-worst almost everywhere**. Decisive point: at uc8 the *densest* init (rate-match, top 11%)
-trains to **819**, while the *sparsest* (σ-init, top 1%) trains to **1000**. So (1) the init's static rate
-profile does **not** predict trained accuracy, and (2) **denser is worse**, not better. The real substrate
-quality is **σ≈1 = optimal information propagation at the edge of chaos**, *not* firing rate: where the
-substrate is the bottleneck (uc8) σ=1 preserves the signal while an over-driven dense regime saturates it.
-Net: `rate_match_init` is a **confirmed dead end** for trained-readout accuracy; calibration stays the FF
-default, `critical_init` (σ≈1) stays the rescue init for un-revivable starved stacks.
-
-**Is calibration itself redundant with training? — No (`None`-init test, 2026-07-11).** A fourth init,
-`FfInit::None` (train from *raw* weights, no init pass, `rate_reg` only), added as a column to the gate:
-
-| up_count | none | calibration | σ-init | rate-match+ |
-|---|---|---|---|---|
-| 8  | 498 (chance) | 830 | **1000** | 819 |
-| 12 | 498 (chance) | **1000** | 820 | 832 |
-| 16 | 1000 | 1000 | 1000 | 988 |
-| 32 | 1000 | 1000 | 982 | 992 |
-
-`None` sits at **chance** at uc8/uc12 and only reaches 1000 at uc16/uc32. So training's `rate_reg` *cannot*
-bootstrap a raw stack at marginal fan-in — it needs calibration's threshold pre-pass to reach a trainable
-operating point first. This gives a clean **three-regime picture by substrate richness**: (1) **generous
-fan-in (uc16, 32)** — init is irrelevant, even `None` trains to 1000, calibration *is* redundant here; (2)
-**marginal fan-in (uc12)** — calibration is *decisive* (chance→perfect), `rate_reg` alone can't bootstrap
-raw weights; (3) **severe starvation (uc8)** — even calibration limps (830), σ≈1 is the unique rescue
-(1000). A standing puzzle: at uc12 the *more-alive* inits (σ-init, rate-match) train *worse* than
-calibration's dead-top init — "more firing at init" is not the good; calibration lands a specific operating
-point ideal for `rate_reg` training that the weight-only inits miss (cf. Pennington: forward liveness ≠ a
-trainable basin). Literature frame: untrained reservoirs (ESN/LSM) need edge-of-chaos init because the
-hidden weights are never trained (our uc8); trained RSNNs (Bellec e-prop/LSNN) rely on firing-rate
-regularization and treat init as a warm-start (our uc16/32); deep-FF signal-propagation theory
-(Poole/Schoenholz, Pennington) says criticality enables depth but normalization can substitute — all three
-consistent with the regimes above.
-
-**Final decision (2026-07-11) — calibration removed *entirely* (clean slate; supersedes "calibration stays
-the default" above).** Calibration had caused recurring headaches in the recurrent experiments, and the
-study above shows it only ever *bootstraps* a marginal-fan-in stack. So it was dropped wholesale from
-`wave_net`/`bench` (`Network::calibrate`, `CalibrateParams`, `bench/calibrate.rs`, `FfInit::Calibrate`, and
-every call site) — the **frozen `wave_state_machine` keeps its own `calibrate`, untouched**. The standing
-discipline (see `AGENTS.md` → *Initialization*): **feed-forward nets train from raw weights** under a
-contract of **generous fan-in + a liveness assert** (target the `up_count ≥ 16` regime where even raw
-`FfInit::None` trains to ceiling); `Network::critical_init` (σ≈1) is the **rescue** for forced-starved
-substrates and the operating-point setter for *untrained forward measurement* (throughput bench,
-`profile_wave`); `rate_match_init` is a documented dead end. Benchmarks that depended on a calibrated
-substrate (two e-prop learning tests, one characterization value) are `#[ignore]`d pending re-analysis from
-the calibration-free baseline.
-
-**Status.** FF-validated; **`sigma_eprop_init` (rate-free, σ≈1) is the keeper** and the intended calibration
-replacement. Recurrent criticality (the side-car *loop gain* — a separate quantity `sigma_probe(Some(z))`
-measures) is **not yet handled**: the greedy-FF structure doesn't map to the cyclic (L2↔L3) topology. That
-extension + validation on the recurrent benchmarks is required before it replaces calibration for recurrent
-configs; calibration is retained (downgraded to a bench tool) as the fallback until then.
+The standing contract is **generous fan-in + a liveness assert**: size the fan-in so that every computational
+layer fires above a floor after training, and **fail loud** (assert) if a layer dies — then raise fan-in. In
+the generous-fan-in regime (e.g. `up_count ≥ 16` at width 32) even raw weights train to ceiling. Liveness
+*during* training is owned by **`rate_reg`** — a soft per-neuron firing-rate term `c_reg·(rate − target)`
+folded into the e-prop learning signal (the LSNN/e-prop mechanism). It **requires ALIF**: a LIF deep stack has
+no near-threshold ψ, hence no gradient, and cannot be revived. See the over-training caveat at the end —
+`rate_reg` is load-bearing early (revival) but harmful after convergence.
 
 ## Multi-layer temporal-DFA training engine + the `rate_reg`-everywhere decision (2026-07-11)
 
-**A reusable training engine, staged in `bench`.** `src/bench/multilayer_dfa.rs` extracts the temporal
-multi-topology multi-layer-DFA rule (the core of `rsnn.rs`'s `train_multilayer`/`train_recurrent`) into a
-**self-contained, task-agnostic** module: `temporal_eligibility` (decaying pre-trace × ψ × optional ALIF εᵃ)
-+ `multilayer_dfa_step`, built on a new engine primitive `Network::eprop_update_synaptic` — a **non-factored**
-per-synapse update. (The temporal eligibility `e_ij = Σ_t pretr_i(t)·ψ_j(t)` is *not* separable into
-`pre_i·ψ_j`, so the factored `eprop_update` cannot apply it; `eprop_update` is left byte-identical, since f32
-multiplication is not associative.) The engine owns the update + eligibility; the caller owns the trial,
-readout, and learning signal — seam: `TrialRecords{spikes,pots,effs}` in, `signal[layer][j]` in. It depends
-**only on `wave_net`** (helpers `elig_adapt_sum`/`dfa_weight`/`PSI_*` are *copied*, not imported) so it lifts
-into the engine wholesale once proven; **`bench/rsnn.rs` and its benchmarks are untouched**. Design + TDD plan
-under `docs/superpowers/{specs,plans}/2026-07-11-multilayer-dfa-engine*`. Verified: trains temporal XOR
-(held-out > 640, ignored/`--release`), a 2-class task to ceiling in the generous-fan-in regime (size 16,
-`up_count` 32; 4 layers at size 8 is fan-in-starved → chance), trains recurrent (level-0) edges, and is
-deterministic for both the membrane (β=0) and ALIF-εᵃ (β>0) eligibility flavors.
+**The training engine lives in `wave_bitnet::multilayer_dfa`.** `src/wave_bitnet/multilayer_dfa.rs` is the
+**self-contained, task-agnostic** temporal multi-topology multi-layer-DFA rule: `temporal_eligibility` (a
+decaying presynaptic trace × ψ × optional ALIF adaptation eligibility `εᵃ`) + `multilayer_dfa_step`, built on
+the engine primitive `Network::eprop_update_synaptic` — a **non-factored, per-synapse** shadow update that
+repacks each touched row to the 2-bit codes. The temporal eligibility `e_ij = Σ_t pretr_i(t)·ψ_j(t)` is *not*
+separable into `pre_i · ψ_j`, so the update must run per synapse (targets decoded from the source layer's
+occupancy bitset, in wired-rank order — credit reuses the same materialized topology the forward pass
+iterates). The engine owns the update + eligibility; the caller owns the trial, readout, and learning signal —
+the seam is `TrialRecords{spikes, pots, effs}` in, `signal[layer][j]` in. The harness
+(`src/bench/wave_bitnet_bench.rs`) drives it. Design + TDD plan under
+`docs/superpowers/{specs,plans}/2026-07-11-multilayer-dfa-engine*`. Verified: trains temporal XOR (held-out,
+ignored/`--release`), a 2-class task to ceiling in the generous-fan-in regime (size 16, `up_count 32`; a
+fan-in-starved 4-layer size-8 stack goes to chance), trains recurrent (level-0) edges, and is deterministic
+for both the membrane (β=0) and ALIF-`εᵃ` (β>0) eligibility flavors.
 
 **`rate_reg` everywhere; `rec_stab` set aside — supersedes the AGENTS.md "forward-path-only" hard rule.**
 The earlier rule (AGENTS.md) held that `rate_reg` (per-neuron `c_reg·(rate − target)`) belongs on the forward
 path *only*, and that on recurrent weights it homogenizes the class signal and *hurts* — with the per-layer,
 class-preserving `rec_stab` as the recurrent substitute. **Current position: `rate_reg` is better across all
 layer types; `rec_stab` was not carrying its weight.** So `rate_reg` is now applied to every edge type
-(forward `+1`, lateral `0`, backward `−1/−2`) and `rec_stab` is dropped from the training signal — its code
-remains in `rsnn.rs` and can be resurrected if a recurrent config is shown to need it. The new engine's
-signal builder uses per-neuron `rate_reg` on all layers, no `rec_stab`.
+(forward `+1`, lateral `0`, backward `−1/−2`) and `rec_stab` is dropped from the training signal — a
+documented option to resurrect only if a recurrent config is shown to need it. The engine's signal builder
+uses per-neuron `rate_reg` on all layers, no `rec_stab`.
 
 **Eligibility note — bump-ψ collapses under strong forward drive.** The bump pseudo-derivative
 `ψ = γ·max(0, 1 − |v − eff|/W)` (the β>0 path; `elig_psi_width` = W, default 16) goes to ~0 when a neuron's
@@ -336,8 +251,8 @@ substrate (its intended job — see the liveness rescue above). But once the tas
 the *uniform* target rate — **homogenizing the representation and eroding class separability**. Depth
 amplifies it (more compounding reg terms, a more fragile deep class signal), turning a transient dip (4L,
 recovers) into a permanent collapse (12L). `rate_reg = 0` (or weak = 1) removes the collapse **on a generous
-substrate** (r4/c48/c64, σ ≈ 0.5–0.74, which is alive without the reg); on a *starved* substrate the reg is
-still needed for liveness, so it cannot simply be deleted.
+substrate** (r4/c48/c64, alive without the reg); on a *starved* substrate the reg is still needed for
+liveness, so it cannot simply be deleted.
 
 **Mitigation — early-stopping (documented, NOT implemented).** Because `rate_reg` must stay ON during the
 bootstrap/revival phase but is harmful after convergence, the fix is to **stop eroding the converged

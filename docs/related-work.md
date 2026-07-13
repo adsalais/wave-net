@@ -1,200 +1,190 @@
-# Related work — where wave_net sits, and what to borrow
+# Related work — where wave_bitnet sits, and what to borrow
 
 **Date:** 2026-07-08
-**Purpose:** `wave_net` is a novel *combination*, but every major ingredient maps to an established
-line of work. This note records the closest matches and the concrete idea to steal from each — a
-starting point for designing the learning layer.
+**Purpose:** `wave_bitnet` is a novel *combination*, but every major ingredient maps to an established
+line of work. This note records the closest matches and the concrete idea to borrow from each — the
+literature backing for the engine's design and its learning layer.
 
-## What wave_net is, in one line
+## What wave_bitnet is, in one line
 
-A **procedural-connectivity liquid state machine with intrinsic-plasticity threshold learning, in a
-TrueNorth-style integer substrate**, laid out on a 2D grid with deferred wave propagation. Each
-quadrant below is real and studied; the specific fusion (and the grid/wave deferred-propagation
-topology) is the part that looks like our own contribution.
+A **ternary-native integer spiking network with ALIF adaptive-threshold neurons, trained by e-prop /
+multi-layer temporal-DFA, in a TrueNorth-style integer substrate** — laid out on a 2D grid with
+deferred one-hop wave propagation, its topology materialized once into per-neuron occupancy bitsets and
+its plastic weights stored as 2-bit packed ±1/0 codes plus an f32 training shadow. Each quadrant below is
+real and studied; the specific fusion (and the grid/wave deferred-propagation topology) is the part that
+looks like our own contribution.
 
-## 1. Hash-generated synapses → "procedural connectivity" (closest match)
+## 1. Materialized procedural topology → "procedural connectivity" (closest match)
 
 Knight & Nowotny, *Larger GPU-accelerated brain simulations with procedural connectivity* (GeNN,
-Nature Computational Science 2021) do exactly our "synapses are never stored — regenerated on the
-fly": connectivity + weights are generated on demand from a **per-neuron-seeded RNG** (a PRNG is a
-hash) whenever a spike must be transmitted, storing zero connectivity. It enabled 4.1M neurons /
-24B synapses on one GPU. Our `synapse::key`/`mix` → `generate_into` is the same trick.
+Nature Computational Science 2021) do the "synapses need never be stored — regenerate on the fly":
+connectivity + weights are generated on demand from a **per-neuron-seeded RNG** (a PRNG is a hash)
+whenever a spike must be transmitted, storing zero connectivity. It enabled 4.1M neurons / 24B synapses
+on one GPU. `wave_bitnet` uses the same address trick but resolves the memory-vs-compute tradeoff the
+other way: it **samples each neuron's neighborhood once at construction and materializes it into an
+occupancy bitset** (one bit per `(2r+1)²` cell), then iterates the set bits at fire time — no per-wave
+hashing. The address scheme stays procedural (a pure function of `(seed, config)`); only the resolved
+bitset is kept.
 
-- **Steal:** the determinism discipline and the memory-vs-compute tradeoff argument — the published
-  justification that our storage-free, FPGA-clean approach scales. Also worth checking how they
-  keep per-neuron RNG streams independent and reproducible.
+- **Steal:** the determinism discipline and the memory-vs-compute tradeoff argument. Because the
+  addresses are procedural, materializing them costs almost nothing (~0.2 B/synapse) and buys back the
+  per-wave hash cost — the deliberate inverse of GeNN's never-store choice, correct at our scale. Worth
+  matching how they keep per-neuron RNG streams independent and reproducible.
 
-**Read in full (2026-07-08) — three points that reframe wave_net's learning experiments:**
+**Two points from a full read (2026-07-08), now the settled design rationale:**
 
-1. **RNG quality is load-bearing; they use Philox4×32-10** (a *counter-based* cryptographic PRNG,
-   Salmon et al. 2011) precisely to get independent, correlation-free streams per neuron. Our
-   home-rolled `key`/`mix` is **not** that: the verification pass found it *correlates* the streams
-   that share a seed (network vs task aligned spuriously → the "same-seed learns" artifact), and
-   swapping in BLAKE3 removed it. **Adopt a counter-based / crypto-quality mixer** (Philox-style
-   integer, or keep BLAKE3-quality) — this is a real defect the paper's design explicitly avoids.
-2. **Procedural = *static* connectivity only.** Verbatim: *"applicable whenever synapses are static –
-   plastic synapses which change their weights during a simulation will have to be simulated in the
-   traditional way."* GeNN **never learns procedural weights**; plastic weights are **stored**. So our
-   attempt to learn on a purely-procedural net fights the paradigm. The sanctioned architecture is
-   **hybrid: procedural static reservoir + a small *stored* plastic readout/projection.** (Enriching
-   the static projection with distributional magnitudes — our `random_weights` test — did **not** make
-   learning reliable, consistent with this: a richer *static* projection is still static.)
-3. **The benefit is memory at *scale* (24×10⁹ synapses).** We run at ~10³–10⁵ synapses, where storage
-   is trivially cheap — so we inherited procedural's *constraint* (can't learn weights) with **none**
-   of its payoff. At our scale, storing the plastic part costs nothing.
+1. **RNG quality is load-bearing; GeNN uses Philox4×32-10** (a *counter-based* cryptographic PRNG,
+   Salmon et al. 2011) precisely to get independent, correlation-free streams per neuron. The
+   neighborhood sampler must be counter-based / crypto-quality so the sampled per-neuron streams stay
+   correlation-free — **hold to a BLAKE3-quality mixer** (the `strong_hash` control is the standard to
+   match). This is a real defect the paper's design explicitly avoids.
+2. **Procedural = *static* connectivity only; plastic weights must be stored.** Verbatim: *"applicable
+   whenever synapses are static – plastic synapses which change their weights during a simulation will
+   have to be simulated in the traditional way."* GeNN **never learns procedural weights**; plastic
+   weights are **stored**. That is exactly `wave_bitnet`'s split: the synapse **addresses** are
+   procedural (materialized once, free), and the **plastic weights** are stored — as 2-bit packed ±1/0
+   codes plus an f32 training shadow (quantized through a prune threshold). Addresses cost storage once;
+   the trainable part lives where it must. The GeNN payoff (pure procedural) is memory at *scale*
+   (24×10⁹ synapses); at `wave_bitnet`'s ~10³–10⁵ synapses, storing the plastic part costs nothing —
+   which is precisely why it stores the ternary codes outright and keeps only the free part procedural.
+   The sanctioned architecture is this **hybrid: procedural static structure + a small *stored* plastic
+   part**, and it is the one `wave_bitnet` implements.
 
-## 2. Fixed substrate + train per-neuron params → Liquid State Machine / spiking reservoir computing
+## 2. Fixed substrate + trained readout → Liquid State Machine / spiking reservoir computing
 
-Our "fixed procedurally-wired dynamical substrate, then learn on top" *is* an LSM (Maass): a random
-recurrent spiking reservoir with fixed synapses + a trained readout. Large literature on
-*conditioning* the reservoir.
+The grid of adaptive integer neurons *is* a spiking reservoir (Maass LSM): a recurrent spiking
+substrate driven by input, read (and here also trained) on top. A trained readout on the full reservoir
+(classic LSM) is a reliable baseline; the engine additionally trains the reservoir weights themselves.
+Large literature on *conditioning* the reservoir.
 
-- **Steal:** the **edge-of-chaos / criticality** result — reservoirs compute best when the
-  branching ratio ≈ 1. That is the deeper target our firing-rate calibration is a proxy for: rate
-  is easy to measure, but **branching ratio / spatial-temporal σ** is the quantity that actually
-  governs memory and computation. Calibration direction is validated; reservoir theory says *where*
-  the sweet spot is. (This is what the earlier, now-deleted criticality/homeostasis idea was
-  reaching for — revisit it when conditioning matters.)
+- **Steal:** the **edge-of-chaos / criticality** result — reservoirs compute best when the branching
+  ratio ≈ 1. That is the deeper operating-point target. `rate_reg` keeps the substrate live, but the
+  quantity that actually governs memory and computation is **branching ratio / spatial-temporal σ**,
+  measured on the *task* drive — reservoir theory says *where* the sweet spot is.
 
-## 3. Training per-neuron thresholds → intrinsic / homeostatic plasticity + adaptive-threshold neurons
+## 3. Adaptive-threshold neurons → intrinsic / homeostatic plasticity + ALIF
 
-Our `Layer::calibrate_step` — "boost excitability if it rarely fires, depress if it fires too much"
-— is textbook **intrinsic plasticity / homeostasis**. Modern RSNNs make the firing **threshold** an
-adaptive per-neuron state variable (**ALIF** — adaptive leaky integrate-and-fire), which is exactly
-our chosen trainable parameter.
+The engine's per-neuron **adaptive threshold** — the ALIF adaptation state that rises when a neuron
+fires and decays at rest, throttling its own excitability — is the neuromorphic form of textbook
+**intrinsic plasticity / homeostasis** ("depress if it fires too much, boost if it rarely fires").
+Modern RSNNs make the firing **threshold** an adaptive per-neuron state variable (**ALIF** — adaptive
+leaky integrate-and-fire), which is exactly `wave_bitnet`'s delay-memory mechanism; the soft `rate_reg`
+liveness term is its co-trained homeostatic companion.
 
-- **Steal:** intrinsic-plasticity rules are a proven, gradient-free way to train the per-neuron
-  threshold; ALIF shows adaptive thresholds + recurrence is what makes RSNNs expressive. The common
-  "dynamic threshold" rule (raise on spike, decay at rest) is a ready-made homeostatic primitive.
+- **Borrowed context / steal:** intrinsic-plasticity rules are the literature frame for the adaptive
+  threshold and `rate_reg`; ALIF shows adaptive thresholds + recurrence are what make RSNNs expressive.
+  The common "dynamic threshold" rule (raise on spike, decay at rest) is precisely the ALIF adaptation
+  primitive the engine runs.
 
-## 4. Integer, ±1 weights, deterministic → neuromorphic hardware
+## 4. Integer, ternary weights, deterministic → neuromorphic hardware
 
 The engine is shaped like a neuromorphic chip. **IBM TrueNorth** is the closest sibling: strictly
-digital, **deterministic integer neurons, binary synaptic weights** — nearly our ±1 / i16 /
-deterministic design. **Intel Loihi 2** is fixed-point (8-bit weights, 24-bit membrane) with
-on-chip learning.
+digital, **deterministic integer neurons, binary synaptic weights** — nearly `wave_bitnet`'s 2-bit ±1/0
+codes / i16 potential / deterministic design. **Intel Loihi 2** is fixed-point (8-bit weights, 24-bit
+membrane) with on-chip learning.
 
-- **Steal:** TrueNorth confirms deterministic-integer-binary-weight SNNs are a real, effective
-  design point, not a compromise. Loihi's fixed-point layout is a reference for how many bits to
-  budget for thresholds vs. membrane potential if precision ever bites.
+- **Steal:** TrueNorth confirms deterministic-integer, low-bit-weight SNNs are a real, effective design
+  point, not a compromise. Loihi's fixed-point layout is a reference for how many bits to budget for
+  thresholds vs. membrane potential if precision ever bites.
 
-## Training the learning layer (next phase) — and the multi-wave rule
+## The training rule — e-prop, eligibility traces, and the multi-wave rule
 
-**e-prop** (Bellec et al. 2020, *A solution to the learning dilemma for recurrent networks of
-spiking neurons*) is the key RSNN training rule, and two things align eerily with our design:
+**e-prop** (Bellec et al. 2020, *A solution to the learning dilemma for recurrent networks of spiking
+neurons*) is the key RSNN training rule, and two things align eerily with `wave_bitnet`'s design:
 
 - It solves **temporal credit assignment** with **eligibility traces**: because a recurrent net's
-  response is spread over time, learning signals must integrate over a window. That is our
+  response is spread over time, learning signals must integrate over a window. That is the
   "**a read requires several waves; single-wave training is an error**" rule (AGENTS.md), formalized.
 - In their words, e-prop's gradient information "flows through slow hidden variables **like firing
-  thresholds**" — the trainable slow variable they lean on is exactly the one we chose.
+  thresholds**" — and the engine's ALIF adaptation is exactly that slow hidden state, carried in the
+  eligibility as the `εᵃ` term (`e = ψ·(εᵛ − β·εᵃ)`, Bellec 2020). The trained parameter is the stored
+  ternary weight, moved through its f32 shadow.
 
-So the multi-wave rule is not just correct — it is the principle e-prop is built on. When we get to
-training, the menu is:
+So the multi-wave rule is not just correct — it is the principle e-prop is built on. The engine's
+realized rule sits in the gradient-based branch of the family:
 
-1. **Intrinsic plasticity / homeostasis** — unsupervised conditioning (what calibration already is).
-2. **Reward-modulated plasticity / node perturbation** — gradient-free, integer-friendly task
-   learning over a multi-wave window (no differentiable shadow needed).
-3. **e-prop-style eligibility traces** — if we want a per-neuron-threshold learning rule with proper
-   temporal credit assignment; needs a surrogate-gradient shadow since the integer engine is
-   non-differentiable.
+1. **Intrinsic plasticity / homeostasis** — the unsupervised-conditioning role, now filled by the soft
+   `rate_reg` liveness term.
+2. **Reward-modulated plasticity / node perturbation** — gradient-free, integer-friendly task learning
+   over a multi-wave window (no differentiable shadow needed).
+3. **e-prop-style eligibility traces** — a factored per-neuron eligibility (`e = pre-trace × ψ`, both
+   O(neurons) engine state) times a top-down learning signal, updating the stored weights through the
+   `f32` shadow. **This is the path `wave_bitnet` took**; the `f32` shadow is the differentiable twin the
+   non-differentiable integer engine needs.
 
-Any of these must operate on a **multi-wave window**, per the engine's deferred + recurrent dynamics.
+Any such rule operates on a **multi-wave window**, per the engine's deferred + recurrent dynamics.
 
 ## Online, constant-memory training over long windows (FPTT / HYPR family)
 
-The methods below all solve the same problem the multi-wave rule creates: learning over a long
-temporal window in a recurrent spiking net **without storing the window**. Two facts about wave_net
-filter what's borrowable:
+The methods below all solve the same problem the multi-wave rule creates: learning over a long temporal
+window in a recurrent spiking net **without storing the window**. Two facts about `wave_bitnet` filter
+what's borrowable:
 
-- **Weights are fixed ±1 procedural** → per-*synapse* rules don't apply; the only trainable state is
-  **per-neuron** (threshold, maybe leak/adaptation). Point these methods' machinery at per-neuron
-  parameters, not synapses.
-- **Integer hard threshold → no gradients.** Gradient-based methods (FPTT, HYPR, StochEP) need a
-  **differentiable shadow twin**; the gradient-free three-factor form (eligibility × reward) needs
-  no shadow and fits the FPGA-clean integer substrate — that's the natural path.
+- **Weights are stored and trainable** (2-bit ternary codes + per-synapse `f32` shadow) → per-*synapse*
+  rules apply directly; point their machinery at the stored weights. The per-neuron slow states (ALIF
+  adaptation, and optionally leak) are available too.
+- **Integer hard threshold → no gradients** in the forward engine. Gradient-based methods (FPTT, HYPR,
+  StochEP) need a **differentiable shadow twin** — which the engine already carries as the `f32` weight
+  shadow. The gradient-free three-factor form (eligibility × reward) needs no shadow and fits the
+  integer substrate.
 
 Ranked by value to this engine:
 
-1. **Adaptive threshold (ALIF) as the trainable slow state** — highest leverage. Make the per-neuron
-   threshold a slow dynamic variable (rises on fire, decays at rest) instead of a static calibrated
-   value. Gives long-range memory, is per-neuron (fits the constraint), and is exactly the variable
-   e-prop/FPTT know how to train (e-prop's ALIF eligibility has a threshold-adaptation component).
-   Cheap: one extra per-neuron slow variable + decay. Bridges static-threshold *calibration* to
-   dynamic-threshold *learning*.
+1. **Adaptive threshold (ALIF) as the slow state** — highest leverage, and built. The per-neuron
+   threshold is a slow dynamic variable (rises on fire, decays at rest): long-range memory, per-neuron,
+   and exactly the variable e-prop/FPTT know how to train (e-prop's ALIF eligibility has a
+   threshold-adaptation component — the `εᵃ` term the engine uses). Cheap: one extra per-neuron slow
+   variable + decay.
 2. **Constant-memory online learning** — don't store the multi-wave window; carry a constant-size
-   **eligibility trace** forward and update online. Borrow (a) e-prop's threshold eligibility trace
-   as the credit-assignment mechanism (gradient-free when the top-down signal is a reward =
-   three-factor), and (b) FPTT's **dynamic regularizer** (couple each online update to a slowly
-   moving reference parameter) as the stabilizer — transplantable even into a reward-modulated rule.
-3. **Locality ladder for on-substrate learning** — **ETLP** (event-based three-factor local
-   plasticity) is e-prop made hardware-local; the target shape for a rule that runs inside the
-   substrate rather than an offline trainer.
+   **eligibility trace** forward and update online. Borrow (a) e-prop's threshold eligibility trace as
+   the credit-assignment mechanism (gradient-free when the top-down signal is a reward = three-factor),
+   and (b) FPTT's **dynamic regularizer** (couple each online update to a slowly moving reference
+   parameter) as the stabilizer — transplantable even into a reward-modulated rule.
+3. **Locality ladder for on-substrate learning** — **ETLP** (event-based three-factor local plasticity)
+   is e-prop made hardware-local; the target shape for a rule that runs inside the substrate rather than
+   an offline trainer.
 4. **Liquid / heterogeneous time constants** — FPTT matched BPTT paired with a liquid (adaptive)
-   time-constant neuron. Making `leak` per-neuron / heterogeneous / adaptive is another cheap
-   per-neuron parameter buying multi-timescale memory (adaptive-LIF / resonate-and-fire family).
+   time-constant neuron. Making `leak` per-neuron / heterogeneous / adaptive is another cheap per-neuron
+   parameter buying multi-timescale memory (adaptive-LIF / resonate-and-fire family).
 5. **HYPR parallelization** — file for later: forward-mode learning parallelizes, and the deferred
-   one-hop model is already layer-parallelizable (read last wave's inbox, write next wave's outbox),
-   so this lands naturally at scale-up.
+   one-hop model is already layer-parallelizable (read last wave's inbox, write next wave's outbox), so
+   this lands naturally at scale-up.
 6. **StochEP / Equilibrium Propagation** — a stretch: EP needs the net to relax to an equilibrium
-   (convergent RNN, free/nudged phases); a driven wave engine only fits if a settling regime is
-   carved out. Lower priority.
+   (convergent RNN, free/nudged phases); a driven wave engine only fits if a settling regime is carved
+   out. Lower priority.
 
-**Suggested path:** per-neuron threshold as an adaptive (ALIF) state, trained by an e-prop-style
-eligibility trace under a reward/three-factor signal (gradient-free, no shadow), regularized
-FPTT-style toward a running reference — with a surrogate-gradient shadow as a ceiling/benchmark and
-ETLP as the on-chip-local target.
+**Realized path:** a factored per-neuron eligibility trace (`pre-trace × ψ`, with the ALIF adaptation
+`εᵃ` component) under a learning signal from a trained readout / multi-layer DFA feedback, updating the
+stored ternary weights through the `f32` shadow, with `rate_reg` as a light co-trained liveness term.
+Borrowable next: FPTT's dynamic regularizer as a stabilizer, and ETLP as the on-substrate-local target.
 
-## Design notes from the ALIF iteration (2026-07-08) — two alternatives weighed
+## Design note from the ALIF iteration (2026-07-08) — heterogeneous leak weighed
 
-After the ALIF-threshold branch landed, two alternative directions were analysed as a critical-thinking
-exercise. Neither is built; captured here so the learning-layer phase inherits the reasoning.
+After the ALIF-threshold design landed, an alternative direction was analysed as a critical-thinking
+exercise. It is not built; captured here so the reasoning is not lost.
 
-### A. Online baseline-homeostasis (as a replacement for offline calibration)
-
-- **What.** Replace the offline `calibrate` pass with a per-neuron online rule: a spike-triggered
-  **rate trace** (geometric decay, same shape as `adapt`) plus a slow **baseline nudge** toward a
-  target rate. Structurally the same integer slow-variable pattern as ALIF.
-- **Cost.** Code is *low* (≈ the ALIF change). The difficulty is **dynamical, not code**: stable
-  timescale separation (homeostasis ≪ adaptation ≪ wave), avoiding oscillation in the coupled
-  recurrent stack, noise-robust rate estimation. Offline calibration deliberately dodges all of this
-  via reset → measure → step → freeze (and its bottom-up ordering tames the recurrent coupling).
-- **Risk.** Strict per-neuron rate homeostasis **homogenises** firing rates, which can *hurt* reservoir
-  richness — edge-of-chaos/criticality wants heterogeneity. Calibration's uniform per-layer shift
-  preserves per-neuron jitter; naive homeostasis erases it. Mitigate with a soft/slow rule or a target
-  *distribution* rather than a single rate.
-- **Strategic.** An online homeostatic baseline rule already *is* a gradient-free intrinsic-plasticity
-  learning rule (three-factor family). Its real payoff is when the baseline is nudged by **task
-  reward**, not a fixed rate — so build it *with* the learning layer, against a task, not as a
-  calibration replacement now.
-- **Recommendation.** Don't cold-drop calibration. Either (a) keep calibration as a **warm-start** and
-  add online maintenance on top (removes the hardest cold-start stability problem — the rule only has
-  to *hold* a good operating point, not *find* one), or (b) defer entirely to the learning-layer phase.
-
-### B. Adaptive / heterogeneous leak (vs. the adaptive threshold we built)
+### Adaptive / heterogeneous leak (vs. the adaptive threshold)
 
 - **What.** Make the **leak** (integration time constant) per-neuron — heterogeneous-fixed or dynamic.
   Memory then lives in the *existing* `potential` (an **input-integration** memory), giving a spectrum
   of temporal receptive fields (coincidence-detector → accumulator). This is a *different* memory from
   ALIF's **output/firing-rate** memory, and composes natively with the sub-threshold-integration dead
-  zone we deliberately kept (slow-leak → near-perfect accumulator; fast-leak → leaky).
+  zone the engine deliberately keeps (slow-leak → near-perfect accumulator; fast-leak → leaky).
 - **Memory usage — much lighter.** `adapt` is `i32` = **4 bytes/neuron**, the single heaviest
-  per-neuron field (44% of the 9-byte footprint `potential`/`cooldown`/`threshold`/`adapt`), inflated
-  to i32 by the Q-fixed-point dead-zone fix. Per-neuron leak is a `u8` shift = **1 byte** stored, or
-  **0 bytes** if hash-derived (`leak_shift(seed, id)` computed on demand, exactly like synapses and
-  threshold jitter). The fixed-heterogeneous form adds **no new dynamic state at all** — the
-  multi-timescale memory is just `potential` decaying at per-neuron rates. (Hash-derived trades 1 byte
-  of storage for one `mix()` per neuron per wave in the leak loop; storing the byte is likely the
-  better trade.)
+  per-neuron field (44% of the 9-byte footprint `potential`(i16)/`cooldown`(u8)/`threshold`(i16)/`adapt`(i32)),
+  inflated to i32 by the Q-fixed-point dead-zone fix. Per-neuron leak is a `u8` shift = **1 byte**
+  stored, or **0 bytes** if derived on demand from the seed. The fixed-heterogeneous form adds **no new
+  dynamic state at all** — the multi-timescale memory is just `potential` decaying at per-neuron rates.
+  (Deriving on demand trades 1 byte of storage for one mix per neuron per wave in the leak loop; storing
+  the byte is likely the better trade.)
 - **Trade.** Leak buys input-timescale memory + reservoir richness but **not** ALIF's rate
-  self-regulation — dropping ALIF for leak shifts all rate control onto calibration/homeostasis. The
-  two are **not mutually exclusive**.
-- **Recommendation.** Add heterogeneous (hash-derived) leak **additively** first — cheap, deterministic,
-  on-brand for a store-nothing engine — and measure what each contributes before deciding whether leak
-  makes `adapt` droppable (reclaiming the 4 bytes). Final adjudication needs a temporal task.
+  self-regulation. The two are **not mutually exclusive**.
+- **Recommendation.** Add heterogeneous leak **additively** first — cheap, deterministic, on-brand for a
+  store-light engine — and measure what each contributes before deciding whether leak makes `adapt`
+  droppable (reclaiming the 4 bytes). Final adjudication needs a temporal task.
 
-Both alternatives share the same meta-point as the ranked list above: mechanism should be validated by a
-task, not tuned in a vacuum. See ranked items 1 (ALIF threshold) and 4 (liquid/heterogeneous leak).
+Meta-point (shared with the ranked list above): mechanism should be validated by a task, not tuned in a
+vacuum. See ranked items 1 (ALIF threshold) and 4 (liquid/heterogeneous leak).
 
 ## Follow-up: fixed-point potential — remove the floored-leak density cost (store-recall bench)
 
@@ -207,7 +197,7 @@ ALIF held ~55% decoding at delay 24 — the adaptive-threshold memory is real an
 
 - **Cost, now on the books:** the 1/wave floor **starves weakly-driven (sparse) cascades** — a neuron
   receiving < 1 delivery/wave loses more to the floor than it gains, so it can't integrate. Upper layers
-  need much denser drive (the calibration fixture went `level+1 count 6 → 16`). The sub-threshold
+  need much denser drive (the fixture's fan-in went `level+1 count 6 → 16`). The sub-threshold
   integration property we'd defended is now confirmed to matter.
 - **The upgrade when it bites — fixed-point `potential`.** Mirror the `adapt` fix: store `potential`
   scaled up (`i32`, Q-fixed-point), with `±1` deliveries becoming `±scale`. Then the geometric leak
@@ -217,7 +207,7 @@ ALIF held ~55% decoding at delay 24 — the adaptive-threshold memory is real an
   touching everything (much bigger than the floored-leak two-liner). Do it if/when the density
   requirement of floored-leak proves limiting; otherwise floored-leak suffices.
 
-## Bench findings: ALIF buys only held-category memory (three experiments), and what Spec 3 should train
+## Bench findings: ALIF buys only held-category memory (three experiments), and what training should target
 
 The Tier-0/1 bench (Specs 1, 2, 2b) ran three ALIF-vs-LIF experiments. The result is sharper — and
 narrower — than expected, which directly scopes what an e-prop-style rule (Spec 3) should target.
@@ -243,13 +233,13 @@ narrower — than expected, which directly scopes what an e-prop-style rule (Spe
 by a probe. Not linear echo (MC), not nonlinear temporal computation (XOR).** The two prior notes'
 guess that XOR/adding would reward ALIF was wrong; correct it here.
 
-Implications for Spec 3 (e-prop-style threshold training):
+Implications for Spec 3 (e-prop-style training):
 
 - **Train against a held-category / working-memory task** — the store-recall / delayed-match family (hold
   *which pattern*, recall after a delay/distractor). **Not** MC, **not** XOR/adding (bit-level tasks LIF
   already does better) — those don't exercise what adaptation provides.
-- **e-prop's eligibility trace on the per-neuron threshold** is precisely the machinery that credits this
-  slow held-state; the trainable variable and the memory it carries line up.
+- **e-prop's eligibility trace, carrying the ALIF adaptation state (the `εᵃ` component)**, is precisely the
+  machinery that credits this slow held-state; the slow variable and the memory it carries line up.
 - **Control for passive memory** when attributing memory to adaptation: recurrence carries memory on its
   own (feed-forward isolates adaptation), and — before the floored-leak fix — frozen sub-threshold
   potentials gave even LIF infinite memory. The harness supports feed-forward isolation.
@@ -264,49 +254,44 @@ Implications for Spec 3 (e-prop-style threshold training):
   topology density. This is the natural way to span both memory axes; worth a bench experiment (a mixed
   config on store-recall *and* XOR) before or alongside Spec 3.
 
-## What e-prop actually does with firing rates — and where our approach diverged (2026-07-09)
+## What e-prop does with firing rates — and how rate_reg follows it (2026-07-09)
 
-Checked the e-prop / LSNN literature against `wave_net`'s firing-rate machinery (calibration + the
-rate-regularization experiments). Three divergences, each now a correction:
+The e-prop / LSNN literature pins down what firing-rate machinery should and shouldn't do; `wave_bitnet`'s
+`rate_reg` follows it on three points.
 
-1. **Rate regularization is a soft *loss* term, co-trained — not a separate calibration.** e-prop/LSNN adds
-   an L1/L2 firing-rate penalty to the loss, minimized *jointly* with the task, pulling rates to a modest
-   biologically-plausible level (~16 Hz; tasks solved with no neuron above ~12 Hz) for **efficiency /
-   sparsity**. There is **no** pre-training threshold *calibration on a proxy drive*. `wave_net`'s
-   `calibrate` (tune thresholds to ~10% on `random_l0_input`) is *our* addition, and it introduces a
-   **drive mismatch**: it hits ~10% on the random drive (`calib_fraction_q16` ≈ 30% of L0) but the *denser
-   task cue* (`base_q16` ≈ 46% of L0) overshoots to **20–40%** on the actual task — so the calibrated rate
-   never transfers. The "10%" is measured on the wrong drive.
+1. **Rate regularization is a soft *loss* term, co-trained.** e-prop/LSNN adds an L1/L2 firing-rate penalty
+   to the loss, minimized *jointly* with the task, pulling rates to a modest biologically-plausible level
+   (~16 Hz; tasks solved with no neuron above ~12 Hz) for **efficiency / sparsity**. `wave_bitnet`'s
+   `rate_reg` is exactly this: a light per-neuron term folded into the e-prop learning signal and minimized
+   jointly with the task — not a separate pre-training pass on a proxy drive.
 2. **A fixed, uniform rate target is a documented liability, not a virtue.** The SNN regularization
    literature warns it "forces neurons to have similar firing rates for different inputs instead of allowing
    them to use different rates to represent different inputs" — i.e. it erodes input-specific coding. This is
-   exactly the **"class-agnostic activity, not information"** failure our depth- and recurrence-rate-reg
-   experiments hit (reviving / keeping-alive added activity but not class content). It also matches the
-   earlier homeostasis note (§ Design notes A: strict per-neuron rate homeostasis homogenizes rates → hurts
-   reservoir richness).
+   exactly the **"class-agnostic activity, not information"** failure the depth- and recurrence-`rate_reg`
+   experiments hit (reviving / keeping-alive added activity but not class content), and why `rate_reg` is
+   held to a *light* co-trained term rather than a hard set-point: strict per-neuron rate homeostasis
+   homogenizes rates → hurts reservoir richness.
 3. **LSNN's delay-task memory is ALIF adaptation, not a self-sustaining recurrent loop.** LSNN = LIF +
    adaptive-LIF; the "long short-term memory" *is* the slow adaptation variable, and recurrence + e-prop
-   *route/compute* on top. Stripping ALIF to "isolate recurrence" (our LIF temporal-XOR setup) removes the
+   *route/compute* on top. Stripping ALIF to "isolate recurrence" (the LIF temporal-XOR setup) removes the
    field's actual memory mechanism — so the LIF-recurrence sustaining null is the expected outcome, not a
    surprise: bare recurrence at a sub-critical operating point is not what holds the trace.
 
-**Correction to §2 (criticality).** Firing-rate calibration is a proxy for branching-ratio ≈ 1 — but on a
-proxy *drive* it doesn't even hit its own rate target on the task, so it is a proxy twice removed. For
-sustaining, the operating point that matters is recurrent **gain**, measured on the *task* drive (or by a
-gap-survival probe directly), not a rate on random input. (An earlier branch that tried an external "gain
-calibration" was abandoned because its analytic `Σ|w|/θ` estimator was blind to actual propagation — it read
-"branching 16" for layers that never fire; see `experiments_results.md`.)
+**Note on §2 (criticality).** For sustaining, the operating point that matters is recurrent **gain**,
+measured on the *task* drive (or by a gap-survival probe directly), not a rate on random input — a firing
+rate is at best a proxy for branching-ratio ≈ 1, and on the wrong drive not even that. (An earlier
+external "gain" estimator was abandoned because its analytic `Σ|w|/θ` form was blind to actual propagation
+— it read "branching 16" for layers that never fire; see `experiments_results.md`.)
 
-**What the field does — adopted here.** (a) Keep **ALIF** as the delay-memory mechanism (don't strip it);
-(b) rate reg only as a **light, co-trained liveness/efficiency term** (modest coefficient), never a memory
-mechanism and never a hard uniform target; (c) drop the separate proxy-drive calibration, or at least match
-its drive density to the task; (d) let recurrence + e-prop **compute** on top of adaptation-held memory. The
-real "does recurrence earn its keep" test is **ALIF + recurrence vs ALIF-alone** at a delay where adaptation
-alone is marginal — not bare-LIF recurrence vs FF.
+**What the field does — followed here.** (a) Keep **ALIF** as the delay-memory mechanism (don't strip it);
+(b) `rate_reg` only as a **light, co-trained liveness/efficiency term** (modest coefficient), never a memory
+mechanism and never a hard uniform target; (c) let recurrence + e-prop **compute** on top of
+adaptation-held memory. The real "does recurrence earn its keep" test is **ALIF + recurrence vs ALIF-alone**
+at a delay where adaptation alone is marginal — not bare-LIF recurrence vs FF.
 
 ## The side-car recurrence result vs the literature (2026-07-10)
 
-`wave_net`'s recurrence result — trained recurrence robustly beats feed-forward **only** on a backward-fed
+`wave_bitnet`'s recurrence result — trained recurrence robustly beats feed-forward **only** on a backward-fed
 **side-car** topology that *isolates the recurrent layer from the forward path* (the forward signal skips past
 it; a separate recurrent scratchpad holds state and writes back) — is not idiosyncratic. The same design
 principle, and even the same two side-findings (isolation + sparse recurrence), recur across the RNN and
