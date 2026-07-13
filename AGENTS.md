@@ -30,13 +30,18 @@ distractor-XOR 700→995, parity N=4 587→837). The open questions are generali
 
 ## The two modules (read this before touching code)
 
-The crate is `wave_bitnet` + `bench` (`src/lib.rs` wires them up), plus a second, independent
-**inference-only** engine `wave_driven` (Phase 1) that trades size-bound sweeps for **activity-bound**
-ones — each wave processes only a per-layer frontier of non-quiescent neurons with lazy fire-anchored
-adaptation, so cost scales with activity rather than layer size. `wave_bitnet` remains the trainable
-engine; `wave_driven` is a free redefinition of its dynamics (not bit-exact — but it *is* bit-exact
-when `adapt_bump = 0`, which the equivalence tests assert) validated by a dense-vs-sparse oracle. Spec:
-`docs/superpowers/specs/2026-07-13-wave-driven-event-active-set-design.md`.
+The crate is `wave_bitnet` + `bench` (`src/lib.rs` wires them up), plus a second, independent engine
+`wave_driven` that trades size-bound sweeps for **activity-bound** ones — each wave processes only a
+per-layer frontier of non-quiescent neurons with lazy fire-anchored adaptation, so cost scales with
+activity rather than layer size. `wave_driven` is a free redefinition of `wave_bitnet`'s dynamics (not
+bit-exact — but it *is* bit-exact when `adapt_bump = 0`, which the equivalence tests assert), validated
+by a dense-vs-sparse oracle. **Phase 1 (inference) and Phase 2a (training) are landed:** it now trains
+too, via **online, activity-scaled** multi-layer-DFA — membrane e-prop eligibility with **spike-ψ**
+accrued on the frontier during `wave()` (`e_ij = Σ_{t: j fires} pretr_i`), validated by a **bit-exact
+online-vs-dense** eligibility oracle and end-to-end FF training (single-cue above chance; pure-ternary
+depth-8 → 1000/1000/1000). The ALIF `εᵃ` term + bump-ψ + recurrence-beats-FF is **Phase 2b** (not yet
+built). Specs: `docs/superpowers/specs/2026-07-13-wave-driven-event-active-set-design.md` (Phase 1),
+`docs/superpowers/specs/2026-07-13-wave-driven-phase2-training-design.md` (Phase 2a).
 
 - **`wave_bitnet/` — the engine.** A memory-lean integer spiking engine: topology is materialized once
   into a per-neuron neighborhood **occupancy bitset** (no per-wave hashing), and weights are stored as
@@ -307,16 +312,18 @@ src/
     network.rs           # Network — orchestration, routing, deferred swap, listeners, readout layer, eprop_update_synaptic, enable/disable_training, from_layers
     multilayer_dfa.rs    # temporal multi-layer-DFA training engine (temporal_eligibility + multilayer_dfa_step; targets decoded from occupancy)
     persist.rs           # save/load — self-contained model (.wbm) + runtime overlay (.wbr) + model_fingerprint
-  wave_driven/           # NEW engine (Phase 1): event-driven active-set INFERENCE, independent of wave_bitnet
+  wave_driven/           # NEW engine: event-driven active-set INFERENCE (Phase 1) + online training (Phase 2a), independent of wave_bitnet
     synapse.rs           # copied hash/topology helpers
     config.rs            # copied Config/LayerConfig (adapt_decay now sets ρ = 1 − 2^−decay; no dead-zone bound)
-    neurons.rs           # Layer SoA state + occupancy bitset + 2-bit codes + fire-anchored adapt (adapt_ref/fire_wave) + geometric decay table
-    frontier.rs          # Frontier: worklist Vec + dedup mark bitset (GPU unique-append primitive)
+    neurons.rs           # Layer SoA state + occupancy bitset + 2-bit codes + fire-anchored adapt + geometric decay table + optional TrainState (shadow/elig/pretr/spike_count) + repack
+    frontier.rs          # Frontier: worklist Vec + dedup mark bitset (GPU unique-append primitive; reused for pretr_active/dirty_rows)
     wave.rs              # process_layer(Work::Sparse|Dense) — frontier step + the dense equivalence oracle
-    network.rs           # Network: sparse/dense orchestration, injection-into-frontier, deferred one-hop swap
+    network.rs           # Network: sparse/dense orchestration, injection-into-frontier, deferred one-hop swap, online eligibility accrual + dfa_update
+    training.rs          # online activity-scaled multi-layer-DFA: EligParams/Edge, spike-ψ membrane eligibility + bit-exact dense_eligibility oracle
     equivalence_tests.rs # (test-only) sparse==dense oracle + adapt_bump==0 wave_bitnet cross-check
   bench/                 # experiment harness (public-API only, test-only) — the learning rules + tasks
     wave_bitnet_bench.rs # FF + side-car training harness (run_trial, build_signal, train_and_eval_best, tasks) + smoke benchmark
+    wave_driven_bench.rs # wave_driven FF training harness (online eligibility) — trains above chance; ignored depth-8 smoke + online-vs-offline throughput
 docs/
   experiments_results.md # SOURCE OF TRUTH for findings
   related-work.md        # literature framing (GeNN, e-prop, ALIF/LSNN, FPTT, …)
