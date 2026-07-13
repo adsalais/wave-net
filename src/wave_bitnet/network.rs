@@ -133,6 +133,26 @@ impl Network {
         f(&mut self.layers[z])
     }
 
+    /// Read-only access to the layer stack (used by persistence).
+    pub(crate) fn layers(&self) -> &[Layer] {
+        &self.layers
+    }
+
+    /// Assemble a `Network` from already-built layers (used by `load_model`). Fresh runtime:
+    /// `wave_id = 0`, zeroed delivery scratch, eligibility recording on, no listeners.
+    pub(crate) fn from_layers(size: u32, layers: Vec<Layer>) -> Network {
+        let l = layers.len();
+        let ls = (size as usize) * (size as usize);
+        Network {
+            size,
+            layers,
+            wave_id: 0,
+            scratch: Scratch { fired: Vec::new(), deliv: (0..l).map(|_| vec![0i32; ls]).collect() },
+            record_eligibility: true,
+            listeners: (0..l).map(|_| None).collect(),
+        }
+    }
+
     /// Read-only access to one layer (introspection).
     pub fn with_layer<R>(&self, z: usize, f: impl FnOnce(&Layer) -> R) -> R {
         f(&self.layers[z])
