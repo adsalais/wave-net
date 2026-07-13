@@ -189,7 +189,7 @@ mod tests {
         let (mut zeros, mut total) = (0usize, 0usize);
         for z in 1..l {
             net.with_layer(z, |lz| {
-                let n = lz.shadow.len(); // ls * total_slots
+                let n = lz.synapse_count(); // ls * total_slots
                 total += n;
                 zeros += (0..n).filter(|&s| lz.weight_at(s) == 0).count();
             });

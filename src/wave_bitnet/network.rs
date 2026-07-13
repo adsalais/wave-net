@@ -108,8 +108,11 @@ impl Network {
             g.potential.iter_mut().for_each(|p| *p = 0);
             g.cooldown.iter_mut().for_each(|c| *c = 0);
             g.adapt.iter_mut().for_each(|a| *a = 0);
-            g.decide_potential.iter_mut().for_each(|p| *p = 0);
             g.pending.iter_mut().for_each(|p| *p = 0);
+            if let Some(t) = g.train.as_mut() {
+                t.decide_potential.iter_mut().for_each(|p| *p = 0);
+                t.decide_eff.iter_mut().for_each(|e| *e = 0);
+            }
         }
         for d in self.scratch.deliv.iter_mut() {
             d.iter_mut().for_each(|x| *x = 0);
@@ -172,13 +175,13 @@ impl Network {
 
     /// Per-neuron membrane potential captured at the last decide step (pre fire-reset/leak).
     pub fn layer_decide_potential(&self, z: usize) -> Vec<i16> {
-        self.layers[z].decide_potential.clone()
+        self.layers[z].train.as_ref().expect("layer_decide_potential requires training enabled").decide_potential.clone()
     }
 
     /// Per-neuron effective firing threshold captured at the last decide step (the value compared
     /// against `layer_decide_potential`).
     pub fn layer_decide_effective_threshold(&self, z: usize) -> Vec<i32> {
-        self.layers[z].decide_eff.clone()
+        self.layers[z].train.as_ref().expect("layer_decide_effective_threshold requires training enabled").decide_eff.clone()
     }
 
     /// Apply one e-prop update to layer `source_z`'s `level_idx` topology entry from a per-synapse
@@ -205,11 +208,14 @@ impl Network {
                 wired.clear();
                 lz.for_wired(level_idx, i, |r, c| wired.push((r, lz.decode(level_idx, i as u32, c, size) as usize)));
                 let mut touched = false;
-                for &(r, target) in &wired {
-                    let e = elig[i * count + r];
-                    if e != 0.0 {
-                        touched = true;
-                        lz.shadow[i * ts + sbase + r] += -lr * signal[target] * e;
+                {
+                    let shadow = &mut lz.train.as_mut().expect("eprop requires training enabled").shadow;
+                    for &(r, target) in &wired {
+                        let e = elig[i * count + r];
+                        if e != 0.0 {
+                            touched = true;
+                            shadow[i * ts + sbase + r] += -lr * signal[target] * e;
+                        }
                     }
                 }
                 if touched {
@@ -252,7 +258,7 @@ mod tests {
         a.with_layer(1, |la| {
             b.with_layer(1, |lb| {
                 assert_eq!(la.potential, lb.potential);
-                assert_eq!(la.shadow, lb.shadow);
+                assert_eq!(la.train.as_ref().unwrap().shadow, lb.train.as_ref().unwrap().shadow);
             })
         });
     }
@@ -265,7 +271,7 @@ mod tests {
         net.with_layer_mut(0, |l| {
             let ts = l.total_slots;
             for s in 0..ts {
-                l.shadow[0 * ts + s] = 0.0;
+                l.train.as_mut().unwrap().shadow[0 * ts + s] = 0.0;
             }
             l.repack_row(0);
             assert_eq!(l.weight_at(0), 0, "row starts fully pruned");
@@ -276,7 +282,8 @@ mod tests {
         let signal = vec![-1.0f32; ls];
         net.eprop_update_synaptic(0, 0, &elig, &signal, 0.02);
         net.with_layer(0, |l| {
-            assert!(l.shadow[0] > 0.0, "shadow raised by -lr·(-1)·1 > 0: {}", l.shadow[0]);
+            let sh = &l.train.as_ref().unwrap().shadow;
+            assert!(sh[0] > 0.0, "shadow raised by -lr·(-1)·1 > 0: {}", sh[0]);
         });
     }
 }

@@ -58,16 +58,19 @@ pub fn process_layer(
     let adapt_bump = layer.adapt_bump as i32;
     let threshold = &layer.threshold[..ls];
     let adapt = &mut layer.adapt[..ls];
-    let decide_potential = &mut layer.decide_potential[..ls];
-    let decide_eff = &mut layer.decide_eff[..ls];
-    // (A0) decide-time snapshot — hoisted out of the fire loop so the inference path skips it entirely.
-    // Reads potential/adapt BEFORE the fire loop mutates them, capturing the pre-fire-reset state.
+    // (A0) decide-time snapshot — records decide-time potential/eff into the training scratch, and only
+    // when training is enabled (train == Some). Reads potential/adapt BEFORE the fire loop mutates them,
+    // capturing the pre-fire-reset state. `train` is a disjoint field, so it coexists with the borrows above.
     if record_elig {
-        for i in 0..ls {
-            let p = potential[i];
-            let eff = threshold[i] as i32 + (adapt[i] >> ADAPT_SHIFT);
-            decide_potential[i] = p; // snapshot pre fire-reset/leak
-            decide_eff[i] = eff; // pre-bump effective threshold
+        if let Some(t) = layer.train.as_mut() {
+            let decide_potential = &mut t.decide_potential[..ls];
+            let decide_eff = &mut t.decide_eff[..ls];
+            for i in 0..ls {
+                let p = potential[i];
+                let eff = threshold[i] as i32 + (adapt[i] >> ADAPT_SHIFT);
+                decide_potential[i] = p; // snapshot pre fire-reset/leak
+                decide_eff[i] = eff; // pre-bump effective threshold
+            }
         }
     }
 

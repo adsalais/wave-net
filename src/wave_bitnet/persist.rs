@@ -365,8 +365,9 @@ mod tests {
                     assert_eq!(la.offsets, lb.offsets);
                     assert_eq!(la.off_flat, lb.off_flat);
                     // loaded shadow is the decode of codes
-                    for s in 0..lb.shadow.len() {
-                        assert_eq!(lb.shadow[s], lb.weight_at(s) as f32);
+                    let lb_shadow = &lb.train.as_ref().unwrap().shadow;
+                    for s in 0..lb_shadow.len() {
+                        assert_eq!(lb_shadow[s], lb.weight_at(s) as f32);
                     }
                 })
             });
