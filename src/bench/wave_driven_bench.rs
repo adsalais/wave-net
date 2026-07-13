@@ -193,4 +193,75 @@ mod tests {
         let (best, _at) = train_and_eval_best(&mut net, &entries, seed, seed, &cfg, single_task, 100, 3, 1000);
         assert!(best > 600, "wave_driven FF should train above chance: {best}");
     }
+
+    #[test]
+    #[ignore] // smoke: run manually in --release
+    fn wave_driven_ff_depth8_smoke() {
+        let seeds = [0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF];
+        eprintln!("== wave_driven FF depth-8 pure ternary smoke (r4/c48, adapt=5, online elig) ==");
+        let mut bests = Vec::new();
+        for &s in &seeds {
+            let (mut net, entries) = make_ff(s, 32, 8, 48, 4, 5, 6);
+            let mut cfg = ff_cfg();
+            cfg.size = 32;
+            cfg.present = 8;
+            cfg.read = 8;
+            cfg.holdout = 300;
+            let (best, at) = train_and_eval_best(&mut net, &entries, s, s, &cfg, single_task, 300, 3, 3000);
+            eprintln!("seed {s:#x}: best {best}@{at}");
+            bests.push(best);
+        }
+        let worst = *bests.iter().min().unwrap();
+        eprintln!("worst {worst} (target ~1000)");
+        assert!(worst >= 900, "pure ternary FF depth-8 should hold ~1000 (worst {worst})");
+    }
+
+    #[test]
+    #[ignore] // experiment: online vs offline-eligibility trainer throughput (run in --release)
+    fn wave_driven_training_throughput() {
+        use crate::wave_driven::training::dense_eligibility;
+        use std::time::Instant;
+        for &size in &[16u32, 32u32] {
+            let seed = 0xC0FFEEu64;
+            let (mut net, entries) = make_ff(seed, size, 4, 32, 3, 5, 6);
+            let mut cfg = ff_cfg();
+            cfg.size = size;
+            let trials = 200usize;
+
+            // online: run trials, accrual happens inside wave(); dfa_update reads engine elig
+            let w = vec![vec![0f32; (size * size) as usize]; 2];
+            let t0 = Instant::now();
+            for t in 0..trials {
+                let (classes, _label) = single_task(seed, t);
+                let (_act, ttot) = run_trial(&mut net, size, &classes, seed, cfg.present, cfg.delay, cfg.read);
+                let err = [0.1f32, -0.1f32];
+                let signal = build_signal(&net, &w, &err, seed, ttot, &cfg);
+                net.dfa_update(&entries, &signal, cfg.hidden_lr);
+            }
+            let online = t0.elapsed().as_secs_f64();
+
+            // offline: record fired every wave, compute dense_eligibility per trial (the size-bound path)
+            let (mut net2, entries2) = make_ff(seed, size, 4, 32, 3, 5, 6);
+            let t1 = Instant::now();
+            for t in 0..trials {
+                let (classes, _label) = single_task(seed, t);
+                let l = net2.layer_count();
+                let rec: Arc<Mutex<Vec<Vec<Vec<u32>>>>> = Arc::new(Mutex::new(vec![Vec::new(); l]));
+                for z in 0..l {
+                    let r = rec.clone();
+                    net2.on_layer(z, Box::new(move |_w, f: &[u32]| r.lock().unwrap()[z].push(f.to_vec())));
+                }
+                net2.reset_state();
+                for _ in 0..(cfg.present + cfg.read) {
+                    let sites = cue_sites(seed, size, classes[0]);
+                    net2.wave(&sites);
+                }
+                net2.clear_listeners();
+                let fired = rec.lock().unwrap().clone();
+                let _e = dense_eligibility(&net2, &entries2, &fired, &EligParams { rec_tau: 6.0, epsilon: 1.0 / 1024.0 });
+            }
+            let offline = t1.elapsed().as_secs_f64();
+            eprintln!("size {size}: online {:.1} trials/s, offline-eligibility {:.1} trials/s ({:.1}x)", trials as f64 / online, trials as f64 / offline, offline / online);
+        }
+    }
 }
