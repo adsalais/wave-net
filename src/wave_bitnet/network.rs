@@ -138,6 +138,21 @@ impl Network {
         &self.layers
     }
 
+    /// Mutable access to the layer stack (used by the runtime overlay).
+    pub(crate) fn layers_mut(&mut self) -> &mut [Layer] {
+        &mut self.layers
+    }
+
+    /// The wave counter (persisted/restored by the runtime overlay).
+    pub(crate) fn wave_id(&self) -> usize {
+        self.wave_id
+    }
+
+    /// Restore the wave counter (used by `apply_runtime`).
+    pub(crate) fn set_wave_id(&mut self, w: usize) {
+        self.wave_id = w;
+    }
+
     /// Assemble a `Network` from already-built layers (used by `load_model`). Fresh runtime:
     /// `wave_id = 0`, zeroed delivery scratch, eligibility recording on, no listeners.
     pub(crate) fn from_layers(size: u32, layers: Vec<Layer>) -> Network {
