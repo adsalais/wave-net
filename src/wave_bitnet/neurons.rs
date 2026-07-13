@@ -70,9 +70,7 @@ pub struct Layer {
     pub adapt: Vec<i32>,
     pub threshold: Vec<i16>,
     pub pending: Vec<i32>, // per-target incoming accumulator (scatter-add target); folded in step 1
-    // eligibility / decide-step state
-    pub elig_pre: Vec<i32>,
-    pub elig_post: Vec<i32>,
+    // decide-step snapshots (credit-assignment records the trainer reads)
     pub decide_potential: Vec<i16>,
     pub decide_eff: Vec<i32>,
     // config
@@ -217,8 +215,6 @@ impl Layer {
             adapt: vec![0i32; ls],
             threshold,
             pending: vec![0i32; ls],
-            elig_pre: vec![0i32; ls],
-            elig_post: vec![0i32; ls],
             decide_potential: vec![0i16; ls],
             decide_eff: vec![0i32; ls],
             leak,
@@ -289,8 +285,6 @@ impl Layer {
             adapt: vec![0i32; ls],
             threshold,
             pending: vec![0i32; ls],
-            elig_pre: vec![0i32; ls],
-            elig_post: vec![0i32; ls],
             decide_potential: vec![0i16; ls],
             decide_eff: vec![0i32; ls],
             leak: cfg.leak,

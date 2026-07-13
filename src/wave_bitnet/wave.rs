@@ -49,10 +49,9 @@ pub fn process_layer(
     }
 
     // 3. per-neuron step, split into passes so the hot arithmetic
-    // vectorizes and the inference path carries no eligibility branch: (A0) eligibility snapshot
-    // [record only], (A) decide/fire/adapt-bump [scalar — diverges + compacts `fired`], (A2)
-    // eligibility pre-trace bump [record only], (B) elementwise leak + adapt-decay [auto-vectorized].
-    const PSI_BAND: i32 = 8;
+    // vectorizes and the inference path carries no eligibility branch: (A0) decide-time snapshot
+    // [record only], (A) decide/fire/adapt-bump [scalar — diverges + compacts `fired`], (B) elementwise
+    // leak + adapt-decay [auto-vectorized].
     let (la, lb) = layer.leak;
     let adapt_decay = layer.adapt_decay;
     let cooldown_base = layer.cooldown_base;
@@ -61,9 +60,7 @@ pub fn process_layer(
     let adapt = &mut layer.adapt[..ls];
     let decide_potential = &mut layer.decide_potential[..ls];
     let decide_eff = &mut layer.decide_eff[..ls];
-    let elig_pre = &mut layer.elig_pre[..ls];
-    let elig_post = &mut layer.elig_post[..ls];
-    // (A0) eligibility snapshot — hoisted out of the fire loop so the inference path skips it entirely.
+    // (A0) decide-time snapshot — hoisted out of the fire loop so the inference path skips it entirely.
     // Reads potential/adapt BEFORE the fire loop mutates them, capturing the pre-fire-reset state.
     if record_elig {
         for i in 0..ls {
@@ -71,9 +68,6 @@ pub fn process_layer(
             let eff = threshold[i] as i32 + (adapt[i] >> ADAPT_SHIFT);
             decide_potential[i] = p; // snapshot pre fire-reset/leak
             decide_eff[i] = eff; // pre-bump effective threshold
-            if (p as i32 - eff).abs() <= PSI_BAND {
-                elig_post[i] += 1;
-            }
         }
     }
 
@@ -92,13 +86,6 @@ pub fn process_layer(
             fired.push(i as u32);
         } else {
             cooldown[i] = c;
-        }
-    }
-
-    // (A2) eligibility pre-trace bump for the neurons that just fired — record path only.
-    if record_elig {
-        for &i in fired.iter() {
-            elig_pre[i as usize] += 1;
         }
     }
 
