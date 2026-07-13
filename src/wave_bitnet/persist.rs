@@ -364,11 +364,8 @@ mod tests {
                     assert_eq!(la.occ_wpn, lb.occ_wpn);
                     assert_eq!(la.offsets, lb.offsets);
                     assert_eq!(la.off_flat, lb.off_flat);
-                    // loaded shadow is the decode of codes
-                    let lb_shadow = &lb.train.as_ref().unwrap().shadow;
-                    for s in 0..lb_shadow.len() {
-                        assert_eq!(lb_shadow[s], lb.weight_at(s) as f32);
-                    }
+                    // loaded nets are inference-lean (no shadow); code equality above proves weight identity.
+                    assert!(lb.train.is_none(), "loaded model is inference-lean");
                 })
             });
         }
@@ -394,8 +391,9 @@ mod tests {
         for inp in inputs {
             a.wave(inp);
             b.wave(inp);
+            // loaded nets are inference-lean, so compare the forward state inference actually produces.
             for z in 0..a.layer_count() {
-                assert_eq!(a.layer_decide_potential(z), b.layer_decide_potential(z), "layer {z} decide_potential");
+                a.with_layer(z, |la| b.with_layer(z, |lb| assert_eq!(la.potential, lb.potential, "layer {z} potential")));
             }
         }
     }
@@ -473,13 +471,13 @@ mod tests {
             });
         }
 
-        // continuing both must stay identical (true resume)
+        // continuing both must stay identical (true resume) — loaded nets are lean, so compare potential.
         let more: [&[u32]; 3] = [&[1, 4], &[], &[7]];
         for inp in more {
             a.wave(inp);
             b.wave(inp);
             for z in 0..a.layer_count() {
-                assert_eq!(a.layer_decide_potential(z), b.layer_decide_potential(z), "resumed layer {z}");
+                a.with_layer(z, |la| b.with_layer(z, |lb| assert_eq!(la.potential, lb.potential, "resumed layer {z}")));
             }
         }
     }

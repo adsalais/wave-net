@@ -193,6 +193,7 @@ mod tests {
     #[test]
     fn step_raises_weights_on_negative_signal() {
         let (mut net, entries) = net2(8);
+        net.enable_training();
         let ls = 64;
         let rec = dense_records(ls, 2, 6);
         let signal = vec![vec![0f32; ls], vec![-1.0f32; ls]]; // negative on layer 1 (the target)

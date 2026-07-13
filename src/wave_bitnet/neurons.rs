@@ -120,6 +120,28 @@ impl Layer {
         self.total_slots * self.threshold.len()
     }
 
+    /// Allocate this layer's training state (idempotent — keeps any existing accumulated shadow).
+    /// A fresh state reconstructs `shadow` as the per-slot decode of `codes` and zeroes the decide
+    /// snapshots — identical to the shadow a `.wbm` load would rebuild (codes are the master).
+    pub fn enable_training(&mut self) {
+        if self.train.is_some() {
+            return;
+        }
+        let n = self.synapse_count();
+        let mut shadow = vec![0f32; n];
+        for s in 0..n {
+            shadow[s] = self.weight_at(s) as f32;
+        }
+        let ls = self.threshold.len();
+        self.train = Some(TrainState { shadow, decide_potential: vec![0i16; ls], decide_eff: vec![0i32; ls] });
+    }
+
+    /// Free this layer's training state. LOSSY for in-flight sub-threshold shadow: re-enabling
+    /// rebuilds `shadow = decode(codes)`, exactly like a `.wbm` save/load round-trip.
+    pub fn disable_training(&mut self) {
+        self.train = None;
+    }
+
     /// Iterate the wired cells of neuron `i` at level `lvl`, in ascending cell order, calling
     /// `f(rank, cell)`. Word-scan: only set bits are visited (`trailing_zeros` + clear-lowest-set).
     #[inline]
@@ -220,12 +242,6 @@ impl Layer {
         if codes.len() != want_codes {
             return Err(format!("codes length {} != {want_codes}", codes.len()));
         }
-        // shadow = per-slot decode of codes (inference-authoritative; not the training master)
-        let n = ls * total_slots;
-        let mut shadow = vec![0f32; n];
-        for s in 0..n {
-            shadow[s] = WCODE[((codes[s >> 5] >> ((s & 31) * 2)) & 0b11) as usize] as f32;
-        }
         Ok(Layer {
             potential: vec![0i16; ls],
             cooldown: vec![0u8; ls],
@@ -247,11 +263,7 @@ impl Layer {
             offsets,
             off_flat,
             codes,
-            train: Some(TrainState {
-                shadow,
-                decide_potential: vec![0i16; ls],
-                decide_eff: vec![0i32; ls],
-            }),
+            train: None, // loaded model is inference-lean; call `enable_training` to resume training
         })
     }
 
@@ -328,6 +340,9 @@ impl Layer {
         for i in 0..ls {
             layer.repack_row(i);
         }
+        // Codes are now seeded from the procedural ±1 sign; drop the transient training state so a
+        // fresh net is inference-lean (call `enable_training` / `Network::enable_training` to train).
+        layer.train = None;
         layer
     }
 }
@@ -388,13 +403,14 @@ mod tests {
             TopologyLevel { level: 0, radius: 1, count: 3 },
         ]);
         let mut built = Layer::new(&cfg, 7, 1, size);
+        built.enable_training();
         // make neuron 0's row non-trivial (+1 / -1 / 0 mix) then repack so codes differ from init
         let ts = built.total_slots;
         for s in 0..ts {
             built.train.as_mut().unwrap().shadow[s] = match s % 3 { 0 => 0.0, 1 => 2.0, _ => -2.0 };
         }
         built.repack_row(0);
-        let rebuilt = Layer::from_parts(
+        let mut rebuilt = Layer::from_parts(
             built.topology.clone(),
             built.leak,
             built.cooldown_base,
@@ -408,6 +424,8 @@ mod tests {
             size,
         )
         .unwrap();
+        assert!(rebuilt.train.is_none(), "from_parts is inference-lean");
+        rebuilt.enable_training(); // reconstruct shadow = decode(codes) to check the load identity
         assert_eq!(rebuilt.topology, built.topology);
         assert_eq!(rebuilt.threshold, built.threshold);
         assert_eq!(rebuilt.occ, built.occ);
@@ -450,6 +468,7 @@ mod tests {
         let size = 8u32;
         let cfg = lc(vec![TopologyLevel { level: 1, radius: 2, count: 4 }]);
         let mut l = Layer::new(&cfg, 7, 0, size);
+        l.enable_training();
         let ts = l.total_slots;
         {
             let sh = &mut l.train.as_mut().unwrap().shadow;

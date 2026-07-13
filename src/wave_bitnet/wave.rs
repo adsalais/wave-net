@@ -12,7 +12,6 @@ pub fn process_layer(
     input: &[u32],
     deliv: &mut [Vec<i32>],
     fired: &mut Vec<u32>,
-    record_elig: bool,
 ) {
     let ls = (size as usize) * (size as usize);
 
@@ -58,19 +57,18 @@ pub fn process_layer(
     let adapt_bump = layer.adapt_bump as i32;
     let threshold = &layer.threshold[..ls];
     let adapt = &mut layer.adapt[..ls];
-    // (A0) decide-time snapshot — records decide-time potential/eff into the training scratch, and only
-    // when training is enabled (train == Some). Reads potential/adapt BEFORE the fire loop mutates them,
-    // capturing the pre-fire-reset state. `train` is a disjoint field, so it coexists with the borrows above.
-    if record_elig {
-        if let Some(t) = layer.train.as_mut() {
-            let decide_potential = &mut t.decide_potential[..ls];
-            let decide_eff = &mut t.decide_eff[..ls];
-            for i in 0..ls {
-                let p = potential[i];
-                let eff = threshold[i] as i32 + (adapt[i] >> ADAPT_SHIFT);
-                decide_potential[i] = p; // snapshot pre fire-reset/leak
-                decide_eff[i] = eff; // pre-bump effective threshold
-            }
+    // (A0) decide-time snapshot — records decide-time potential/eff into the training scratch, and ONLY
+    // when training is enabled (train == Some); an inference-lean layer skips it entirely. Reads
+    // potential/adapt BEFORE the fire loop mutates them, capturing the pre-fire-reset state. `train` is a
+    // disjoint field, so it coexists with the borrows above.
+    if let Some(t) = layer.train.as_mut() {
+        let decide_potential = &mut t.decide_potential[..ls];
+        let decide_eff = &mut t.decide_eff[..ls];
+        for i in 0..ls {
+            let p = potential[i];
+            let eff = threshold[i] as i32 + (adapt[i] >> ADAPT_SHIFT);
+            decide_potential[i] = p; // snapshot pre fire-reset/leak
+            decide_eff[i] = eff; // pre-bump effective threshold
         }
     }
 
@@ -192,7 +190,7 @@ mod tests {
         });
         let mut deliv: Vec<Vec<i32>> = vec![vec![0i32; ls]; 2];
         let mut fired = Vec::new();
-        process_layer(&mut l, 0, size, &[], &mut deliv, &mut fired, true);
+        process_layer(&mut l, 0, size, &[], &mut deliv, &mut fired);
         assert_eq!(fired, vec![0], "only neuron 0 fires");
         assert_eq!(deliv[1], expect, "scatter-adds decoded nonzero weights into layer 1's accumulator");
     }

@@ -208,7 +208,8 @@ mod tests {
             adapt_bump,
             adapt_decay,
         };
-        let net = Network::new(Config { seed, size, layers: vec![lc; layers] });
+        let mut net = Network::new(Config { seed, size, layers: vec![lc; layers] });
+        net.enable_training();
         let entries = (0..layers)
             .map(|z| if z == layers - 1 { vec![] } else { vec![Edge { level: 1, count: up_count as usize, radius: up_radius }] })
             .collect();
@@ -247,7 +248,7 @@ mod tests {
         for &bi in &[0i16, 1, 2, 3, 4, 6] {
             let lc = LayerConfig { topology: vec![TopologyLevel { level: 1, radius: 3, count: 32 }], leak: (3, 5), cooldown_base: 2, inhibitor_ratio: 0, threshold_jitter: 32, baseline_init: bi, adapt_bump: 5, adapt_decay: 6 };
             let mut net = Network::new(Config { seed, size, layers: vec![lc; 5] });
-            net.set_record_eligibility(false);
+            // forward-rate diagnostic only — a fresh net is inference-lean, so no eligibility is recorded.
             let input = random_l0_input(seed, size, 20000);
             let l = net.layer_count();
             let counts = Arc::new(Mutex::new(vec![0u64; l]));
