@@ -5,6 +5,7 @@
 use crate::wave_driven::config::Config;
 use crate::wave_driven::frontier::Frontier;
 use crate::wave_driven::neurons::Layer;
+use crate::wave_driven::training::EligParams;
 use crate::wave_driven::wave::{process_layer, Work};
 
 #[derive(Clone, Copy, PartialEq)]
@@ -22,6 +23,11 @@ pub struct Network {
     deliv: Vec<Vec<i32>>,         // per layer: NEXT wave's incoming accumulator
     frontier: Vec<Frontier>,      // per layer: current worklist (sparse only)
     frontier_next: Vec<Frontier>, // per layer: worklist being built (sparse only)
+    fired_by_layer: Vec<Vec<u32>>, // this wave's fired ids per layer (captured during wave, training only)
+    fired_bitset: Vec<Vec<u64>>,  // per layer: "did neuron fire this wave" (ceil(ls/64) words)
+    pretr_active: Vec<Frontier>,  // per layer: sources with a live presynaptic trace
+    dirty_rows: Vec<Frontier>,    // per layer: source neurons whose elig row got accrual
+    elig_params: EligParams,
     #[allow(clippy::type_complexity)]
     listeners: Vec<Option<Box<dyn Fn(usize, &[u32]) + Send + Sync>>>,
 }
@@ -65,6 +71,11 @@ impl Network {
             deliv: (0..l).map(|_| vec![0i32; ls]).collect(),
             frontier: (0..l).map(|_| Frontier::new(ls)).collect(),
             frontier_next: (0..l).map(|_| Frontier::new(ls)).collect(),
+            fired_by_layer: (0..l).map(|_| Vec::new()).collect(),
+            fired_bitset: (0..l).map(|_| vec![0u64; (ls + 63) / 64]).collect(),
+            pretr_active: (0..l).map(|_| Frontier::new(ls)).collect(),
+            dirty_rows: (0..l).map(|_| Frontier::new(ls)).collect(),
+            elig_params: EligParams::default(),
             listeners: (0..l).map(|_| None).collect(),
         }
     }
@@ -133,6 +144,60 @@ impl Network {
             f.clear();
         }
         self.wave_id = 0;
+        self.reset_eligibility();
+    }
+
+    pub fn enable_training(&mut self) {
+        for l in self.layers.iter_mut() {
+            l.enable_training();
+        }
+    }
+
+    pub fn disable_training(&mut self) {
+        for l in self.layers.iter_mut() {
+            l.disable_training();
+        }
+    }
+
+    pub fn is_training(&self) -> bool {
+        self.layers.first().map(|l| l.train.is_some()).unwrap_or(false)
+    }
+
+    pub fn set_elig_params(&mut self, p: EligParams) {
+        self.elig_params = p;
+    }
+
+    /// Per-neuron spike count accumulated since the last reset (for rate_reg). Requires training.
+    pub fn layer_spike_count(&self, z: usize) -> &[u32] {
+        &self.layers[z].train.as_ref().expect("layer_spike_count requires training enabled").spike_count
+    }
+
+    /// Clear all per-trial training accumulators (elig over dirty rows, pretr over the active set,
+    /// spike_count densely) and the per-wave work-sets. Called by `reset_state`.
+    pub fn reset_eligibility(&mut self) {
+        let l = self.layers.len();
+        let Self { layers, pretr_active, dirty_rows, fired_by_layer, fired_bitset, .. } = self;
+        for z in 0..l {
+            let ts = layers[z].total_slots;
+            if let Some(t) = layers[z].train.as_mut() {
+                for &i in &dirty_rows[z].list {
+                    let base = i as usize * ts;
+                    for s in 0..ts {
+                        t.elig[base + s] = 0.0;
+                    }
+                }
+                for &i in &pretr_active[z].list {
+                    t.pretr[i as usize] = 0.0;
+                }
+                t.spike_count.iter_mut().for_each(|c| *c = 0);
+            }
+            dirty_rows[z].clear();
+            pretr_active[z].clear();
+            for &j in &fired_by_layer[z] {
+                fired_bitset[z][(j >> 6) as usize] &= !(1u64 << (j & 63));
+            }
+            fired_by_layer[z].clear();
+        }
     }
 
     pub fn size(&self) -> u32 {
@@ -151,6 +216,17 @@ impl Network {
         for l in self.listeners.iter_mut() {
             *l = None;
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_layer_mut_test<R>(&mut self, z: usize, f: impl FnOnce(&mut Layer) -> R) -> R {
+        f(&mut self.layers[z])
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_worksets_test(&mut self, z: usize, i: u32) {
+        self.dirty_rows[z].push(i);
+        self.pretr_active[z].push(i);
     }
 }
 
@@ -208,5 +284,36 @@ mod tests {
         assert_eq!(*fired_top.lock().unwrap(), 0, "readout never fires");
         let any_pot = net.with_layer(1, |l| l.potential.iter().any(|&p| p != 0));
         assert!(any_pot, "readout integrated some potential");
+    }
+
+    #[test]
+    fn training_toggles_and_reports() {
+        let mut net = Network::new(two_layer(8));
+        assert!(!net.is_training());
+        net.enable_training();
+        assert!(net.is_training());
+        net.with_layer(0, |l| assert_eq!(l.train.as_ref().unwrap().shadow.len(), l.synapse_count()));
+        net.disable_training();
+        assert!(!net.is_training());
+    }
+
+    #[test]
+    fn reset_eligibility_clears_accumulators() {
+        let mut net = Network::new(two_layer(8));
+        net.enable_training();
+        net.with_layer_mut_test(0, |l| {
+            let t = l.train.as_mut().unwrap();
+            t.elig[0] = 5.0;
+            t.pretr[0] = 2.0;
+            t.spike_count[0] = 7;
+        });
+        net.seed_worksets_test(0, 0); // register neuron 0 as dirty + pretr-active
+        net.reset_eligibility();
+        net.with_layer(0, |l| {
+            let t = l.train.as_ref().unwrap();
+            assert_eq!(t.elig[0], 0.0);
+            assert_eq!(t.pretr[0], 0.0);
+            assert!(t.spike_count.iter().all(|&c| c == 0));
+        });
     }
 }
