@@ -1,6 +1,7 @@
 //! `persist` — hand-rolled, std-only binary save/load for a `wave_bitnet` `Network`. Two independent
 //! formats: a self-contained **model** (`b"WBNM"`: structure + 2-bit codes, inference-ready) and a
-//! **runtime overlay** (`b"WBNR"`: the mutable per-neuron state only) applied onto a loaded model.
+//! **runtime overlay** (`b"WBNR"`: the resumable forward state only — `potential`/`cooldown`/`adapt`/
+//! `pending` + `wave_id`) applied onto a loaded model. Training state (`Layer.train`) is never persisted.
 //! See docs/superpowers/specs/2026-07-13-wave-bitnet-persist-design.md.
 
 use crate::wave_bitnet::network::Network;

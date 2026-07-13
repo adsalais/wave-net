@@ -34,8 +34,10 @@ The crate is `wave_bitnet` + `bench` (`src/lib.rs` wires them up):
 
 - **`wave_bitnet/` — the engine.** A memory-lean integer spiking engine: topology is materialized once
   into a per-neuron neighborhood **occupancy bitset** (no per-wave hashing), and weights are stored as
-  **2-bit packed ±1/0 codes** with an `f32` training shadow. It carries the on-engine hooks a learning
-  rule needs. **This is where engine work happens.**
+  **2-bit packed ±1/0 codes**. The `f32` training shadow (and the decide-time snapshots) live in an
+  **optional per-`Layer` `TrainState`** allocated only while training is enabled
+  (`Network::enable_training()` / `disable_training()`), so inference pays nothing for them. It carries
+  the on-engine hooks a learning rule needs. **This is where engine work happens.**
 - **`bench/` — the experiment harness.** Integer tasks, readouts, decoders, and **the learning rules
   themselves** (multi-layer-DFA credit). Test-only; uses only the engine's public API. The engine
   exposes the *state* a learning rule needs; `bench` implements the rules on top.
@@ -47,9 +49,10 @@ At construction, each neuron draws `count` distinct neighborhood cells (a pure f
 `(seed, source, config)`) and sets them in a per-neuron **occupancy bitset** (one bit per `(2r+1)²`
 cell). At fire time the forward pass scans the set bits (`trailing_zeros`) and decodes each cell to its
 target local index with arithmetic (an offset LUT + toroidal wrap) — **no hashing after startup**. What
-is stored per synapse is the **weight**: a 2-bit code (`0b00`→0, `0b01`→+1, `0b11`→−1) plus an `f32`
-shadow for training. Weights **init** to the procedural `±1` sign (so a fresh net is a random ±1
-projection), and training moves the shadow and requantizes it to the codes. Determinism flows from
+is stored per synapse is the **weight**: a 2-bit code (`0b00`→0, `0b01`→+1, `0b11`→−1); the `f32`
+shadow it trains through lives in `Layer.train` and exists only while training is enabled. Weights
+**init** to the procedural `±1` sign (so a fresh net is a random ±1 projection), and training moves the
+shadow and requantizes it to the codes. Determinism flows from
 `(seed, config, input)`. The engine's dominant cost is the fire-time bitset scan + decode + delivery.
 
 ## The engine model (how a wave works)
@@ -198,11 +201,15 @@ activity back over subsequent waves). Therefore, for any readout or training:
 
 Two independent, std-only binary formats (`wave_bitnet::persist`): a self-contained **model** (`.wbm`:
 materialized structure + 2-bit codes, inference-ready — no seed dependence, no shadow) and a **runtime
-overlay** (`.wbr`: only the mutable per-neuron state + `wave_id`, applied onto a loaded model). API on
-`Network`: `save_model`/`load_model`, `save_runtime`/`apply_runtime` (+ `*_path` conveniences),
-`model_fingerprint` (binds an overlay to its model). Loading a `.wbm` reconstructs each `Layer` via
-`Layer::from_parts` (shadow = decode of codes; runtime zeroed). This is the primitive behind
-best-checkpointing (see the over-training caveat).
+overlay** (`.wbr`: only the resumable forward state — `potential`/`cooldown`/`adapt`/`pending` +
+`wave_id`, applied onto a loaded model). API on `Network`: `save_model`/`load_model`,
+`save_runtime`/`apply_runtime` (+ `*_path` conveniences), `model_fingerprint` (binds an overlay to its
+model). Loading a `.wbm` reconstructs each `Layer` via `Layer::from_parts` **inference-lean**
+(`train: None`). **Training is toggled:** `Network::enable_training()` allocates the per-`Layer`
+`TrainState` (rebuilding each `shadow` as decode(codes)); `disable_training()` frees it to serve lean.
+Disabling is **lossy for in-flight sub-threshold shadow** — re-enabling snaps it back to the quantized
+codes, exactly like a `.wbm` round-trip (codes are the cross-checkpoint master). This is the primitive
+behind best-checkpointing (see the over-training caveat).
 
 ## Commands
 
@@ -286,12 +293,12 @@ destructive action or a real change of scope.
 ```
 src/
   lib.rs                 # wires up the two modules
-  wave_bitnet/           # the engine — materialized bitset topology + 2-bit ternary weights + f32 shadow
+  wave_bitnet/           # the engine — materialized bitset topology + 2-bit ternary weights + optional f32 training shadow
     synapse.rs           # hash helpers, square-grid index, TopologyLevel, sample_distinct_cells, cell decode, random_l0_input
     config.rs            # Config, LayerConfig (leak, cooldown, inhibitor_ratio, adapt_bump/decay, …), demo, validate (count ≤ (2r+1)²)
-    neurons.rs           # Layer — per-neuron SoA state + occupancy bitset (occ) + offset LUTs + 2-bit codes + f32 shadow + elig/decide state; new, from_parts, repack_row, for_wired, decode, weight_at
+    neurons.rs           # Layer — per-neuron SoA state + occupancy bitset (occ) + offset LUTs + 2-bit codes + optional TrainState (f32 shadow + decide snapshots); new, from_parts, enable_training, repack_row, for_wired, decode, weight_at
     wave.rs              # process_layer — the per-layer wave step (bitset-scan synapse generation; the one documented unsafe)
-    network.rs           # Network — orchestration, routing, deferred swap, listeners, readout layer, eprop_update_synaptic, from_layers
+    network.rs           # Network — orchestration, routing, deferred swap, listeners, readout layer, eprop_update_synaptic, enable/disable_training, from_layers
     multilayer_dfa.rs    # temporal multi-layer-DFA training engine (temporal_eligibility + multilayer_dfa_step; targets decoded from occupancy)
     persist.rs           # save/load — self-contained model (.wbm) + runtime overlay (.wbr) + model_fingerprint
   bench/                 # experiment harness (public-API only, test-only) — the learning rules + tasks
