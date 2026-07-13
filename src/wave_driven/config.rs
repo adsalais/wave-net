@@ -72,9 +72,10 @@ impl Config {
             if lc.cooldown_base == 0 {
                 return Err(format!("layer {z}: cooldown_base must be >= 1"));
             }
-            if lc.adapt_decay == 0 || lc.adapt_decay > 24 {
+            if lc.adapt_decay == 0 || lc.adapt_decay > crate::wave_driven::neurons::MAX_ADAPT_DECAY {
                 return Err(format!(
-                    "layer {z}: adapt_decay must be in 1..=24 (defines the geometric decay ratio ρ = 1 − 2^−decay)"
+                    "layer {z}: adapt_decay must be in 1..={} (defines the geometric decay ratio ρ = 1 − 2^−decay)",
+                    crate::wave_driven::neurons::MAX_ADAPT_DECAY
                 ));
             }
             for t in &lc.topology {
