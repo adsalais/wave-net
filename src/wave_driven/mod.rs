@@ -4,5 +4,6 @@
 //! substrate is copied). Spec: docs/superpowers/specs/2026-07-13-wave-driven-event-active-set-design.md.
 
 pub mod config;
+pub mod frontier;
 pub mod neurons;
 pub mod synapse;
