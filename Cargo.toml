@@ -26,3 +26,7 @@ harness = false
 [[bench]]
 name = "throughput_driven"
 harness = false
+
+[[bench]]
+name = "train_sidecar_compare"
+harness = false
