@@ -17,6 +17,52 @@ pub const ADAPT_MAX: i32 = (i16::MAX as i32) << ADAPT_SHIFT;
 /// 2-bit weight code decode LUT: `0b00`→0, `0b01`→+1, `0b11`→−1 (`0b10` unused → 0).
 pub(crate) const WCODE: [i8; 4] = [0, 1, 0, -1];
 
+/// Layout quantities derived purely from `(topology, size)` — no seed, no RNG. Shared by
+/// `Layer::new` (fresh build) and `Layer::from_parts` (load) so a loaded layer's LUTs are
+/// byte-identical to a freshly-built one.
+pub(crate) struct DerivedLayout {
+    pub total_slots: usize,
+    pub slot_bases: Vec<usize>,
+    pub neigh: Vec<usize>,
+    pub occ_wpn: Vec<usize>,
+    pub offsets: Vec<Vec<(i8, i8)>>,
+    pub off_flat: Vec<Vec<i32>>,
+}
+
+pub(crate) fn derive_layout(topology: &[TopologyLevel], size: u32) -> DerivedLayout {
+    let n_levels = topology.len();
+    let mut slot_bases = Vec::with_capacity(n_levels);
+    let mut neigh = Vec::with_capacity(n_levels);
+    let mut occ_wpn = Vec::with_capacity(n_levels);
+    let mut offsets: Vec<Vec<(i8, i8)>> = Vec::with_capacity(n_levels);
+    let mut off_flat: Vec<Vec<i32>> = Vec::with_capacity(n_levels);
+    let mut total_slots = 0usize;
+    for t in topology {
+        slot_bases.push(total_slots);
+        let n = neigh_size(t.radius);
+        neigh.push(n);
+        occ_wpn.push((n + 63) / 64);
+        let span = 2 * t.radius + 1;
+        let r = t.radius as i32;
+        offsets.push(
+            (0..n)
+                .map(|c| (((c as u32 % span) as i32 - r) as i8, ((c as u32 / span) as i32 - r) as i8))
+                .collect(),
+        );
+        off_flat.push(
+            (0..n)
+                .map(|c| {
+                    let dx = (c as u32 % span) as i32 - r;
+                    let dy = (c as u32 / span) as i32 - r;
+                    dy * size as i32 + dx
+                })
+                .collect(),
+        );
+        total_slots += t.count as usize;
+    }
+    DerivedLayout { total_slots, slot_bases, neigh, occ_wpn, offsets, off_flat }
+}
+
 pub struct Layer {
     // neuron state (identical to wave_net::neurons::Layer)
     pub potential: Vec<i16>,
@@ -122,38 +168,10 @@ impl Layer {
     pub fn new(cfg: &LayerConfig, seed: u64, layer_index: u32, size: u32) -> Layer {
         let ls = (size as usize) * (size as usize);
         let base = layer_index as usize * ls;
-        let n_levels = cfg.topology.len();
 
-        // derived layout + per-level occupancy word count + offset LUT
-        let mut slot_bases = Vec::with_capacity(n_levels);
-        let mut neigh = Vec::with_capacity(n_levels);
-        let mut occ_wpn = Vec::with_capacity(n_levels);
-        let mut offsets: Vec<Vec<(i8, i8)>> = Vec::with_capacity(n_levels);
-        let mut off_flat: Vec<Vec<i32>> = Vec::with_capacity(n_levels);
-        let mut total_slots = 0usize;
-        for t in &cfg.topology {
-            slot_bases.push(total_slots);
-            let n = neigh_size(t.radius);
-            neigh.push(n);
-            occ_wpn.push((n + 63) / 64);
-            let span = 2 * t.radius + 1;
-            let r = t.radius as i32;
-            offsets.push(
-                (0..n)
-                    .map(|c| (((c as u32 % span) as i32 - r) as i8, ((c as u32 / span) as i32 - r) as i8))
-                    .collect(),
-            );
-            off_flat.push(
-                (0..n)
-                    .map(|c| {
-                        let dx = (c as u32 % span) as i32 - r;
-                        let dy = (c as u32 / span) as i32 - r;
-                        dy * size as i32 + dx
-                    })
-                    .collect(),
-            );
-            total_slots += t.count as usize;
-        }
+        // derived layout + per-level occupancy word count + offset LUT (shared with load)
+        let DerivedLayout { total_slots, slot_bases, neigh, occ_wpn, offsets, off_flat } =
+            derive_layout(&cfg.topology, size);
 
         // threshold: baseline_init + rand(0..threshold_jitter), clamp(1, i16::MAX)  (verbatim wave_net)
         let mut threshold = vec![0i16; ls];
@@ -232,6 +250,23 @@ mod tests {
 
     fn lc(topology: Vec<TopologyLevel>) -> LayerConfig {
         LayerConfig { topology, leak: (3, 5), cooldown_base: 2, inhibitor_ratio: 0, threshold_jitter: 0, baseline_init: 6, adapt_bump: 5, adapt_decay: 6 }
+    }
+
+    #[test]
+    fn derive_layout_matches_expected() {
+        let topo = vec![
+            TopologyLevel { level: 1, radius: 2, count: 8 },
+            TopologyLevel { level: 0, radius: 1, count: 3 },
+        ];
+        let d = derive_layout(&topo, 8);
+        assert_eq!(d.total_slots, 11);
+        assert_eq!(d.slot_bases, vec![0, 8]);
+        assert_eq!(d.neigh, vec![25, 9]);
+        assert_eq!(d.occ_wpn, vec![1, 1]);
+        assert_eq!(d.offsets[0].len(), 25);
+        assert_eq!(d.off_flat[1].len(), 9);
+        assert_eq!(d.offsets[1][4], (0, 0)); // center of a radius-1 (span-3) level
+        assert_eq!(d.off_flat[1][4], 0);
     }
 
     #[test]

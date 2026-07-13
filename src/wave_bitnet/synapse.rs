@@ -2,7 +2,7 @@
 //! replace procedural target generation: `decode_cell` (neighborhood cell → target local, arithmetic)
 //! and `sample_distinct_cells` (startup fill of `count` distinct cells via partial Fisher-Yates).
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TopologyLevel {
     pub level: i32,
     pub radius: u32,
