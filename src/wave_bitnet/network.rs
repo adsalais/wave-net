@@ -11,7 +11,6 @@ pub struct Network {
     layers: Vec<Layer>,
     wave_id: usize,
     scratch: Scratch,
-    record_eligibility: bool,
     #[allow(clippy::type_complexity)]
     listeners: Vec<Option<Box<dyn Fn(usize, &[u32]) + Send + Sync>>>,
 }
@@ -60,7 +59,6 @@ impl Network {
                 fired: Vec::new(),
                 deliv: (0..l).map(|_| vec![0i32; ls]).collect(),
             },
-            record_eligibility: true,
             listeners: (0..l).map(|_| None).collect(),
         }
     }
@@ -70,12 +68,11 @@ impl Network {
         self.wave_id += 1;
         let l = self.layers.len();
         let size = self.size;
-        let record_elig = self.record_eligibility;
         let Self { layers, scratch, listeners, .. } = self;
         let Scratch { fired, deliv } = scratch;
         for z in 0..l {
             let inp: &[u32] = if z == 0 { input } else { &[] };
-            process_layer(&mut layers[z], z as u32, size, inp, deliv, fired, record_elig);
+            process_layer(&mut layers[z], z as u32, size, inp, deliv, fired);
             if let Some(listener) = &listeners[z] {
                 listener(w, fired);
             }
@@ -97,10 +94,26 @@ impl Network {
         }
     }
 
-    /// Toggle e-prop eligibility recording (default on). Turn it off for a pure forward pass
-    /// (inference / throughput) to skip the per-neuron decide/elig snapshots.
-    pub fn set_record_eligibility(&mut self, on: bool) {
-        self.record_eligibility = on;
+    /// Allocate training state on every layer (idempotent). Required before any training update
+    /// (`eprop_update_synaptic`, `multilayer_dfa_step`) or reading the decide snapshots. A fresh state
+    /// rebuilds each `shadow` as `decode(codes)` and zeroes the decide snapshots.
+    pub fn enable_training(&mut self) {
+        for l in self.layers.iter_mut() {
+            l.enable_training();
+        }
+    }
+
+    /// Free training state on every layer, returning to an inference-lean footprint. LOSSY for
+    /// in-flight sub-threshold shadow (see `Layer::disable_training`) — like a `.wbm` round-trip.
+    pub fn disable_training(&mut self) {
+        for l in self.layers.iter_mut() {
+            l.disable_training();
+        }
+    }
+
+    /// True if training state is currently allocated (checks layer 0; `enable`/`disable` act on all).
+    pub fn is_training(&self) -> bool {
+        self.layers.first().map(|l| l.train.is_some()).unwrap_or(false)
     }
 
     pub fn reset_state(&mut self) {
@@ -108,10 +121,11 @@ impl Network {
             g.potential.iter_mut().for_each(|p| *p = 0);
             g.cooldown.iter_mut().for_each(|c| *c = 0);
             g.adapt.iter_mut().for_each(|a| *a = 0);
-            g.elig_pre.iter_mut().for_each(|e| *e = 0);
-            g.elig_post.iter_mut().for_each(|e| *e = 0);
-            g.decide_potential.iter_mut().for_each(|p| *p = 0);
             g.pending.iter_mut().for_each(|p| *p = 0);
+            if let Some(t) = g.train.as_mut() {
+                t.decide_potential.iter_mut().for_each(|p| *p = 0);
+                t.decide_eff.iter_mut().for_each(|e| *e = 0);
+            }
         }
         for d in self.scratch.deliv.iter_mut() {
             d.iter_mut().for_each(|x| *x = 0);
@@ -153,7 +167,7 @@ impl Network {
     }
 
     /// Assemble a `Network` from already-built layers (used by `load_model`). Fresh runtime:
-    /// `wave_id = 0`, zeroed delivery scratch, eligibility recording on, no listeners.
+    /// `wave_id = 0`, zeroed delivery scratch, inference-lean (layers carry no `train`), no listeners.
     pub(crate) fn from_layers(size: u32, layers: Vec<Layer>) -> Network {
         let l = layers.len();
         let ls = (size as usize) * (size as usize);
@@ -162,7 +176,6 @@ impl Network {
             layers,
             wave_id: 0,
             scratch: Scratch { fired: Vec::new(), deliv: (0..l).map(|_| vec![0i32; ls]).collect() },
-            record_eligibility: true,
             listeners: (0..l).map(|_| None).collect(),
         }
     }
@@ -174,13 +187,13 @@ impl Network {
 
     /// Per-neuron membrane potential captured at the last decide step (pre fire-reset/leak).
     pub fn layer_decide_potential(&self, z: usize) -> Vec<i16> {
-        self.layers[z].decide_potential.clone()
+        self.layers[z].train.as_ref().expect("layer_decide_potential requires training enabled").decide_potential.clone()
     }
 
     /// Per-neuron effective firing threshold captured at the last decide step (the value compared
     /// against `layer_decide_potential`).
     pub fn layer_decide_effective_threshold(&self, z: usize) -> Vec<i32> {
-        self.layers[z].decide_eff.clone()
+        self.layers[z].train.as_ref().expect("layer_decide_effective_threshold requires training enabled").decide_eff.clone()
     }
 
     /// Apply one e-prop update to layer `source_z`'s `level_idx` topology entry from a per-synapse
@@ -207,11 +220,14 @@ impl Network {
                 wired.clear();
                 lz.for_wired(level_idx, i, |r, c| wired.push((r, lz.decode(level_idx, i as u32, c, size) as usize)));
                 let mut touched = false;
-                for &(r, target) in &wired {
-                    let e = elig[i * count + r];
-                    if e != 0.0 {
-                        touched = true;
-                        lz.shadow[i * ts + sbase + r] += -lr * signal[target] * e;
+                {
+                    let shadow = &mut lz.train.as_mut().expect("eprop requires training enabled").shadow;
+                    for &(r, target) in &wired {
+                        let e = elig[i * count + r];
+                        if e != 0.0 {
+                            touched = true;
+                            shadow[i * ts + sbase + r] += -lr * signal[target] * e;
+                        }
                     }
                 }
                 if touched {
@@ -247,6 +263,8 @@ mod tests {
     fn wave_is_deterministic() {
         let mut a = Network::new(two_layer(8));
         let mut b = Network::new(two_layer(8));
+        a.enable_training();
+        b.enable_training();
         for _ in 0..5 {
             a.wave(&[0, 1, 2]);
             b.wave(&[0, 1, 2]);
@@ -254,7 +272,7 @@ mod tests {
         a.with_layer(1, |la| {
             b.with_layer(1, |lb| {
                 assert_eq!(la.potential, lb.potential);
-                assert_eq!(la.shadow, lb.shadow);
+                assert_eq!(la.train.as_ref().unwrap().shadow, lb.train.as_ref().unwrap().shadow);
             })
         });
     }
@@ -262,12 +280,13 @@ mod tests {
     #[test]
     fn update_with_negative_signal_raises_pruned_synapse() {
         let mut net = Network::new(two_layer(8));
+        net.enable_training();
         let ls = 64usize;
         // neuron 0, level 0: zero its whole row shadow then repack -> all pruned
         net.with_layer_mut(0, |l| {
             let ts = l.total_slots;
             for s in 0..ts {
-                l.shadow[0 * ts + s] = 0.0;
+                l.train.as_mut().unwrap().shadow[0 * ts + s] = 0.0;
             }
             l.repack_row(0);
             assert_eq!(l.weight_at(0), 0, "row starts fully pruned");
@@ -278,7 +297,68 @@ mod tests {
         let signal = vec![-1.0f32; ls];
         net.eprop_update_synaptic(0, 0, &elig, &signal, 0.02);
         net.with_layer(0, |l| {
-            assert!(l.shadow[0] > 0.0, "shadow raised by -lr·(-1)·1 > 0: {}", l.shadow[0]);
+            let sh = &l.train.as_ref().unwrap().shadow;
+            assert!(sh[0] > 0.0, "shadow raised by -lr·(-1)·1 > 0: {}", sh[0]);
         });
+    }
+
+    #[test]
+    fn fresh_net_is_lean_and_toggles() {
+        let mut net = Network::new(two_layer(8));
+        assert!(!net.is_training(), "fresh net is inference-lean");
+        net.with_layer(0, |l| assert!(l.train.is_none()));
+        net.enable_training();
+        assert!(net.is_training());
+        // layer 0 carries synapses (layer 1 is the empty-topology output layer).
+        net.with_layer(0, |l| {
+            let t = l.train.as_ref().expect("enabled");
+            assert_eq!(t.shadow.len(), l.synapse_count());
+            assert!(l.synapse_count() > 0, "layer 0 has synapses");
+        });
+        net.disable_training();
+        assert!(!net.is_training());
+        net.with_layer(0, |l| assert!(l.train.is_none()));
+    }
+
+    #[test]
+    fn enable_is_idempotent_and_preserves_shadow() {
+        let mut net = Network::new(two_layer(8));
+        net.enable_training();
+        net.with_layer_mut(0, |l| l.train.as_mut().unwrap().shadow[0] = 3.5);
+        net.enable_training(); // second call must not clobber
+        net.with_layer(0, |l| assert_eq!(l.train.as_ref().unwrap().shadow[0], 3.5));
+    }
+
+    #[test]
+    fn enable_reconstructs_decode_of_codes() {
+        let mut net = Network::new(two_layer(8));
+        net.enable_training();
+        net.with_layer(0, |l| {
+            let sh = &l.train.as_ref().unwrap().shadow;
+            assert!(!sh.is_empty(), "layer 0 has synapses to check");
+            for s in 0..sh.len() {
+                assert_eq!(sh[s], l.weight_at(s) as f32, "fresh enabled shadow == decode(codes)");
+            }
+        });
+    }
+
+    #[test]
+    fn lean_and_trained_inference_match() {
+        let mut lean = Network::new(two_layer(8));
+        let mut trained = Network::new(two_layer(8));
+        trained.enable_training();
+        let inputs: [&[u32]; 5] = [&[0, 1, 2], &[0, 1, 2], &[], &[5, 9], &[]];
+        for inp in inputs {
+            lean.wave(inp);
+            trained.wave(inp);
+            for z in 0..lean.layer_count() {
+                lean.with_layer(z, |a| {
+                    trained.with_layer(z, |b| {
+                        assert_eq!(a.potential, b.potential, "layer {z} potential matches");
+                        assert_eq!(a.codes, b.codes, "layer {z} codes matches");
+                    })
+                });
+            }
+        }
     }
 }

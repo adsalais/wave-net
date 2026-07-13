@@ -23,7 +23,7 @@ fn main() {
         adapt_decay: 6,
     };
     let mut net = Network::new(Config { seed, size, layers: vec![layer; 5] });
-    net.set_record_eligibility(false);
+    // A fresh net is inference-lean (no training state), so the forward pass records no eligibility.
 
     let input = random_l0_input(seed, size, 20000);
     let noise: Vec<Vec<u32>> = (0..256).map(&input).collect();

@@ -69,7 +69,8 @@ fn make_sidecar(seed: u64, size: u32, uc: u32, ur: u32, n: u32, r: u32, adapt_bu
         mk(vec![TopologyLevel { level: -1, radius: r, count: n }, TopologyLevel { level: 1, radius: ur, count: uc }]),
         mk(vec![]),
     ];
-    let net = Network::new(Config { seed, size, layers });
+    let mut net = Network::new(Config { seed, size, layers });
+    net.enable_training();
     let entries = vec![
         vec![Edge { level: 1, count: uc as usize, radius: ur }],
         vec![Edge { level: 2, count: uc as usize, radius: ur }],
@@ -277,10 +278,9 @@ fn ensure_model() -> Network {
 }
 
 fn setup_net() -> Network {
-    let mut net = ensure_model();
-    // Pure forward-throughput measurement: no training reads eligibility, so skip accruing it.
-    net.set_record_eligibility(false);
-    net
+    // Pure forward-throughput measurement: the loaded model is inference-lean (no training state),
+    // so the forward pass records no eligibility.
+    ensure_model()
 }
 
 /// Per-layer firing rate (fraction of neurons firing per wave) over a counted window. Warmup discarded.

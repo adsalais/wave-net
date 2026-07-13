@@ -1,6 +1,7 @@
 //! `persist` — hand-rolled, std-only binary save/load for a `wave_bitnet` `Network`. Two independent
 //! formats: a self-contained **model** (`b"WBNM"`: structure + 2-bit codes, inference-ready) and a
-//! **runtime overlay** (`b"WBNR"`: the mutable per-neuron state only) applied onto a loaded model.
+//! **runtime overlay** (`b"WBNR"`: the resumable forward state only — `potential`/`cooldown`/`adapt`/
+//! `pending` + `wave_id`) applied onto a loaded model. Training state (`Layer.train`) is never persisted.
 //! See docs/superpowers/specs/2026-07-13-wave-bitnet-persist-design.md.
 
 use crate::wave_bitnet::network::Network;
@@ -12,7 +13,11 @@ use std::path::Path;
 
 const MAGIC_MODEL: &[u8; 4] = b"WBNM";
 const MAGIC_RUNTIME: &[u8; 4] = b"WBNR";
-const VERSION: u16 = 1;
+/// Model file format version (structure + codes). Unchanged by the optional-`TrainState` work.
+const MODEL_VERSION: u16 = 1;
+/// Runtime overlay format version. Bumped to 2 when the overlay was slimmed to the genuinely
+/// resumable forward state (`potential/cooldown/adapt/pending` + `wave_id`); older overlays rejected.
+const RUNTIME_VERSION: u16 = 2;
 
 fn inval(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
@@ -124,7 +129,7 @@ impl Network {
     pub fn save_model(&self, mut w: impl Write) -> io::Result<()> {
         let mut buf = Vec::new();
         buf.write_all(MAGIC_MODEL)?;
-        w_u16(&mut buf, VERSION)?;
+        w_u16(&mut buf, MODEL_VERSION)?;
         write_model_identity(&mut buf, self)?;
         let cksum = fnv1a(&buf);
         w_u64(&mut buf, cksum)?;
@@ -151,8 +156,8 @@ impl Network {
             return Err(inval("bad magic (not a wave_bitnet model file)"));
         }
         let ver = r_u16(&mut c)?;
-        if ver != VERSION {
-            return Err(inval(format!("unsupported model version {ver} (expected {VERSION})")));
+        if ver != MODEL_VERSION {
+            return Err(inval(format!("unsupported model version {ver} (expected {MODEL_VERSION})")));
         }
         read_model_body(&mut c)
     }
@@ -176,13 +181,14 @@ impl Network {
         fnv1a(&buf)
     }
 
-    /// Serialize ONLY the mutable per-neuron runtime state + `wave_id` (`b"WBNR"`). Not standalone:
-    /// `apply_runtime` restores it onto a matching model. `scratch.deliv` is provably all-zero between
-    /// waves, so it is not stored.
+    /// Serialize ONLY the genuinely-resumable per-neuron forward state + `wave_id` (`b"WBNR"`):
+    /// `potential`, `cooldown`, `adapt`, `pending`. Not standalone: `apply_runtime` restores it onto a
+    /// matching model. `scratch.deliv` is provably all-zero between waves, so it is not stored; training
+    /// state (shadow / decide snapshots) lives in `Layer.train` and is never part of the overlay.
     pub fn save_runtime(&self, mut w: impl Write) -> io::Result<()> {
         let mut buf = Vec::new();
         buf.write_all(MAGIC_RUNTIME)?;
-        w_u16(&mut buf, VERSION)?;
+        w_u16(&mut buf, RUNTIME_VERSION)?;
         w_u64(&mut buf, self.model_fingerprint())?;
         w_u32(&mut buf, self.size())?;
         w_u32(&mut buf, self.layer_count() as u32)?;
@@ -192,10 +198,6 @@ impl Network {
             w_vec_u8(&mut buf, &lz.cooldown)?;
             w_vec_i32(&mut buf, &lz.adapt)?;
             w_vec_i32(&mut buf, &lz.pending)?;
-            w_vec_i32(&mut buf, &lz.elig_pre)?;
-            w_vec_i32(&mut buf, &lz.elig_post)?;
-            w_vec_i16(&mut buf, &lz.decide_potential)?;
-            w_vec_i32(&mut buf, &lz.decide_eff)?;
         }
         let cksum = fnv1a(&buf);
         w_u64(&mut buf, cksum)?;
@@ -223,8 +225,8 @@ impl Network {
             return Err(inval("bad magic (not a wave_bitnet runtime file)"));
         }
         let ver = r_u16(&mut c)?;
-        if ver != VERSION {
-            return Err(inval(format!("unsupported runtime version {ver} (expected {VERSION})")));
+        if ver != RUNTIME_VERSION {
+            return Err(inval(format!("unsupported runtime version {ver} (expected {RUNTIME_VERSION})")));
         }
         let model_fp = r_u64(&mut c)?;
         if model_fp != self.model_fingerprint() {
@@ -238,39 +240,30 @@ impl Network {
         let wave_id = r_u64(&mut c)? as usize;
         let ls = (size as usize) * (size as usize);
         // read + validate every layer's arrays BEFORE mutating (keep apply all-or-nothing)
-        type LayerRt = (Vec<i16>, Vec<u8>, Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>, Vec<i16>, Vec<i32>);
+        type LayerRt = (Vec<i16>, Vec<u8>, Vec<i32>, Vec<i32>);
         let mut staged: Vec<LayerRt> = Vec::with_capacity(n_layers);
         for z in 0..n_layers {
             let potential = r_vec_i16(&mut c)?;
             let cooldown = r_vec_u8(&mut c)?;
             let adapt = r_vec_i32(&mut c)?;
             let pending = r_vec_i32(&mut c)?;
-            let elig_pre = r_vec_i32(&mut c)?;
-            let elig_post = r_vec_i32(&mut c)?;
-            let decide_potential = r_vec_i16(&mut c)?;
-            let decide_eff = r_vec_i32(&mut c)?;
             for (name, len) in [
-                ("potential", potential.len()), ("cooldown", cooldown.len()), ("adapt", adapt.len()),
-                ("pending", pending.len()), ("elig_pre", elig_pre.len()), ("elig_post", elig_post.len()),
-                ("decide_potential", decide_potential.len()), ("decide_eff", decide_eff.len()),
+                ("potential", potential.len()), ("cooldown", cooldown.len()),
+                ("adapt", adapt.len()), ("pending", pending.len()),
             ] {
                 if len != ls {
                     return Err(inval(format!("layer {z} {name} length {len} != ls {ls}")));
                 }
             }
-            staged.push((potential, cooldown, adapt, pending, elig_pre, elig_post, decide_potential, decide_eff));
+            staged.push((potential, cooldown, adapt, pending));
         }
         // commit
         let layers = self.layers_mut();
-        for (z, (potential, cooldown, adapt, pending, elig_pre, elig_post, decide_potential, decide_eff)) in staged.into_iter().enumerate() {
+        for (z, (potential, cooldown, adapt, pending)) in staged.into_iter().enumerate() {
             layers[z].potential = potential;
             layers[z].cooldown = cooldown;
             layers[z].adapt = adapt;
             layers[z].pending = pending;
-            layers[z].elig_pre = elig_pre;
-            layers[z].elig_post = elig_post;
-            layers[z].decide_potential = decide_potential;
-            layers[z].decide_eff = decide_eff;
         }
         self.set_wave_id(wave_id);
         Ok(())
@@ -318,6 +311,36 @@ mod tests {
         }
     }
 
+    /// `ErrorKind` of a failed `apply_runtime` (which returns `io::Result<()>`).
+    fn err_kind_rt(r: io::Result<()>) -> io::ErrorKind {
+        match r {
+            Ok(()) => panic!("expected an error, got Ok"),
+            Err(e) => e.kind(),
+        }
+    }
+
+    #[test]
+    fn runtime_version_is_bumped_and_distinct_from_model() {
+        assert_eq!(MODEL_VERSION, 1, "model format unchanged");
+        assert_eq!(RUNTIME_VERSION, 2, "runtime overlay bumped for the slimmer layout");
+    }
+
+    #[test]
+    fn runtime_rejects_old_version() {
+        // hand-build a runtime header with the OLD version byte (1); expect a loud reject.
+        let net = small_net();
+        let mut bad = MAGIC_RUNTIME.to_vec();
+        w_u16(&mut bad, 1).unwrap(); // stale runtime version
+        w_u64(&mut bad, net.model_fingerprint()).unwrap();
+        w_u32(&mut bad, net.size()).unwrap();
+        w_u32(&mut bad, net.layer_count() as u32).unwrap();
+        w_u64(&mut bad, 0).unwrap();
+        let ck = fnv1a(&bad);
+        w_u64(&mut bad, ck).unwrap();
+        let mut n = small_net();
+        assert_eq!(err_kind_rt(n.apply_runtime(&bad[..])), io::ErrorKind::InvalidData);
+    }
+
     /// Assert two networks have equal persisted + derived structure (not runtime; shadow checked as
     /// the decode of codes).
     fn assert_models_eq(a: &Network, b: &Network) {
@@ -342,10 +365,8 @@ mod tests {
                     assert_eq!(la.occ_wpn, lb.occ_wpn);
                     assert_eq!(la.offsets, lb.offsets);
                     assert_eq!(la.off_flat, lb.off_flat);
-                    // loaded shadow is the decode of codes
-                    for s in 0..lb.shadow.len() {
-                        assert_eq!(lb.shadow[s], lb.weight_at(s) as f32);
-                    }
+                    // loaded nets are inference-lean (no shadow); code equality above proves weight identity.
+                    assert!(lb.train.is_none(), "loaded model is inference-lean");
                 })
             });
         }
@@ -371,8 +392,9 @@ mod tests {
         for inp in inputs {
             a.wave(inp);
             b.wave(inp);
+            // loaded nets are inference-lean, so compare the forward state inference actually produces.
             for z in 0..a.layer_count() {
-                assert_eq!(a.layer_decide_potential(z), b.layer_decide_potential(z), "layer {z} decide_potential");
+                a.with_layer(z, |la| b.with_layer(z, |lb| assert_eq!(la.potential, lb.potential, "layer {z} potential")));
             }
         }
     }
@@ -391,14 +413,14 @@ mod tests {
     fn model_rejects_bad_magic_version_and_corruption() {
         // bad magic (valid checksum so magic check is reached)
         let mut bad = b"ZZZZ".to_vec();
-        w_u16(&mut bad, VERSION).unwrap();
+        w_u16(&mut bad, MODEL_VERSION).unwrap();
         let ck = fnv1a(&bad);
         w_u64(&mut bad, ck).unwrap();
         assert_eq!(err_kind(Network::load_model(&bad[..])), io::ErrorKind::InvalidData);
 
         // unsupported version
         let mut badv = MAGIC_MODEL.to_vec();
-        w_u16(&mut badv, VERSION + 1).unwrap();
+        w_u16(&mut badv, MODEL_VERSION + 1).unwrap();
         let ck = fnv1a(&badv);
         w_u64(&mut badv, ck).unwrap();
         assert_eq!(err_kind(Network::load_model(&badv[..])), io::ErrorKind::InvalidData);
@@ -446,21 +468,17 @@ mod tests {
                     assert_eq!(la.cooldown, lb.cooldown, "layer {z} cooldown");
                     assert_eq!(la.adapt, lb.adapt, "layer {z} adapt");
                     assert_eq!(la.pending, lb.pending, "layer {z} pending");
-                    assert_eq!(la.elig_pre, lb.elig_pre, "layer {z} elig_pre");
-                    assert_eq!(la.elig_post, lb.elig_post, "layer {z} elig_post");
-                    assert_eq!(la.decide_potential, lb.decide_potential, "layer {z} decide_potential");
-                    assert_eq!(la.decide_eff, lb.decide_eff, "layer {z} decide_eff");
                 })
             });
         }
 
-        // continuing both must stay identical (true resume)
+        // continuing both must stay identical (true resume) — loaded nets are lean, so compare potential.
         let more: [&[u32]; 3] = [&[1, 4], &[], &[7]];
         for inp in more {
             a.wave(inp);
             b.wave(inp);
             for z in 0..a.layer_count() {
-                assert_eq!(a.layer_decide_potential(z), b.layer_decide_potential(z), "resumed layer {z}");
+                a.with_layer(z, |la| b.with_layer(z, |lb| assert_eq!(la.potential, lb.potential, "resumed layer {z}")));
             }
         }
     }

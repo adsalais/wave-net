@@ -63,6 +63,16 @@ pub(crate) fn derive_layout(topology: &[TopologyLevel], size: u32) -> DerivedLay
     DerivedLayout { total_slots, slot_bases, neigh, occ_wpn, offsets, off_flat }
 }
 
+/// All per-layer TRAINING state — allocated only while training is enabled (see
+/// `Network::enable_training`). Absent (`Layer.train == None`) on an inference-lean net.
+/// `shadow` is the f32 training master requantized into `codes` by `repack_row`; the two
+/// decide-time snapshots are the credit-assignment records the bench reads each wave.
+pub struct TrainState {
+    pub shadow: Vec<f32>,           // ls * total_slots
+    pub decide_potential: Vec<i16>, // ls
+    pub decide_eff: Vec<i32>,       // ls
+}
+
 pub struct Layer {
     // neuron state
     pub potential: Vec<i16>,
@@ -70,11 +80,6 @@ pub struct Layer {
     pub adapt: Vec<i32>,
     pub threshold: Vec<i16>,
     pub pending: Vec<i32>, // per-target incoming accumulator (scatter-add target); folded in step 1
-    // eligibility / decide-step state
-    pub elig_pre: Vec<i32>,
-    pub elig_post: Vec<i32>,
-    pub decide_potential: Vec<i16>,
-    pub decide_eff: Vec<i32>,
     // config
     pub leak: (u8, u8),
     pub cooldown_base: u8,
@@ -93,8 +98,9 @@ pub struct Layer {
     pub offsets: Vec<Vec<(i8, i8)>>, // per level: cell -> (dx, dy) LUT (for the wrapping edge path)
     pub off_flat: Vec<Vec<i32>>,     // per level: cell -> dy·size + dx (flat delta, interior fast path)
     // WEIGHTS (rank-indexed): 2-bit codes packed 32 per u64 — 0b00=0, 0b01=+1, 0b11=−1.
-    pub codes: Vec<u64>,  // ceil(ls·total_slots / 32) words
-    pub shadow: Vec<f32>, // ls·total_slots
+    pub codes: Vec<u64>, // ceil(ls·total_slots / 32) words
+    // TRAINING state — present only while training is enabled (None on an inference-lean net).
+    pub train: Option<TrainState>,
 }
 
 impl Layer {
@@ -106,6 +112,34 @@ impl Layer {
     #[inline]
     pub fn weight_at(&self, widx: usize) -> i8 {
         WCODE[((self.codes[widx >> 5] >> ((widx & 31) * 2)) & 0b11) as usize]
+    }
+
+    /// Number of stored synapses (`ls * total_slots`) — independent of whether training is enabled.
+    #[inline]
+    pub fn synapse_count(&self) -> usize {
+        self.total_slots * self.threshold.len()
+    }
+
+    /// Allocate this layer's training state (idempotent — keeps any existing accumulated shadow).
+    /// A fresh state reconstructs `shadow` as the per-slot decode of `codes` and zeroes the decide
+    /// snapshots — identical to the shadow a `.wbm` load would rebuild (codes are the master).
+    pub fn enable_training(&mut self) {
+        if self.train.is_some() {
+            return;
+        }
+        let n = self.synapse_count();
+        let mut shadow = vec![0f32; n];
+        for s in 0..n {
+            shadow[s] = self.weight_at(s) as f32;
+        }
+        let ls = self.threshold.len();
+        self.train = Some(TrainState { shadow, decide_potential: vec![0i16; ls], decide_eff: vec![0i32; ls] });
+    }
+
+    /// Free this layer's training state. LOSSY for in-flight sub-threshold shadow: re-enabling
+    /// rebuilds `shadow = decode(codes)`, exactly like a `.wbm` save/load round-trip.
+    pub fn disable_training(&mut self) {
+        self.train = None;
     }
 
     /// Iterate the wired cells of neuron `i` at level `lvl`, in ascending cell order, calling
@@ -151,14 +185,17 @@ impl Layer {
             return;
         }
         let base = i * ts;
-        let mut sum = 0.0f32;
-        for s in 0..ts {
-            sum += self.shadow[base + s].abs();
-        }
-        let gamma = sum / ts as f32;
         let t = self.ternary_threshold;
+        let gamma = {
+            let shadow = &self.train.as_ref().expect("repack_row requires training enabled").shadow;
+            let mut sum = 0.0f32;
+            for s in 0..ts {
+                sum += shadow[base + s].abs();
+            }
+            sum / ts as f32
+        };
         for s in 0..ts {
-            let sh = self.shadow[base + s];
+            let sh = self.train.as_ref().unwrap().shadow[base + s];
             let x = if gamma <= 0.0 { 0.0 } else { sh / gamma };
             let code: u64 = if x.abs() < t { 0b00 } else if x > 0.0 { 0b01 } else { 0b11 };
             self.set_code(base + s, code);
@@ -205,22 +242,12 @@ impl Layer {
         if codes.len() != want_codes {
             return Err(format!("codes length {} != {want_codes}", codes.len()));
         }
-        // shadow = per-slot decode of codes (inference-authoritative; not the training master)
-        let n = ls * total_slots;
-        let mut shadow = vec![0f32; n];
-        for s in 0..n {
-            shadow[s] = WCODE[((codes[s >> 5] >> ((s & 31) * 2)) & 0b11) as usize] as f32;
-        }
         Ok(Layer {
             potential: vec![0i16; ls],
             cooldown: vec![0u8; ls],
             adapt: vec![0i32; ls],
             threshold,
             pending: vec![0i32; ls],
-            elig_pre: vec![0i32; ls],
-            elig_post: vec![0i32; ls],
-            decide_potential: vec![0i16; ls],
-            decide_eff: vec![0i32; ls],
             leak,
             cooldown_base,
             topology,
@@ -236,7 +263,7 @@ impl Layer {
             offsets,
             off_flat,
             codes,
-            shadow,
+            train: None, // loaded model is inference-lean; call `enable_training` to resume training
         })
     }
 
@@ -289,10 +316,6 @@ impl Layer {
             adapt: vec![0i32; ls],
             threshold,
             pending: vec![0i32; ls],
-            elig_pre: vec![0i32; ls],
-            elig_post: vec![0i32; ls],
-            decide_potential: vec![0i16; ls],
-            decide_eff: vec![0i32; ls],
             leak: cfg.leak,
             cooldown_base: cfg.cooldown_base,
             topology: cfg.topology.clone(),
@@ -308,11 +331,18 @@ impl Layer {
             offsets,
             off_flat,
             codes: vec![0u64; (ls * total_slots + 31) / 32],
-            shadow,
+            train: Some(TrainState {
+                shadow,
+                decide_potential: vec![0i16; ls],
+                decide_eff: vec![0i32; ls],
+            }),
         };
         for i in 0..ls {
             layer.repack_row(i);
         }
+        // Codes are now seeded from the procedural ±1 sign; drop the transient training state so a
+        // fresh net is inference-lean (call `enable_training` / `Network::enable_training` to train).
+        layer.train = None;
         layer
     }
 }
@@ -373,13 +403,14 @@ mod tests {
             TopologyLevel { level: 0, radius: 1, count: 3 },
         ]);
         let mut built = Layer::new(&cfg, 7, 1, size);
+        built.enable_training();
         // make neuron 0's row non-trivial (+1 / -1 / 0 mix) then repack so codes differ from init
         let ts = built.total_slots;
         for s in 0..ts {
-            built.shadow[s] = match s % 3 { 0 => 0.0, 1 => 2.0, _ => -2.0 };
+            built.train.as_mut().unwrap().shadow[s] = match s % 3 { 0 => 0.0, 1 => 2.0, _ => -2.0 };
         }
         built.repack_row(0);
-        let rebuilt = Layer::from_parts(
+        let mut rebuilt = Layer::from_parts(
             built.topology.clone(),
             built.leak,
             built.cooldown_base,
@@ -393,6 +424,8 @@ mod tests {
             size,
         )
         .unwrap();
+        assert!(rebuilt.train.is_none(), "from_parts is inference-lean");
+        rebuilt.enable_training(); // reconstruct shadow = decode(codes) to check the load identity
         assert_eq!(rebuilt.topology, built.topology);
         assert_eq!(rebuilt.threshold, built.threshold);
         assert_eq!(rebuilt.occ, built.occ);
@@ -404,8 +437,9 @@ mod tests {
         assert_eq!(rebuilt.offsets, built.offsets);
         assert_eq!(rebuilt.off_flat, built.off_flat);
         // shadow is the decode of codes (inference-authoritative), runtime zeroed
-        for s in 0..rebuilt.shadow.len() {
-            assert_eq!(rebuilt.shadow[s], rebuilt.weight_at(s) as f32);
+        let rebuilt_shadow = &rebuilt.train.as_ref().unwrap().shadow;
+        for s in 0..rebuilt_shadow.len() {
+            assert_eq!(rebuilt_shadow[s], rebuilt.weight_at(s) as f32);
         }
         assert!(rebuilt.potential.iter().all(|&p| p == 0));
         assert!(rebuilt.adapt.iter().all(|&a| a == 0));
@@ -434,11 +468,15 @@ mod tests {
         let size = 8u32;
         let cfg = lc(vec![TopologyLevel { level: 1, radius: 2, count: 4 }]);
         let mut l = Layer::new(&cfg, 7, 0, size);
+        l.enable_training();
         let ts = l.total_slots;
-        l.shadow[0 * ts + 0] = 2.0;
-        l.shadow[0 * ts + 1] = -3.0;
-        l.shadow[0 * ts + 2] = 0.05;
-        l.shadow[0 * ts + 3] = 0.0;
+        {
+            let sh = &mut l.train.as_mut().unwrap().shadow;
+            sh[0 * ts + 0] = 2.0;
+            sh[0 * ts + 1] = -3.0;
+            sh[0 * ts + 2] = 0.05;
+            sh[0 * ts + 3] = 0.0;
+        }
         l.repack_row(0);
         assert_eq!(l.weight_at(0 * ts + 0), 1);
         assert_eq!(l.weight_at(0 * ts + 1), -1);

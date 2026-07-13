@@ -193,13 +193,14 @@ mod tests {
     #[test]
     fn step_raises_weights_on_negative_signal() {
         let (mut net, entries) = net2(8);
+        net.enable_training();
         let ls = 64;
         let rec = dense_records(ls, 2, 6);
         let signal = vec![vec![0f32; ls], vec![-1.0f32; ls]]; // negative on layer 1 (the target)
         let p = EligParams { rec_tau: 4.0, elig_beta: 0.0, elig_psi_width: PSI_WIDTH, use_bump: false, adapt_decay: 6 };
-        let before: f32 = net.with_layer(0, |l| l.shadow.iter().sum());
+        let before: f32 = net.with_layer(0, |l| l.train.as_ref().unwrap().shadow.iter().sum());
         multilayer_dfa_step(&mut net, &entries, &rec, &signal, 0.02, &p);
-        let after: f32 = net.with_layer(0, |l| l.shadow.iter().sum());
+        let after: f32 = net.with_layer(0, |l| l.train.as_ref().unwrap().shadow.iter().sum());
         assert!(after > before, "negative target signal + positive eligibility raises L0 shadow: {before}->{after}");
     }
 }
