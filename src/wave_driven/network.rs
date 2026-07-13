@@ -28,6 +28,7 @@ pub struct Network {
     fired_bitset: Vec<Vec<u64>>,  // per layer: "did neuron fire this wave" (ceil(ls/64) words)
     pretr_active: Vec<Frontier>,  // per layer: sources with a live presynaptic trace
     dirty_rows: Vec<Frontier>,    // per layer: source neurons whose elig row got accrual
+    elig_active: Vec<Frontier>,   // per layer: sources fired since reset (εᵃ scan set, β≠0)
     elig_params: EligParams,
     #[allow(clippy::type_complexity)]
     listeners: Vec<Option<Box<dyn Fn(usize, &[u32]) + Send + Sync>>>,
@@ -76,6 +77,7 @@ impl Network {
             fired_bitset: (0..l).map(|_| vec![0u64; (ls + 63) / 64]).collect(),
             pretr_active: (0..l).map(|_| Frontier::new(ls)).collect(),
             dirty_rows: (0..l).map(|_| Frontier::new(ls)).collect(),
+            elig_active: (0..l).map(|_| Frontier::new(ls)).collect(),
             elig_params: EligParams::default(),
             listeners: (0..l).map(|_| None).collect(),
         }
@@ -189,7 +191,12 @@ impl Network {
         let l = self.layers.len();
         let decay = 1.0 - 1.0 / self.elig_params.rec_tau.max(1.0);
         let eps = self.elig_params.epsilon;
-        let Self { layers, fired_by_layer, fired_bitset, pretr_active, dirty_rows, .. } = self;
+        let beta = self.elig_params.elig_beta;
+        let eps_a_cut = self.elig_params.epsilon_a;
+        let use_ea = beta != 0.0;
+        // ρ per layer = 1 − 2^(−adapt_decay); εᵃ decays at the TARGET layer's ρ.
+        let rho: Vec<f32> = self.layers.iter().map(|lz| 1.0 - 2f32.powi(-(lz.adapt_decay as i32))).collect();
+        let Self { layers, fired_by_layer, fired_bitset, pretr_active, dirty_rows, elig_active, .. } = self;
 
         // 1. fired bitset + spike_count
         for z in 0..l {
@@ -225,47 +232,108 @@ impl Network {
                 pretr_active[z].push(j);
             }
         }
-
-        // 3. accrue: for each source with a live trace, scan its fan-out, add pretr where target fired
-        for z in 0..l {
-            if layers[z].train.is_none() {
-                continue;
+        if use_ea {
+            for z in 0..l {
+                for &j in &fired_by_layer[z] {
+                    elig_active[z].push(j);
+                }
             }
-            let ts = layers[z].total_slots;
-            let Layer { topology, slot_bases, occ_wpn, occ, offsets, train, .. } = &mut layers[z];
-            let tr = train.as_mut().unwrap();
-            for &iu in &pretr_active[z].list {
-                let i = iu as usize;
-                let pr = tr.pretr[i];
-                if pr == 0.0 {
+        }
+
+        // 3. accrual
+        if !use_ea {
+            // Phase 2a: membrane, over pretr_active
+            for z in 0..l {
+                if layers[z].train.is_none() {
                     continue;
                 }
-                let (sx, sy) = xy_of(iu, size);
-                for (e_idx, entry) in topology.iter().enumerate() {
-                    let tz_i = z as i32 + entry.level;
-                    if tz_i < 0 || tz_i as usize >= l {
+                let ts = layers[z].total_slots;
+                let Layer { topology, slot_bases, occ_wpn, occ, offsets, train, .. } = &mut layers[z];
+                let tr = train.as_mut().unwrap();
+                for &iu in &pretr_active[z].list {
+                    let i = iu as usize;
+                    let pr = tr.pretr[i];
+                    if pr == 0.0 {
                         continue;
                     }
-                    let tz = tz_i as usize;
-                    let sbase = slot_bases[e_idx];
-                    let wpn = occ_wpn[e_idx];
-                    let words = &occ[e_idx][i * wpn..i * wpn + wpn];
-                    let fb = &fired_bitset[tz];
-                    let mut rank = 0usize;
-                    for (wi, &w0) in words.iter().enumerate() {
-                        let mut word = w0;
-                        let cbase = wi * 64;
-                        while word != 0 {
-                            let bit = word.trailing_zeros() as usize;
-                            let cell = cbase + bit;
-                            let (dx, dy) = offsets[e_idx][cell];
-                            let j = local_of(wrap(sx, dx as i32, size), wrap(sy, dy as i32, size), size);
-                            if fb[(j >> 6) as usize] & (1u64 << (j & 63)) != 0 {
-                                tr.elig[i * ts + sbase + rank] += pr;
-                                dirty_rows[z].push(iu);
+                    let (sx, sy) = xy_of(iu, size);
+                    for (e_idx, entry) in topology.iter().enumerate() {
+                        let tz_i = z as i32 + entry.level;
+                        if tz_i < 0 || tz_i as usize >= l {
+                            continue;
+                        }
+                        let tz = tz_i as usize;
+                        let sbase = slot_bases[e_idx];
+                        let wpn = occ_wpn[e_idx];
+                        let words = &occ[e_idx][i * wpn..i * wpn + wpn];
+                        let fb = &fired_bitset[tz];
+                        let mut rank = 0usize;
+                        for (wi, &w0) in words.iter().enumerate() {
+                            let mut word = w0;
+                            let cbase = wi * 64;
+                            while word != 0 {
+                                let bit = word.trailing_zeros() as usize;
+                                let cell = cbase + bit;
+                                let (dx, dy) = offsets[e_idx][cell];
+                                let j = local_of(wrap(sx, dx as i32, size), wrap(sy, dy as i32, size), size);
+                                if fb[(j >> 6) as usize] & (1u64 << (j & 63)) != 0 {
+                                    tr.elig[i * ts + sbase + rank] += pr;
+                                    dirty_rows[z].push(iu);
+                                }
+                                rank += 1;
+                                word &= word - 1;
                             }
-                            rank += 1;
-                            word &= word - 1;
+                        }
+                    }
+                }
+            }
+        } else {
+            // εᵃ: over elig_active, with the adaptation-eligibility recursion (spike-ψ)
+            for z in 0..l {
+                if layers[z].train.is_none() {
+                    continue;
+                }
+                let ts = layers[z].total_slots;
+                let Layer { topology, slot_bases, occ_wpn, occ, offsets, train, .. } = &mut layers[z];
+                let tr = train.as_mut().unwrap();
+                for &iu in &elig_active[z].list {
+                    let i = iu as usize;
+                    let pr = tr.pretr[i]; // 0 if the presynaptic trace already decayed (silent-source coupling)
+                    let (sx, sy) = xy_of(iu, size);
+                    for (e_idx, entry) in topology.iter().enumerate() {
+                        let tz_i = z as i32 + entry.level;
+                        if tz_i < 0 || tz_i as usize >= l {
+                            continue;
+                        }
+                        let tz = tz_i as usize;
+                        let r_tz = rho[tz];
+                        let sbase = slot_bases[e_idx];
+                        let wpn = occ_wpn[e_idx];
+                        let words = &occ[e_idx][i * wpn..i * wpn + wpn];
+                        let fb = &fired_bitset[tz];
+                        let mut rank = 0usize;
+                        for (wi, &w0) in words.iter().enumerate() {
+                            let mut word = w0;
+                            let cbase = wi * 64;
+                            while word != 0 {
+                                let bit = word.trailing_zeros() as usize;
+                                let cell = cbase + bit;
+                                let (dx, dy) = offsets[e_idx][cell];
+                                let j = local_of(wrap(sx, dx as i32, size), wrap(sy, dy as i32, size), size);
+                                let widx = i * ts + sbase + rank;
+                                let ea = tr.eps_a[widx];
+                                let fired = fb[(j >> 6) as usize] & (1u64 << (j & 63)) != 0;
+                                let new_ea = if fired {
+                                    tr.elig[widx] += pr - beta * ea;
+                                    dirty_rows[z].push(iu);
+                                    pr + (r_tz - beta) * ea
+                                } else {
+                                    r_tz * ea
+                                };
+                                tr.eps_a[widx] = if new_ea.abs() < eps_a_cut { 0.0 } else { new_ea };
+                                rank += 1;
+                                word &= word - 1;
+                            }
                         }
                     }
                 }
@@ -341,7 +409,7 @@ impl Network {
     /// spike_count densely) and the per-wave work-sets. Called by `reset_state`.
     pub fn reset_eligibility(&mut self) {
         let l = self.layers.len();
-        let Self { layers, pretr_active, dirty_rows, fired_by_layer, fired_bitset, .. } = self;
+        let Self { layers, pretr_active, dirty_rows, elig_active, fired_by_layer, fired_bitset, .. } = self;
         for z in 0..l {
             let ts = layers[z].total_slots;
             if let Some(t) = layers[z].train.as_mut() {
@@ -351,6 +419,14 @@ impl Network {
                         t.elig[base + s] = 0.0;
                     }
                 }
+                if !t.eps_a.is_empty() {
+                    for &i in &elig_active[z].list {
+                        let base = i as usize * ts;
+                        for s in 0..ts {
+                            t.eps_a[base + s] = 0.0;
+                        }
+                    }
+                }
                 for &i in &pretr_active[z].list {
                     t.pretr[i as usize] = 0.0;
                 }
@@ -358,6 +434,7 @@ impl Network {
             }
             dirty_rows[z].clear();
             pretr_active[z].clear();
+            elig_active[z].clear();
             for &j in &fired_by_layer[z] {
                 fired_bitset[z][(j >> 6) as usize] &= !(1u64 << (j & 63));
             }
@@ -490,6 +567,31 @@ mod tests {
         net.dfa_update(&entries, &signal, 0.05);
         let after: f32 = net.with_layer(0, |l| l.train.as_ref().unwrap().shadow[0..l.total_slots].iter().sum());
         assert!(after > before, "negative target signal + positive eligibility raises L0 row-0 shadow: {before}->{after}");
+    }
+
+    #[test]
+    fn eps_a_accrual_changes_elig_and_is_deterministic() {
+        // Same net/input trained at β=0 vs β=0.4 must produce DIFFERENT elig (εᵃ has an effect),
+        // and two β=0.4 builds must match (determinism).
+        let cfg = {
+            let up = LayerConfig { topology: vec![TopologyLevel { level: 1, radius: 2, count: 8 }, TopologyLevel { level: 0, radius: 1, count: 3 }], leak: (3, 5), cooldown_base: 2, inhibitor_ratio: 0, threshold_jitter: 0, baseline_init: 3, adapt_bump: 5, adapt_decay: 6 };
+            let top = LayerConfig { topology: vec![], ..up.clone() };
+            Config { seed: 21, size: 8, layers: vec![up, top] }
+        };
+        let run = |beta: f32| {
+            let mut net = Network::new(cfg.clone());
+            net.set_elig_params(EligParams { rec_tau: 6.0, epsilon: 1.0 / 1024.0, elig_beta: beta, epsilon_a: 1.0 / 1024.0 });
+            net.enable_training();
+            for _ in 0..16 {
+                net.wave(&[0, 1, 2, 8, 9, 10]);
+            }
+            net.with_layer(0, |l| l.train.as_ref().unwrap().elig.clone())
+        };
+        let b0 = run(0.0);
+        let b4a = run(0.4);
+        let b4b = run(0.4);
+        assert_eq!(b4a, b4b, "β=0.4 deterministic");
+        assert_ne!(b0, b4a, "εᵃ (β=0.4) changes the eligibility vs β=0");
     }
 
     #[test]
