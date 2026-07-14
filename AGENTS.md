@@ -28,7 +28,7 @@ a strict improvement over FF across every benchmark and seed (XOR/flip-flop tie 
 distractor-XOR 700→995, parity N=4 587→837). The open questions are generality to larger sizes and
 *why* the topology works. **BPTT is out of scope — permanently; do not propose it.**
 
-## The two modules (read this before touching code)
+## The engine modules (read this before touching code)
 
 The crate is `wave_bitnet` + `bench` (`src/lib.rs` wires them up), plus a second, independent engine
 `wave_driven` that trades size-bound sweeps for **activity-bound** ones — each wave processes only a
@@ -50,6 +50,18 @@ cliff is tested, since that cliff may be a bump-ψ credit-starvation artifact, n
 `docs/superpowers/specs/2026-07-13-wave-driven-event-active-set-design.md`,
 `docs/superpowers/specs/2026-07-13-wave-driven-phase2-training-design.md`,
 `docs/superpowers/specs/2026-07-13-wave-driven-phase2b-adaptation-eligibility-design.md`.
+
+A **third** engine `wave_resonate` (an island duplicated from `wave_driven`) replaces LIF/ALIF
+integration with the **Balanced Resonate-and-Fire (BRF)** complex-membrane oscillator (Higuchi et al.,
+*Balanced Resonate-and-Fire Neurons*, ICML 2024 — the flagship complex variant), trained online **without
+BPTT** by a **HYPR**-style forward eligibility (Baronig et al. 2026): the sub-threshold `(x,y)` dynamics
+are linear, so RTRL is an exact, cheap 2-state per-synapse trace. It keeps the **ternary ±1/0 weight
+substrate** (the f32 membrane `x,y,q,ω,b′` is O(neurons)) but runs a **dense** oscillator update + a
+**sparse, firer-gated** ternary delivery — resonators ring continuously, so there is no membrane frontier.
+**Phase 1 (inference) is landed** (BRF dynamics validated by a bit-exact single-neuron oracle, divergence-
+free stability, resonance/frequency selectivity, deterministic forward); **Phase 2 (HYPR training) is
+next.** Spec: `docs/superpowers/specs/2026-07-14-wave-resonate-brf-hypr-design.md`; plan:
+`docs/superpowers/plans/2026-07-14-wave-resonate-phase1-inference.md`.
 
 - **`wave_bitnet/` — the engine.** A memory-lean integer spiking engine: topology is materialized once
   into a per-neuron neighborhood **occupancy bitset** (no per-wave hashing), and weights are stored as
@@ -332,6 +344,12 @@ src/
     network.rs           # Network: sparse/dense orchestration, injection-into-frontier, deferred one-hop swap, online eligibility accrual + dfa_update
     training.rs          # online activity-scaled multi-layer-DFA: EligParams(β,εᵃ)/Edge, spike-ψ membrane + ALIF εᵃ eligibility + bit-exact dense_eligibility oracle
     equivalence_tests.rs # (test-only) sparse==dense oracle + adapt_bump==0 wave_bitnet cross-check
+  wave_resonate/         # 3rd engine (island): BRF (complex resonate-and-fire) neurons + HYPR training; f32 membrane + ternary weights. Phase 1: inference
+    synapse.rs           # copied hash/topology helpers (verbatim from wave_driven)
+    config.rs            # BRF Config (global dt/gamma/theta_c) + LayerConfig (omega_init/b_offset_init/tau_out); validate enforces δ·ω ≤ 1
+    neurons.rs           # BRF Layer SoA (f32 x,y,q + per-neuron ω,b') + pw() divergence boundary + occupancy bitset + 2-bit codes
+    wave.rs              # process_layer — dense complex-oscillator update + firer-gated ternary delivery (single-neuron reference oracle)
+    network.rs           # Network: orchestration, deferred one-hop swap, L0 transducer, leaky-integrator readout, listeners
   bench/                 # experiment harness (public-API only, test-only) — the learning rules + tasks
     wave_bitnet_bench.rs # FF + side-car training harness (run_trial, build_signal, train_and_eval_best, tasks) + smoke benchmark
     wave_driven_bench.rs # wave_driven FF training harness (online eligibility) — trains above chance; ignored depth-8 smoke + online-vs-offline throughput
