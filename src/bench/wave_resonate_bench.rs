@@ -229,12 +229,56 @@ mod tests {
 
     // hidden_lr is ~100× the integer engines' (0.004): BRF's HYPR eligibility is δ-scaled (~0.05·…), so
     // the shadow needs a proportionally larger step to move the ternary codes.
+    // Backward-fed side-car (ported from wave_driven_bench::make_sidecar, BRF config):
+    // L0→L1(+1); L1→L3(+2 skip); L2 self(0)+L2→L3(+1); L3→L2(−1 back)+L3→L4(+1); L4 read.
+    fn make_sidecar(seed: u64, size: u32, uc: u32, ur: u32, n: u32, r: u32, theta_c: f32, b_off: (f32, f32), train_omega_b: bool) -> (Network, Vec<Vec<Edge>>) {
+        let mk = |topology| LayerConfig { topology, inhibitor_ratio: 0, omega_init: (5.0, 10.0), b_offset_init: b_off, tau_out: 20.0 };
+        let layers = vec![
+            mk(vec![TopologyLevel { level: 1, radius: ur, count: uc }]),
+            mk(vec![TopologyLevel { level: 2, radius: ur, count: uc }]),
+            mk(vec![TopologyLevel { level: 0, radius: r, count: n }, TopologyLevel { level: 1, radius: r, count: n }]),
+            mk(vec![TopologyLevel { level: -1, radius: r, count: n }, TopologyLevel { level: 1, radius: ur, count: uc }]),
+            mk(vec![]),
+        ];
+        let mut net = Network::new(Config { seed, size, dt: 0.05, gamma: 0.9, theta_c, layers });
+        net.set_elig_params(EligParams { dt: 0.05, eps_cut: 1e-6, train_omega_b });
+        net.enable_training();
+        let entries = vec![
+            vec![Edge { level: 1, count: uc as usize, radius: ur }],
+            vec![Edge { level: 2, count: uc as usize, radius: ur }],
+            vec![Edge { level: 0, count: n as usize, radius: r }, Edge { level: 1, count: n as usize, radius: r }],
+            vec![Edge { level: -1, count: n as usize, radius: r }, Edge { level: 1, count: uc as usize, radius: ur }],
+            vec![],
+        ];
+        (net, entries)
+    }
+
+    #[test]
+    #[ignore] // smoke (size 16): side-car builds + is live + trains above chance (--release --nocapture)
+    fn wave_resonate_sidecar_smoke_size16() {
+        let seed = 0xE9_0B_0A17u64;
+        let (mut net, entries) = make_sidecar(seed, 16, 32, 3, 8, 4, 0.1, (0.0, 0.2), false);
+        let (pct, sigma) = rate_profile(&mut net, 16, seed, 0, 16, 48);
+        eprintln!("side-car size16 rate% {pct:?} σ≈{sigma:.2}");
+        assert!(pct.iter().skip(1).any(|&r| r > 0.5), "side-car compute layers must be live: {pct:?}");
+        let mut cfg = ff_cfg();
+        cfg.size = 16;
+        cfg.present = 6;
+        cfg.delay = 8;
+        cfg.read = 8;
+        let task = |s: u64, t: usize| task_parity(s, t, 2);
+        let (best, at) = train_and_eval_best(&mut net, &entries, seed, seed, &cfg, task, 100, 4, 1500);
+        eprintln!("side-car size16 temporal-XOR: best {best}@{at}");
+        assert!(best > 600, "side-car should clear chance on temporal XOR: {best}");
+    }
+
     fn ff_cfg() -> TaskCfg {
         TaskCfg { size: 16, present: 6, delay: 4, read: 6, holdout: 200, readout_lr: 0.02, hidden_lr: 2.0, rate_reg: 0.0, rate_target: 0.1, train_omega_b: false, omega_b_lr: 0.0 }
     }
 
-    /// Per-layer firing rate (%/neuron/wave) over a cue-driven window — the liveness diagnostic.
-    fn rate_profile(net: &mut Network, size: u32, task_seed: u64, class: usize, warmup: usize, waves: usize) -> Vec<f64> {
+    /// Per-layer firing rate (%/neuron/wave) over a cue-driven window + a coarse σ (mean
+    /// consecutive-layer spike ratio over `1..l-1`) — the liveness + dynamics diagnostic.
+    fn rate_profile(net: &mut Network, size: u32, task_seed: u64, class: usize, warmup: usize, waves: usize) -> (Vec<f64>, f64) {
         let l = net.layer_count();
         let counts = Arc::new(Mutex::new(vec![0u64; l]));
         for z in 0..l {
@@ -253,7 +297,15 @@ mod tests {
         net.clear_listeners();
         let counts = std::mem::take(&mut *counts.lock().unwrap());
         let denom = ((size as u64) * (size as u64) * waves as u64) as f64;
-        counts.iter().map(|&s| (s as f64 / denom * 1000.0).round() / 10.0).collect()
+        let pct: Vec<f64> = counts.iter().map(|&s| (s as f64 / denom * 1000.0).round() / 10.0).collect();
+        let mut ratios = Vec::new();
+        for z in 1..l.saturating_sub(1) {
+            if counts[z] > 0 {
+                ratios.push(counts[z + 1] as f64 / counts[z] as f64);
+            }
+        }
+        let sigma = if ratios.is_empty() { 0.0 } else { ratios.iter().sum::<f64>() / ratios.len() as f64 };
+        (pct, sigma)
     }
 
     #[test]
@@ -264,7 +316,7 @@ mod tests {
         for &b_off in &[(0.0f32, 0.2f32), (0.1, 1.0)] {
             for &theta_c in &[0.05f32, 0.1, 0.2, 0.5, 1.0] {
                 let (mut net, _e) = make_ff(seed, 16, 4, 24, 3, theta_c, b_off, false);
-                let pct = rate_profile(&mut net, 16, seed, 0, 20, 40);
+                let (pct, _sigma) = rate_profile(&mut net, 16, seed, 0, 20, 40);
                 eprintln!("  b_off {b_off:?} θ_c {theta_c:>4}: rate% {pct:?}");
             }
         }
