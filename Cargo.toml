@@ -5,11 +5,15 @@ edition = "2024"
 
 [dependencies]
 blake3 = { version = "1", optional = true }
+cudarc = { version = "0.19.8", optional = true, default-features = false }
 
 # Test-only: swap the procedural hash (`mix`) for BLAKE3 to rule out hash quality as a source of
 # seed-fragility. `cargo test --features strong_hash`. The engine stays dependency-free by default.
 [features]
 strong_hash = ["dep:blake3"]
+# GPU eligibility-kernel spike backend (wave_resonate_gpu::cuda). CUDA 12.4 via NVRTC + dynamic loading;
+# opt-in only — the default build stays std-only. `cargo test --features cuda`.
+cuda = ["dep:cudarc", "cudarc/cuda-12040", "cudarc/driver", "cudarc/nvrtc", "cudarc/std", "cudarc/fallback-dynamic-loading"]
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

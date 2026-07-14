@@ -9,6 +9,11 @@ use crate::wave_resonate::network::Network;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "cuda")]
+pub mod cuda;
+#[cfg(feature = "cuda")]
+pub use cuda::CudaBackend;
+
 /// Flat per-synapse edge list derived once from a `Network`. Synapse `e` corresponds to the CPU's
 /// `widx = i*ts + sbase + rank` within layer `z`, offset by `syn_base[z]`. `tgt_g[e]`/`src_g[e]` are the
 /// GLOBAL neuron ids (`layer*ls + local`) of the synapse's target and source.
@@ -240,6 +245,26 @@ pub fn run_backend<B: GpuBackend>(layout: &Layout, seq: &[Captured], dt: f32, cu
     }
     let dur = t.elapsed();
     (b.download_elig(), dur)
+}
+
+/// numpy-style elementwise closeness: every `|got-want| <= atol + rtol*|want|`. Returns
+/// `(all_ok, max_abs, max_rel)`. For GPU-vs-CPU float validation the ABSOLUTE agreement is the meaningful
+/// bar — relative error explodes for near-cutoff tiny eligibilities where absolute agreement is already at
+/// the f32 FMA-reordering floor (~1e-7), so a global-max relative check is the wrong statistic near zero.
+pub fn allclose(got: &[f32], want: &[f32], atol: f32, rtol: f32) -> (bool, f32, f32) {
+    let mut ok = true;
+    let (mut max_abs, mut max_rel) = (0f32, 0f32);
+    for (g, w) in got.iter().zip(want) {
+        let d = (g - w).abs();
+        max_abs = max_abs.max(d);
+        if w.abs() > 0.0 {
+            max_rel = max_rel.max(d / w.abs());
+        }
+        if d > atol + rtol * w.abs() {
+            ok = false;
+        }
+    }
+    (ok, max_abs, max_rel)
 }
 
 #[cfg(test)]
