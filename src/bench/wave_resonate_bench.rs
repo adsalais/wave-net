@@ -386,7 +386,9 @@ mod tests {
                 c.read = b.read;
                 c.holdout = 200;
                 c.train_omega_b = train_ob;
-                c.omega_b_lr = if train_ob { 2.0 } else { 0.0 };
+                // omega_b_lr 1.0: the LR-sweep sweet spot — helps the hard tasks without destabilizing the
+                // easy ones (lr 2.0 maxes distractor but breaks temporal-XOR).
+                c.omega_b_lr = if train_ob { 1.0 } else { 0.0 };
                 c
             };
             // returns (worst, mean)
@@ -429,6 +431,40 @@ mod tests {
     #[ignore] // the study (size 32, 3 seeds): the headline comparison — SLOW, run in background (--release --nocapture)
     fn wave_resonate_temporal_size32() {
         run_temporal_study(32, &[0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF], 2400);
+    }
+
+    #[test]
+    #[ignore] // pick omega_b_lr: does a smaller LR keep the distractor gain without hurting XOR? (--release --nocapture)
+    fn wave_resonate_omega_b_lr_sweep() {
+        let seeds = [0xE9_0B_0A17u64, 0x1234_5678];
+        eprintln!("== ω/b′ LR sweep (size 16, FF, 2 seeds): temporal-XOR (frozen 1000) vs distractor-XOR (frozen ~515) ==");
+        eprintln!("   {:<8} | XOR w/m | distractor w/m", "lr");
+        let tasks: [(&str, usize, usize, usize, fn(u64, usize) -> (Vec<usize>, usize)); 2] =
+            [("XOR", 8, 8, 2, |s, t| task_parity(s, t, 2)), ("distr", 20, 8, 3, |s, t| task_distractor(s, t))];
+        for &lr in &[0.0f32, 0.25, 0.5, 1.0, 2.0] {
+            let mut out = String::new();
+            for (_name, delay, read, _n, task) in tasks.iter() {
+                let bests: Vec<u64> = seeds
+                    .iter()
+                    .map(|&s| {
+                        let train_ob = lr != 0.0;
+                        let (mut net, e) = make_ff(s, 16, 5, 32, 3, 0.1, (0.0, 0.2), train_ob);
+                        let mut c = ff_cfg();
+                        c.size = 16;
+                        c.present = 6;
+                        c.delay = *delay;
+                        c.read = *read;
+                        c.holdout = 200;
+                        c.train_omega_b = train_ob;
+                        c.omega_b_lr = lr;
+                        train_and_eval_best(&mut net, &e, s, s, &c, task, 300, 3, 1500).0
+                    })
+                    .collect();
+                let (w, m) = (*bests.iter().min().unwrap(), bests.iter().sum::<u64>() / bests.len() as u64);
+                out.push_str(&format!(" {w:>4}/{m:<4} |"));
+            }
+            eprintln!("   lr {lr:<5} |{out}");
+        }
     }
 
     #[test]
