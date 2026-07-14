@@ -41,6 +41,7 @@ pub struct Layer {
     pub off_flat: Vec<Vec<i32>>,
     pub codes: Vec<u64>,
     pub ternary_threshold: f32,
+    pub train_omega_b: bool, // when training: also learn per-neuron ω/b′ (else frozen at init)
     // TRAINING state — present only while training is enabled (None on an inference-lean net).
     pub train: Option<TrainState>,
 }
@@ -57,6 +58,13 @@ pub struct TrainState {
     pub b_eff: Vec<f32>,       // ls
     pub psi: Vec<f32>,         // ls
     pub spike_count: Vec<u32>, // ls
+    // per-neuron parameter eligibility (ω, b′) — 2-state forward traces + accumulated grads (ls each)
+    pub g_om_x: Vec<f32>,
+    pub g_om_y: Vec<f32>,
+    pub g_bo_x: Vec<f32>,
+    pub g_bo_y: Vec<f32>,
+    pub om_grad: Vec<f32>,
+    pub bo_grad: Vec<f32>,
 }
 
 impl Layer {
@@ -191,6 +199,7 @@ impl Layer {
             off_flat,
             codes,
             ternary_threshold: 0.5,
+            train_omega_b: false,
             train: None,
         }
     }
@@ -213,6 +222,12 @@ impl Layer {
             b_eff: vec![0f32; ls],
             psi: vec![0f32; ls],
             spike_count: vec![0u32; ls],
+            g_om_x: vec![0f32; ls],
+            g_om_y: vec![0f32; ls],
+            g_bo_x: vec![0f32; ls],
+            g_bo_y: vec![0f32; ls],
+            om_grad: vec![0f32; ls],
+            bo_grad: vec![0f32; ls],
         });
     }
 
@@ -354,6 +369,21 @@ mod tests {
         assert_eq!(l.weight_at(1), -1);
         assert_eq!(l.weight_at(2), 0);
         assert_eq!(l.weight_at(3), 0);
+    }
+
+    #[test]
+    fn enable_training_allocates_param_eligibility() {
+        let size = 8u32;
+        let cfg = lc(vec![TopologyLevel { level: 1, radius: 2, count: 4 }]);
+        let mut l = Layer::new(&cfg, 0.05, 0.9, 1.0, 3, 0, size);
+        assert!(!l.train_omega_b, "default off");
+        l.enable_training();
+        let ls = l.x.len();
+        let t = l.train.as_ref().unwrap();
+        assert_eq!(t.g_om_x.len(), ls);
+        assert_eq!(t.g_bo_y.len(), ls);
+        assert_eq!(t.om_grad.len(), ls);
+        assert!(t.g_om_x.iter().all(|&v| v == 0.0) && t.om_grad.iter().all(|&v| v == 0.0));
     }
 
     #[test]
