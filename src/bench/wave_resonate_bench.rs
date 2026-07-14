@@ -166,6 +166,49 @@ mod tests {
         (vec![c], c)
     }
 
+    /// N-bit sequential parity: N deterministic cue bits, label = their XOR. (N=2 is temporal XOR.)
+    fn task_parity(seed: u64, t: usize, n: usize) -> (Vec<usize>, usize) {
+        let bits: Vec<usize> = (0..n).map(|i| (mix(key(seed, t as u32, 0, i as u32, 51)) & 1) as usize).collect();
+        let label = bits.iter().fold(0usize, |a, &b| a ^ b);
+        (bits, label)
+    }
+
+    /// `[a, distractor, b]` where the middle is a label-irrelevant cue (class 2); label = a XOR b.
+    fn task_distractor(seed: u64, trial: usize) -> (Vec<usize>, usize) {
+        let a = (mix(key(seed, trial as u32, 0, 0, 51)) & 1) as usize;
+        let b = (mix(key(seed, trial as u32, 0, 0, 53)) & 1) as usize;
+        (vec![a, 2, b], a ^ b)
+    }
+
+    /// `n_ops` set(class 0)/reset(class 1) ops; label = final state (set -> on 1, reset -> off 0).
+    fn task_flipflop(seed: u64, trial: usize, n_ops: usize) -> (Vec<usize>, usize) {
+        let ops: Vec<usize> = (0..n_ops).map(|i| (mix(key(seed, trial as u32, 0, i as u32, 57)) & 1) as usize).collect();
+        let last = *ops.last().unwrap();
+        (ops, if last == 0 { 1 } else { 0 })
+    }
+
+    #[test]
+    fn task_labels_correct() {
+        for trial in 0..25 {
+            let (bits, label) = task_parity(42, trial, 4);
+            assert_eq!(bits.len(), 4);
+            assert!(bits.iter().all(|&b| b <= 1));
+            assert_eq!(label, bits.iter().fold(0, |a, &b| a ^ b), "parity label is the XOR of the bits");
+
+            let (classes, dlabel) = task_distractor(42, trial);
+            assert_eq!(classes.len(), 3);
+            assert_eq!(classes[1], 2, "middle cue is the class-2 distractor");
+            assert!(classes[0] <= 1 && classes[2] <= 1);
+            assert_eq!(dlabel, classes[0] ^ classes[2], "distractor label ignores the middle cue");
+
+            let (ops, flabel) = task_flipflop(42, trial, 4);
+            assert_eq!(ops.len(), 4);
+            assert!(ops.iter().all(|&o| o <= 1));
+            let last = *ops.last().unwrap();
+            assert_eq!(flabel, if last == 0 { 1 } else { 0 }, "flip-flop label is the final state");
+        }
+    }
+
     fn make_ff(seed: u64, size: u32, layers: usize, up_count: u32, up_radius: u32, theta_c: f32, b_off: (f32, f32), train_omega_b: bool) -> (Network, Vec<Vec<Edge>>) {
         let lc = LayerConfig {
             topology: vec![TopologyLevel { level: 1, radius: up_radius, count: up_count }],
