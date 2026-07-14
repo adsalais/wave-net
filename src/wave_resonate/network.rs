@@ -302,6 +302,12 @@ impl Network {
                     }
                 }
                 t.spike_count.iter_mut().for_each(|c| *c = 0);
+                t.g_om_x.iter_mut().for_each(|v| *v = 0.0);
+                t.g_om_y.iter_mut().for_each(|v| *v = 0.0);
+                t.g_bo_x.iter_mut().for_each(|v| *v = 0.0);
+                t.g_bo_y.iter_mut().for_each(|v| *v = 0.0);
+                t.om_grad.iter_mut().for_each(|v| *v = 0.0);
+                t.bo_grad.iter_mut().for_each(|v| *v = 0.0);
             }
             elig_active[z].clear();
             for w in elig_mark[z].iter_mut() {
@@ -336,8 +342,10 @@ impl Network {
     }
 
     pub fn enable_training(&mut self) {
+        let tob = self.elig_params.train_omega_b;
         for l in self.layers.iter_mut() {
             l.enable_training();
+            l.train_omega_b = tob;
         }
     }
     pub fn disable_training(&mut self) {
@@ -350,6 +358,29 @@ impl Network {
     }
     pub fn set_elig_params(&mut self, p: EligParams) {
         self.elig_params = p;
+        for l in self.layers.iter_mut() {
+            l.train_omega_b = p.train_omega_b;
+        }
+    }
+
+    /// Apply one DFA update to the per-neuron BRF params: for each compute layer `z` (train_omega_b, not
+    /// transducer/readout), `ω[j] += −lr·signal[z][j]·om_grad[j]` (clamped to keep `δ·ω ≤ 1`), and
+    /// `b′[j] += −lr·signal[z][j]·bo_grad[j]` (clamped `≥ 0`). No-op when `train_omega_b` is off (grads 0).
+    pub fn omega_b_update(&mut self, signal: &[Vec<f32>], lr: f32) {
+        let l = self.layers.len();
+        for z in 0..l {
+            let Layer { omega, b_off, train, transducer, readout, train_omega_b, dt, .. } = &mut self.layers[z];
+            if !*train_omega_b || *transducer || *readout {
+                continue;
+            }
+            let Some(t) = train.as_ref() else { continue };
+            let om_hi = 0.99 / *dt;
+            for j in 0..omega.len() {
+                let s = signal[z][j];
+                omega[j] = (omega[j] - lr * s * t.om_grad[j]).clamp(0.5, om_hi);
+                b_off[j] = (b_off[j] - lr * s * t.bo_grad[j]).max(0.0);
+            }
+        }
     }
     /// The per-layer topology edges (source-layer view), built at construction. Convenience for callers
     /// that drive `dfa_update` (the DFA credit wiring lines up index-for-index with these).
@@ -535,6 +566,55 @@ mod training_tests {
         net.dfa_update(&entries, &signal, 0.05);
         let after: f32 = net.with_layer(0, |l| l.train.as_ref().unwrap().shadow.iter().sum());
         assert!(after != before, "a negative signal × accrued eligibility moves the shadow: {before}->{after}");
+    }
+
+    #[test]
+    fn omega_b_frozen_when_disabled() {
+        let mut net = Network::new(two_layer(8));
+        net.enable_training(); // train_omega_b default false
+        let before = net.with_layer(1, |l| (l.omega.clone(), l.b_off.clone()));
+        for _ in 0..30 {
+            net.wave(&[0, 1, 2, 8, 9, 10]);
+        }
+        let ls = 64usize;
+        let signal = vec![vec![0f32; ls], vec![-1.0f32; ls]];
+        net.omega_b_update(&signal, 0.5);
+        let after = net.with_layer(1, |l| (l.omega.clone(), l.b_off.clone()));
+        assert_eq!(before, after, "ω/b′ frozen when train_omega_b=false");
+    }
+
+    #[test]
+    fn omega_b_train_moves_params_within_clamp() {
+        let mut net = Network::new(two_layer(8));
+        net.set_elig_params(EligParams { dt: 0.05, eps_cut: 1e-6, train_omega_b: true });
+        net.enable_training();
+        let before = net.with_layer(1, |l| l.omega.clone());
+        for _ in 0..30 {
+            net.wave(&[0, 1, 2, 8, 9, 10]);
+        }
+        let ls = 64usize;
+        let signal = vec![vec![0f32; ls], vec![-1.0f32; ls]];
+        net.omega_b_update(&signal, 5.0);
+        net.with_layer(1, |l| {
+            assert!(l.omega != before, "ω moves when trained");
+            assert!(l.omega.iter().all(|&w| w >= 0.5 && w <= 0.99 / 0.05), "ω stays within δω≤1 clamp");
+            assert!(l.b_off.iter().all(|&b| b >= 0.0), "b′ stays ≥ 0");
+        });
+    }
+
+    #[test]
+    fn reset_clears_param_eligibility() {
+        let mut net = Network::new(two_layer(8));
+        net.set_elig_params(EligParams { dt: 0.05, eps_cut: 1e-6, train_omega_b: true });
+        net.enable_training();
+        for _ in 0..20 {
+            net.wave(&[0, 1, 2, 8, 9, 10]);
+        }
+        net.reset_state();
+        net.with_layer(1, |l| {
+            let t = l.train.as_ref().unwrap();
+            assert!(t.om_grad.iter().all(|&v| v == 0.0) && t.g_om_x.iter().all(|&v| v == 0.0));
+        });
     }
 
     #[test]
