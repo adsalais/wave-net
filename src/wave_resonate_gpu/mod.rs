@@ -7,6 +7,7 @@
 use crate::wave_resonate::config::Config;
 use crate::wave_resonate::network::Network;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// Flat per-synapse edge list derived once from a `Network`. Synapse `e` corresponds to the CPU's
 /// `widx = i*ts + sbase + rank` within layer `z`, offset by `syn_base[z]`. `tgt_g[e]`/`src_g[e]` are the
@@ -160,6 +161,87 @@ pub fn cpu_accrue(layout: &Layout, seq: &[Captured], dt: f32, cut: f32) -> Vec<f
     elig
 }
 
+/// A backend advances the per-synapse eligibility one wave at a time and can read back `elig`. `step`
+/// must be synchronous (complete before returning) so `run_backend` measures true wall time.
+pub trait GpuBackend {
+    fn new(layout: &Layout, dt: f32, cut: f32) -> Self
+    where
+        Self: Sized;
+    fn reset(&mut self);
+    fn step(&mut self, cap: &Captured);
+    fn download_elig(&self) -> Vec<f32>;
+}
+
+/// Reference backend: the same per-synapse recursion as `cpu_accrue`, but one wave per `step` with
+/// resident `eps_x/eps_y/elig` — the shape every GPU backend implements. Also the harness baseline.
+pub struct CpuBackend {
+    tgt_g: Vec<u32>,
+    src_g: Vec<u32>,
+    eps_x: Vec<f32>,
+    eps_y: Vec<f32>,
+    elig: Vec<f32>,
+    dt: f32,
+    cut: f32,
+}
+
+impl GpuBackend for CpuBackend {
+    fn new(layout: &Layout, dt: f32, cut: f32) -> Self {
+        CpuBackend {
+            tgt_g: layout.tgt_g.clone(),
+            src_g: layout.src_g.clone(),
+            eps_x: vec![0.0; layout.n],
+            eps_y: vec![0.0; layout.n],
+            elig: vec![0.0; layout.n],
+            dt,
+            cut,
+        }
+    }
+    fn reset(&mut self) {
+        self.eps_x.iter_mut().for_each(|v| *v = 0.0);
+        self.eps_y.iter_mut().for_each(|v| *v = 0.0);
+        self.elig.iter_mut().for_each(|v| *v = 0.0);
+    }
+    fn step(&mut self, cap: &Captured) {
+        let (dt, cut) = (self.dt, self.cut);
+        for e in 0..self.elig.len() {
+            let j = self.tgt_g[e] as usize;
+            let i = self.src_g[e] as usize;
+            let inj = if cap.prev_fired_g[i] != 0 { dt } else { 0.0 };
+            let (b, om, psi) = (cap.b_eff_g[j], cap.omega_g[j], cap.psi_g[j]);
+            let (ex, ey) = (self.eps_x[e], self.eps_y[e]);
+            let coef = 1.0 + dt * b;
+            let mut nex = coef * ex - dt * om * ey + inj;
+            let mut ney = dt * om * ex + coef * ey;
+            if nex.abs() < cut {
+                nex = 0.0;
+            }
+            if ney.abs() < cut {
+                ney = 0.0;
+            }
+            self.eps_x[e] = nex;
+            self.eps_y[e] = ney;
+            if psi != 0.0 && nex != 0.0 {
+                self.elig[e] += psi * nex;
+            }
+        }
+    }
+    fn download_elig(&self) -> Vec<f32> {
+        self.elig.clone()
+    }
+}
+
+/// Run a full capture sequence through a backend, returning (final elig, wall-clock over the wave loop).
+/// Construction is excluded from timing; the loop is the per-wave `step` (upload + launch for GPU).
+pub fn run_backend<B: GpuBackend>(layout: &Layout, seq: &[Captured], dt: f32, cut: f32) -> (Vec<f32>, Duration) {
+    let mut b = B::new(layout, dt, cut);
+    let t = Instant::now();
+    for cap in seq {
+        b.step(cap);
+    }
+    let dur = t.elapsed();
+    (b.download_elig(), dur)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,5 +312,17 @@ mod tests {
         }
         assert!(max_abs < 1e-6, "cpu_accrue matches oracle, max_abs={max_abs}");
         assert!(flat.iter().any(|&e| e != 0.0), "some eligibility accrued");
+    }
+
+    #[test]
+    fn cpu_backend_stepwise_equals_batch() {
+        let size = 8u32;
+        let cfg = ff_cfg(size, 3);
+        let inputs: Vec<Vec<u32>> =
+            (0..30).map(|w| if w % 3 == 0 { vec![0u32, 1, 2] } else { vec![] }).collect();
+        let (layout, seq) = capture_inputs(&cfg, &inputs);
+        let batch = cpu_accrue(&layout, &seq, 0.05, 1e-6);
+        let (stepwise, _dur) = run_backend::<CpuBackend>(&layout, &seq, 0.05, 1e-6);
+        assert_eq!(batch, stepwise, "stepwise CpuBackend == batch cpu_accrue");
     }
 }
