@@ -419,3 +419,47 @@ so it is **markedly slower than the integer engines**: the size-32 / 3-seed / 4-
 standing perf-then-scaling note) arriving earlier for the f32 engine — size ≥ 64 multi-seed sweeps are not
 practical without the deferred fixed-point port / perf pass. All experiments are `#[ignore]`d
 (`bench::wave_resonate_bench`); no config was silently capped.
+
+## GPU eligibility kernel spike — CUDA + WebGPU (2026-07-14) — **GO**
+
+A de-risking spike (spec `2026-07-14-wave-resonate-gpu-eligibility-spike-design.md`, plan
+`.../plans/2026-07-14-wave-resonate-gpu-eligibility-spike.md`) porting **only** `accrue_eligibility` — the
+profiled **85%** of training cost (see the profiling below / `benches/throughput_resonate.rs`) — to a GPU
+kernel on **two hand-written backends** behind a `GpuBackend` trait: CUDA (cudarc 0.19 + NVRTC `.cu`) and
+WebGPU (wgpu 29 + WGSL). The accrual is turned into a **one-thread-per-synapse map** over a flat
+per-synapse edge list (`tgt_g`/`src_g` global ids precomputed once), with `eps_x/eps_y/elig` resident on
+device and only the `O(L·ls)` per-neuron arrays uploaded each wave. Code: `src/wave_resonate_gpu/`
+(feature-gated `cuda`/`wgpu`; the default build stays std-only). Throughput harness:
+`examples/profile_resonate_gpu.rs`.
+
+**Correctness.** Both backends validated vs the CPU `dense_eligibility` oracle (via a std-only flat
+reference `cpu_accrue`, itself bit-close to the oracle, `max_abs < 1e-6`). GPU-vs-CPU agreement is at the
+**f32 FMA-reordering floor**: `max_abs ≤ 3.6e-6` (< the 1e-5 bar) at every size. The elevated `max_rel`
+(up to ~4e-2 at size 128) is the near-zero artifact — a ~3.6e-6 absolute difference dividing into a
+near-cutoff eligibility of magnitude ~1e-4 — so validation uses numpy-style `allclose(atol=1e-5,
+rtol=1e-3)`, which every element passes on the absolute term alone.
+
+**Throughput** (RTX 3060 Laptop, 256 waves, FF 5-layer r3/c32 top-empty, ~12% L0 drive; waves/s, ×vs CPU):
+
+| size | synapses | CPU (flat ref) | CUDA | WebGPU |
+|-----:|---------:|---------------:|-----:|-------:|
+| 32   | 131,072  | 2208 | **32,329 (14.6×)** | 10,862 (4.9×) |
+| 64   | 524,288  |  545 | **7,650 (14.0×)**  | 4,598 (8.4×)  |
+| 128  | 2,097,152|  134 | **2,167 (16.1×)**  | 1,435 (10.7×) |
+
+**Findings.**
+- **CUDA holds ~14–16× across all sizes**; at size 128 (the CPU-blocked regime) it is **16.1×**.
+- **WebGPU advantage GROWS with size (4.9× → 10.7×)** — portable at ~⅔ the CUDA throughput at size 128.
+- The GPU lead holds/grows with size — the property required, since the CPU engine is blocked at size ≥ 64.
+- The flat edge-list layout is itself a CPU win (the `cpu_accrue` reference removes the per-wave
+  occupancy-scan + `decode` that the profiling charged ~13% of accrual to).
+- **End-to-end projection:** accrual is 85% of training; forward ~7%, `dfa_update` ~4%. Moving only the
+  accrual to CUDA (forward left on CPU) projects `1/(0.15 + 0.85/16) ≈ 4.9×` end-to-end at minimum, and the
+  spike's numbers *include* the per-wave neuron-array upload the full engine would eliminate (forward
+  on-device) — so this is a conservative floor.
+
+**Verdict: GO** for a full GPU-engine spec. CUDA at 16× and WebGPU at ~11× on size 128, both validated,
+clear the ~5×-at-size-≥64 bar and unblock the size-64/128 multi-seed scaling study. Deferred to the
+full-engine spec (non-goals here): forward/delivery/`dfa_update`/ω-b′ on GPU, keeping the whole per-wave
+loop device-resident (no transfer), bench-harness integration, sizes > 128, and (for browser portability)
+packing the index arrays into the 8-storage-buffer WebGPU baseline.
