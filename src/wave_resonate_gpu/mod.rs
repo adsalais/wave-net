@@ -14,6 +14,11 @@ pub mod cuda;
 #[cfg(feature = "cuda")]
 pub use cuda::CudaBackend;
 
+#[cfg(feature = "wgpu")]
+pub mod wgpu;
+#[cfg(feature = "wgpu")]
+pub use wgpu::WgpuBackend;
+
 /// Flat per-synapse edge list derived once from a `Network`. Synapse `e` corresponds to the CPU's
 /// `widx = i*ts + sbase + rank` within layer `z`, offset by `syn_base[z]`. `tgt_g[e]`/`src_g[e]` are the
 /// GLOBAL neuron ids (`layer*ls + local`) of the synapse's target and source.
