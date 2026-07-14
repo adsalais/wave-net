@@ -22,6 +22,7 @@ pub struct Network {
     entries: Vec<Vec<Edge>>,           // per layer: topology edges (source-layer view)
     fired_by_layer: Vec<Vec<u32>>,     // this wave's firers per layer (captured during the sweep)
     prev_fired_bitset: Vec<Vec<u64>>,  // PREVIOUS wave's firers per layer (source injection z_i^{t−1})
+    cur_fired_bitset: Vec<Vec<u64>>,   // THIS wave's firers per layer (keeps a just-fired source alive one wave)
     elig_active: Vec<Vec<u32>>,        // per layer: sources with a live ε trace (accrual scan set)
     elig_mark: Vec<Vec<u64>>,          // dedup bitset for elig_active
     dirty_rows: Vec<Vec<u32>>,         // per layer: sources whose elig row got accrual (drives dfa_update)
@@ -66,6 +67,7 @@ impl Network {
             entries,
             fired_by_layer: (0..l).map(|_| Vec::new()).collect(),
             prev_fired_bitset: (0..l).map(|_| vec![0u64; words]).collect(),
+            cur_fired_bitset: (0..l).map(|_| vec![0u64; words]).collect(),
             elig_active: (0..l).map(|_| Vec::new()).collect(),
             elig_mark: (0..l).map(|_| vec![0u64; words]).collect(),
             dirty_rows: (0..l).map(|_| Vec::new()).collect(),
@@ -115,13 +117,17 @@ impl Network {
         let b_snap: Vec<Vec<f32>> = self.layers.iter().map(|lz| lz.train.as_ref().map(|t| t.b_eff.clone()).unwrap_or_default()).collect();
         let psi_snap: Vec<Vec<f32>> = self.layers.iter().map(|lz| lz.train.as_ref().map(|t| t.psi.clone()).unwrap_or_default()).collect();
         let om_snap: Vec<Vec<f32>> = self.layers.iter().map(|lz| lz.omega.clone()).collect();
-        let Self { layers, fired_by_layer, prev_fired_bitset, elig_active, elig_mark, dirty_rows, dirty_mark, .. } = self;
+        let Self { layers, fired_by_layer, prev_fired_bitset, cur_fired_bitset, elig_active, elig_mark, dirty_rows, dirty_mark, .. } = self;
 
-        // 1. add this wave's firers to each layer's active set (dedup)
+        // 1. add this wave's firers to each layer's active set (dedup) + build cur_fired_bitset
         for z in 0..l {
+            for w in cur_fired_bitset[z].iter_mut() {
+                *w = 0;
+            }
             for &i in &fired_by_layer[z] {
                 let w = (i >> 6) as usize;
                 let bit = 1u64 << (i & 63);
+                cur_fired_bitset[z][w] |= bit;
                 if elig_mark[z][w] & bit == 0 {
                     elig_mark[z][w] |= bit;
                     elig_active[z].push(i);
@@ -197,7 +203,12 @@ impl Network {
                         }
                     }
                 }
-                if any_live {
+                // Keep a source while it can still contribute: a live ε trace, OR it fired THIS wave (its
+                // injection δ·z_i lands NEXT wave — dropping it now would lose that injection, the bug the
+                // dense oracle exposed). A source that fired last wave is already covered: `inj` was applied
+                // this wave, so its ε is now live (`any_live`).
+                let fired_now = cur_fired_bitset[z][(iu >> 6) as usize] & (1u64 << (iu & 63)) != 0;
+                if any_live || fired_now {
                     scan[keep] = iu;
                     keep += 1;
                 } else {
@@ -208,15 +219,8 @@ impl Network {
             elig_active[z] = scan;
         }
 
-        // 3. roll prev_fired_bitset ← this wave's firers (source injection for next wave)
-        for z in 0..l {
-            for w in prev_fired_bitset[z].iter_mut() {
-                *w = 0;
-            }
-            for &i in &fired_by_layer[z] {
-                prev_fired_bitset[z][(i >> 6) as usize] |= 1u64 << (i & 63);
-            }
-        }
+        // 3. roll prev_fired_bitset ← this wave's firers (source injection z_i^{t−1} for next wave)
+        std::mem::swap(prev_fired_bitset, cur_fired_bitset);
     }
 
     pub fn reset_state(&mut self) {
