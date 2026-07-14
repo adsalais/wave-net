@@ -223,6 +223,104 @@ impl Network {
         std::mem::swap(prev_fired_bitset, cur_fired_bitset);
     }
 
+    /// Apply one multi-layer-DFA update from the accumulated eligibility: for each trainable edge
+    /// (`tz = z + level ∈ [1, L)`), `shadow[i,edge,r] += −lr·signal[tz][j]·elig[i,edge,r]` over the dirty
+    /// rows, then repack each touched row. Targets decoded from the occupancy (inlined).
+    pub fn dfa_update(&mut self, entries: &[Vec<Edge>], signal: &[Vec<f32>], lr: f32) {
+        let size = self.size;
+        let l = self.layers.len();
+        let Self { layers, dirty_rows, .. } = self;
+        for z in 0..l {
+            if layers[z].train.is_none() {
+                continue;
+            }
+            for ri in 0..dirty_rows[z].len() {
+                let iu = dirty_rows[z][ri];
+                let i = iu as usize;
+                let mut touched = false;
+                {
+                    let ts = layers[z].total_slots;
+                    let Layer { slot_bases, occ_wpn, occ, offsets, train, .. } = &mut layers[z];
+                    let tr = train.as_mut().unwrap();
+                    let (sx, sy) = xy_of(iu, size);
+                    for (e_idx, edge) in entries[z].iter().enumerate() {
+                        let tz_i = z as i32 + edge.level;
+                        if tz_i < 1 || tz_i as usize >= l {
+                            continue;
+                        }
+                        let tz = tz_i as usize;
+                        let sbase = slot_bases[e_idx];
+                        let wpn = occ_wpn[e_idx];
+                        let words = &occ[e_idx][i * wpn..i * wpn + wpn];
+                        let mut rank = 0usize;
+                        for (wi, &w0) in words.iter().enumerate() {
+                            let mut word = w0;
+                            let cbase = wi * 64;
+                            while word != 0 {
+                                let bit = word.trailing_zeros() as usize;
+                                let cell = cbase + bit;
+                                let (dx, dy) = offsets[e_idx][cell];
+                                let j = local_of(wrap(sx, dx as i32, size), wrap(sy, dy as i32, size), size) as usize;
+                                let widx = i * ts + sbase + rank;
+                                let e = tr.elig[widx];
+                                if e != 0.0 {
+                                    tr.shadow[widx] += -lr * signal[tz][j] * e;
+                                    touched = true;
+                                }
+                                rank += 1;
+                                word &= word - 1;
+                            }
+                        }
+                    }
+                }
+                if touched {
+                    layers[z].repack_row(i);
+                }
+            }
+        }
+    }
+
+    /// Clear all per-trial training accumulators (elig over dirty rows, ε traces over the active set,
+    /// spike_count densely) and the per-wave work-sets. Called by `reset_state`.
+    pub fn reset_eligibility(&mut self) {
+        let l = self.layers.len();
+        let Self { layers, elig_active, elig_mark, dirty_rows, dirty_mark, prev_fired_bitset, cur_fired_bitset, fired_by_layer, .. } = self;
+        for z in 0..l {
+            let ts = layers[z].total_slots;
+            if let Some(t) = layers[z].train.as_mut() {
+                for &i in &dirty_rows[z] {
+                    let base = i as usize * ts;
+                    for s in 0..ts {
+                        t.elig[base + s] = 0.0;
+                    }
+                }
+                for &i in &elig_active[z] {
+                    let base = i as usize * ts;
+                    for s in 0..ts {
+                        t.eps_x[base + s] = 0.0;
+                        t.eps_y[base + s] = 0.0;
+                    }
+                }
+                t.spike_count.iter_mut().for_each(|c| *c = 0);
+            }
+            elig_active[z].clear();
+            for w in elig_mark[z].iter_mut() {
+                *w = 0;
+            }
+            dirty_rows[z].clear();
+            for w in dirty_mark[z].iter_mut() {
+                *w = 0;
+            }
+            for w in prev_fired_bitset[z].iter_mut() {
+                *w = 0;
+            }
+            for w in cur_fired_bitset[z].iter_mut() {
+                *w = 0;
+            }
+            fired_by_layer[z].clear();
+        }
+    }
+
     pub fn reset_state(&mut self) {
         for g in self.layers.iter_mut() {
             g.x.iter_mut().for_each(|v| *v = 0.0);
@@ -234,6 +332,7 @@ impl Network {
             d.iter_mut().for_each(|x| *x = 0);
         }
         self.wave_id = 0;
+        self.reset_eligibility();
     }
 
     pub fn enable_training(&mut self) {
@@ -419,5 +518,38 @@ mod training_tests {
         let b = run();
         assert_eq!(a, b, "deterministic elig");
         assert!(a.iter().any(|&e| e != 0.0), "some L0→L1 eligibility accrued once L1 fires");
+    }
+
+    #[test]
+    fn dfa_update_with_negative_signal_moves_eligible_shadow() {
+        let cfg = two_layer(8);
+        let entries = vec![vec![Edge { level: 1, count: 8, radius: 2 }], vec![]];
+        let mut net = Network::new(cfg);
+        net.enable_training();
+        for _ in 0..40 {
+            net.wave(&[0, 1, 2, 8, 9, 10]);
+        }
+        let ls = 64usize;
+        let signal = vec![vec![0f32; ls], vec![-1.0f32; ls]];
+        let before: f32 = net.with_layer(0, |l| l.train.as_ref().unwrap().shadow.iter().sum());
+        net.dfa_update(&entries, &signal, 0.05);
+        let after: f32 = net.with_layer(0, |l| l.train.as_ref().unwrap().shadow.iter().sum());
+        assert!(after != before, "a negative signal × accrued eligibility moves the shadow: {before}->{after}");
+    }
+
+    #[test]
+    fn reset_eligibility_clears_accumulators() {
+        let mut net = Network::new(two_layer(8));
+        net.enable_training();
+        for _ in 0..20 {
+            net.wave(&[0, 1, 2, 8, 9, 10]);
+        }
+        net.reset_state();
+        net.with_layer(0, |l| {
+            let t = l.train.as_ref().unwrap();
+            assert!(t.elig.iter().all(|&e| e == 0.0));
+            assert!(t.eps_x.iter().all(|&e| e == 0.0) && t.eps_y.iter().all(|&e| e == 0.0));
+            assert!(t.spike_count.iter().all(|&c| c == 0));
+        });
     }
 }
