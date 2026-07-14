@@ -4,7 +4,9 @@
 //! in the default build; the CUDA/wgpu backends are feature-gated. See
 //! docs/superpowers/specs/2026-07-14-wave-resonate-gpu-eligibility-spike-design.md.
 
+use crate::wave_resonate::config::Config;
 use crate::wave_resonate::network::Network;
+use std::sync::{Arc, Mutex};
 
 /// Flat per-synapse edge list derived once from a `Network`. Synapse `e` corresponds to the CPU's
 /// `widx = i*ts + sbase + rank` within layer `z`, offset by `syn_base[z]`. `tgt_g[e]`/`src_g[e]` are the
@@ -61,6 +63,103 @@ pub fn build_layout(net: &Network) -> Layout {
     Layout { n, ls, l, syn_base, tgt_g, src_g }
 }
 
+/// Per-wave forward outputs, packed by GLOBAL neuron id `g = z*ls + local` (length `L*ls` each).
+/// `prev_fired_g` is the PREVIOUS wave's firers (the source injection `z_i^{t-1}`); `omega_g` is constant
+/// while `train_omega_b=false` but captured per wave for generality.
+pub struct Captured {
+    pub b_eff_g: Vec<f32>,
+    pub omega_g: Vec<f32>,
+    pub psi_g: Vec<f32>,
+    pub prev_fired_g: Vec<u32>,
+}
+
+/// Drive a fresh training net on `inputs`, capturing each wave's (b_eff, psi, omega, prev_fired) into the
+/// global-id layout. Mirrors what `dense_eligibility` consumes, so `cpu_accrue`/the GPU kernels fed this
+/// reproduce the oracle. Returns the `Layout` (same net) alongside the per-wave captures.
+pub fn capture_inputs(cfg: &Config, inputs: &[Vec<u32>]) -> (Layout, Vec<Captured>) {
+    use crate::wave_resonate::training::EligParams;
+    let size = cfg.size;
+    let ls = (size as usize) * (size as usize);
+    let l = cfg.layers.len();
+    let mut net = Network::new(cfg.clone());
+    net.set_elig_params(EligParams { dt: cfg.dt, eps_cut: 1.0 / 1024.0, train_omega_b: false });
+    net.enable_training();
+    let layout = build_layout(&net);
+
+    // capture each wave's firers per layer via listeners (listener overwrites its slot each wave)
+    let cur: Arc<Mutex<Vec<Vec<u32>>>> = Arc::new(Mutex::new(vec![Vec::new(); l]));
+    for z in 0..l {
+        let c = cur.clone();
+        net.on_layer(z, Box::new(move |_w, f: &[u32]| c.lock().unwrap()[z] = f.to_vec()));
+    }
+
+    let mut prev_fired_g = vec![0u32; l * ls]; // wave 0: no previous firers
+    let mut seq = Vec::with_capacity(inputs.len());
+    for inp in inputs {
+        net.wave(inp);
+        let mut b_eff_g = vec![0f32; l * ls];
+        let mut omega_g = vec![0f32; l * ls];
+        let mut psi_g = vec![0f32; l * ls];
+        for z in 0..l {
+            net.with_layer(z, |lz| {
+                omega_g[z * ls..(z + 1) * ls].copy_from_slice(&lz.omega);
+                if let Some(t) = lz.train.as_ref() {
+                    b_eff_g[z * ls..(z + 1) * ls].copy_from_slice(&t.b_eff);
+                    psi_g[z * ls..(z + 1) * ls].copy_from_slice(&t.psi);
+                }
+            });
+        }
+        seq.push(Captured { b_eff_g, omega_g, psi_g, prev_fired_g: prev_fired_g.clone() });
+        // roll prev_fired ← THIS wave's firers for the next wave
+        prev_fired_g.iter_mut().for_each(|v| *v = 0);
+        let fired_now = cur.lock().unwrap();
+        for z in 0..l {
+            for &i in &fired_now[z] {
+                prev_fired_g[z * ls + i as usize] = 1;
+            }
+        }
+    }
+    net.clear_listeners();
+    (layout, seq)
+}
+
+/// The flat-edge-list eligibility reference — the EXACT per-synapse recursion the CUDA/WGSL kernels mirror.
+/// Per synapse `e`: advance the 2-state ε from the TARGET's (b_eff, ω, ψ) and the SOURCE's prev-spike,
+/// apply `eps_cut`, accumulate `elig += ψ·εˣ`. Per-synapse independent → order-free (matches the oracle).
+pub fn cpu_accrue(layout: &Layout, seq: &[Captured], dt: f32, cut: f32) -> Vec<f32> {
+    let n = layout.n;
+    let mut eps_x = vec![0f32; n];
+    let mut eps_y = vec![0f32; n];
+    let mut elig = vec![0f32; n];
+    for cap in seq {
+        for e in 0..n {
+            let j = layout.tgt_g[e] as usize;
+            let i = layout.src_g[e] as usize;
+            let inj = if cap.prev_fired_g[i] != 0 { dt } else { 0.0 };
+            let b = cap.b_eff_g[j];
+            let om = cap.omega_g[j];
+            let psi = cap.psi_g[j];
+            let ex = eps_x[e];
+            let ey = eps_y[e];
+            let coef = 1.0 + dt * b;
+            let mut nex = coef * ex - dt * om * ey + inj;
+            let mut ney = dt * om * ex + coef * ey;
+            if nex.abs() < cut {
+                nex = 0.0;
+            }
+            if ney.abs() < cut {
+                ney = 0.0;
+            }
+            eps_x[e] = nex;
+            eps_y[e] = ney;
+            if psi != 0.0 && nex != 0.0 {
+                elig[e] += psi * nex;
+            }
+        }
+    }
+    elig
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,5 +203,32 @@ mod tests {
                 });
             }
         });
+    }
+
+    #[test]
+    fn cpu_accrue_matches_dense_eligibility_oracle() {
+        use crate::wave_resonate::training::{dense_eligibility, EligParams};
+        let size = 8u32;
+        let ls = (size * size) as usize;
+        let cfg = ff_cfg(size, 3);
+        // a representative drive sequence (some cue waves, some silent)
+        let inputs: Vec<Vec<u32>> =
+            (0..40).map(|w| if w % 3 == 0 { vec![0u32, 1, 2, 8, 9, 10] } else { vec![] }).collect();
+        let p = EligParams { dt: 0.05, eps_cut: 1e-6, train_omega_b: false };
+
+        let oracle = dense_eligibility(&cfg, &inputs, &p); // Vec<Vec<f32>> per layer, indexed by widx
+        let (layout, seq) = capture_inputs(&cfg, &inputs);
+        let flat = cpu_accrue(&layout, &seq, p.dt, p.eps_cut);
+
+        let l = cfg.layers.len();
+        let mut max_abs = 0f32;
+        for z in 0..l {
+            for widx in 0..oracle[z].len() {
+                let e = layout.syn_base[z] + widx;
+                max_abs = max_abs.max((flat[e] - oracle[z][widx]).abs());
+            }
+        }
+        assert!(max_abs < 1e-6, "cpu_accrue matches oracle, max_abs={max_abs}");
+        assert!(flat.iter().any(|&e| e != 0.0), "some eligibility accrued");
     }
 }
