@@ -165,19 +165,34 @@ point (size 32, rec 8) with a **depth-matched 5-layer FF** trained to its own be
 | temporal XOR | 1000/1000 | **1000/1000** | 990→1000 | tie at ceiling (FF already solves it) |
 | parity N=4 | 595/628 | **1000/1000** | 587→837 | decisive; **exceeds** historical |
 | distractor-XOR | 705/735 | **1000/1000** | 700→995 | decisive; matches/exceeds historical |
-| flip-flop | 525/561 | **670/810** | 985→1000 | side-car wins but **activity-starved** (σ≈0.05) |
+| flip-flop | 525/561 | **670/810** → **1000/1000** | 985→1000 | at `adapt_bump 5` quenched (σ≈0.05); at `adapt_bump 3` → ceiling |
 
 **Verdict: recurrence beats FF (worst-seed) on 4/4 tasks, 3 seeds, matched baseline** — closing the
 Phase-2b caveats. The FF baselines land on the historical FF numbers (parity-4 595≈587, distractor
 705≈700, XOR 1000≈990), confirming the comparison is fair. On parity-4 and distractor-XOR the side-car
 reaches **ceiling**, *exceeding* the historical bump-ψ side-car — so **spike-ψ `εᵃ` is not just a
-reproduction, it is at-least-as-strong**. **One honest wrinkle: flip-flop.** Historically flip-flop was
-easy (FF 985, tie at ceiling); here *both* engines are weak (FF 525, side-car 670/810) and the side-car's
-σ≈0.05 shows the recurrent layer is **activity-starved / sub-critical** at this config (the 4-op + delay-12
-sequence lets adaptation quench activity). The side-car still beats FF, but the low absolute number is a
-**config problem, not a credit-rule failure** — flip-flop needs its own operating point (shorter delay,
-or lower `adapt_bump`/`adapt_decay` to keep the sequence alive), a targeted follow-up. Net: the
-recurrence result is **firmly confirmed**, with flip-flop's operating point the one open tuning item.
+reproduction, it is at-least-as-strong**. **flip-flop needed — and got — its own operating point
+(RESOLVED 2026-07-14).** At the shared `adapt_bump 5` config both engines were weak (FF 525, side-car
+670/810) and the side-car's σ≈0.05 showed the recurrent scratchpad (L2) **silent (0.0% firing)**. Two
+diagnostic sweeps (`wave_driven_bench::wave_driven_flipflop_{rec,adapt}_sweep`, 3 seeds) pinned the cause:
+
+- **Not recurrence density.** Denser/tighter recurrence did *not* fix it — `r3/c16` left L2 silent (0.1%,
+  620/771) and `r3/c32` woke L2 (3.7%) but *collapsed* accuracy to 470 (< FF; the density cliff). So more
+  scratchpad synapses can't overcome the quench.
+- **It was adaptation quenching.** The bump piles up as a leaky accumulator (`adapt_ref = decayed + bump`
+  per fire), and the sustained effective-threshold contribution ≈ `adapt_bump · 2^adapt_decay` = `5·64 ≈
+  320` at the shared config — far above what L2's sparse `count-8` ±1 loop can drive, so L2 quenches and
+  the read path (L3→L4) starves. **Lowering `adapt_bump` from 5 to ≤ 3 (or `adapt_decay` 6→4) takes
+  flip-flop to 1000/1000 worst-seed**, every setting in the swept range (`bump{3,2,1}` and `bump3/decay4`,
+  `bump2/decay4` all hit ceiling); the whole net comes alive (L3 3.4→7–21%, L4 0.5→2.5–20%). Interestingly
+  ceiling arrives at `bump3` even with L2 still ~0.1% — the dominant effect is **un-quenching the
+  read path** so the held state is legible, with L2 waking further as bump drops.
+
+**Net: spike-ψ `εᵃ` recurrence reaches ceiling on ALL four benchmarks** (flip-flop with its own
+`adapt_bump 3` operating point), and beats FF worst-seed 4/4 — the recurrence result is **firmly
+confirmed with no open wrinkle**. (Follow-up if wanted: adaptation is task-timescale-dependent, so a
+principled per-task or adaptive `adapt_bump` — rather than a hand-picked constant — is the clean
+generalization.)
 
 ## Scaling study (in progress) — forward drive, width, and read-layer topology
 

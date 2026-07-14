@@ -488,4 +488,96 @@ mod tests {
         // plumbing sanity gate only: the side-car demonstrably solves temporal XOR
         assert!(sidecar_xor_worst > 700, "side-car should clear chance on temporal XOR (worst {sidecar_xor_worst}); harness broken?");
     }
+
+    #[test]
+    #[ignore] // diagnostic: does a denser/tighter recurrent scratchpad revive activity-starved flip-flop? (--release)
+    fn wave_driven_flipflop_rec_sweep() {
+        let seeds = [0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF];
+        let size = 32u32;
+        let mkcfg = || {
+            let mut c = ff_cfg();
+            c.size = size;
+            c.present = 6;
+            c.delay = 12;
+            c.read = 8;
+            c.holdout = 200;
+            c
+        };
+        let task = |s: u64, t: usize| task_flipflop(s, t, 4);
+        eprintln!("== flip-flop side-car recurrent-topology sweep (size {size}, spike-ψ εᵃ β=0.4, {} seeds) ==", seeds.len());
+
+        // FF baseline (no recurrence; unchanged by the recurrent params)
+        let ff: Vec<u64> = seeds
+            .iter()
+            .map(|&s| {
+                let (mut n, e) = make_ff(s, size, 5, 32, 3, 5, 6);
+                train_and_eval_best(&mut n, &e, s, s, &mkcfg(), &task, 300, 3, 2400).0
+            })
+            .collect();
+        eprintln!("  FF (no recurrence): worst {} mean {}", ff.iter().min().unwrap(), ff.iter().sum::<u64>() / ff.len() as u64);
+
+        // side-car recurrent scratchpad (count n, radius r): current r4/c8 vs the two requested denser/tighter layouts
+        for &(n, r) in &[(8u32, 4u32), (16u32, 3u32), (32u32, 3u32)] {
+            let mut bests = Vec::new();
+            let mut sigmas = Vec::new();
+            for &s in &seeds {
+                let (mut net, e) = make_sidecar(s, size, 32, 3, n, r, 5, 6);
+                bests.push(train_and_eval_best(&mut net, &e, s, s, &mkcfg(), &task, 300, 3, 2400).0);
+                sigmas.push(rate_profile(&mut net, size, s, 0, 16, 64).1);
+            }
+            let profile = {
+                let (mut net, _e) = make_sidecar(seeds[0], size, 32, 3, n, r, 5, 6);
+                rate_profile(&mut net, size, seeds[0], 0, 16, 64).0
+            };
+            eprintln!(
+                "  side-car rec r{r}/c{n:<2}: worst {} mean {} | σ≈{:.2} | rate% {:?}",
+                bests.iter().min().unwrap(),
+                bests.iter().sum::<u64>() / bests.len() as u64,
+                sigmas.iter().sum::<f64>() / sigmas.len() as f64,
+                profile
+            );
+        }
+    }
+
+    #[test]
+    #[ignore] // diagnostic: flip-flop is adaptation-quenched, not density-starved — sweep the side-car's adaptation (--release)
+    fn wave_driven_flipflop_adapt_sweep() {
+        let seeds = [0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF];
+        let size = 32u32;
+        let mkcfg = || {
+            let mut c = ff_cfg();
+            c.size = size;
+            c.present = 6;
+            c.delay = 12;
+            c.read = 8;
+            c.holdout = 200;
+            c
+        };
+        let task = |s: u64, t: usize| task_flipflop(s, t, 4);
+        eprintln!("== flip-flop adaptation sweep (side-car r4/c8, size {size}, spike-ψ εᵃ β=0.4, {} seeds) ==", seeds.len());
+        eprintln!("  reference: FF baseline 525/561; side-car bump5/decay6 = 670/810 (L2 silent, σ≈0.05)");
+
+        // Lower adapt_bump relaxes the per-fire quench; lower adapt_decay speeds relaxation between ops.
+        // Both keep the recurrent scratchpad (L2) alive over the long flip-flop op sequence.
+        for &(bump, decay) in &[(5i16, 6u8), (3, 6), (2, 6), (1, 6), (3, 4), (2, 4)] {
+            let mut bests = Vec::new();
+            let mut sigmas = Vec::new();
+            for &s in &seeds {
+                let (mut net, e) = make_sidecar(s, size, 32, 3, 8, 4, bump, decay);
+                bests.push(train_and_eval_best(&mut net, &e, s, s, &mkcfg(), &task, 300, 3, 2400).0);
+                sigmas.push(rate_profile(&mut net, size, s, 0, 16, 64).1);
+            }
+            let profile = {
+                let (mut net, _e) = make_sidecar(seeds[0], size, 32, 3, 8, 4, bump, decay);
+                rate_profile(&mut net, size, seeds[0], 0, 16, 64).0
+            };
+            eprintln!(
+                "  bump{bump} decay{decay}: worst {} mean {} | σ≈{:.2} | rate% {:?}",
+                bests.iter().min().unwrap(),
+                bests.iter().sum::<u64>() / bests.len() as u64,
+                sigmas.iter().sum::<f64>() / sigmas.len() as f64,
+                profile
+            );
+        }
+    }
 }
