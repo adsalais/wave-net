@@ -67,9 +67,15 @@ BRF Jacobian × double-Gaussian surrogate ψ × multi-layer-DFA into the ternary
 clamped `δ·ω ≤ 1`, `b′ ≥ 0`) — FF still trains to ceiling with `ω/b′` learning (`train_omega_b=false` is
 bit-identical to 2a, the regression gate). **Bring-up findings:** a balanced resonator barely responds to
 **DC** cue drive, so `θ_c≈0.1` (not the reference's 1) gives a live, depth-stable stack, and BRF's δ-scaled
-ε traces need `hidden_lr` ~100× the integer engines' (see `bench::wave_resonate_bench`). **Next: Phase 3 —
-experiments** (BRF-vs-ALIF on the temporal tasks, ω-init/δ sweeps, recurrence), where trainable ω/b′ should
-matter (static single-cue does not exercise it). **BPTT stays out of scope.** Spec:
+ε traces need `hidden_lr` ~100× the integer engines' (see `bench::wave_resonate_bench`). **Phase 3 (experiments) landed** — temporal-task
+battery, size 32, 3 seeds (see `docs/experiments_results.md` § wave_resonate): BRF+HYPR clears chance on all
+four tasks and reaches **ceiling on temporal-XOR / distractor-XOR / flip-flop** (parity-4 above chance,
+like ALIF); **trainable ω/b′ is transformative where the frozen bank fails** (distractor-XOR FF 720→1000)
+with a task-dependent LR (`omega_b_lr 1.0` safe, `2.0` maxes distractor but destabilizes XOR); **side-car
+recurrence remains the strongest lever** (reproduces recurrence-beats-FF with a BRF neuron) but trained
+resonance partly/fully substitutes for it on FF. Competitive with the ALIF reference on the same harness.
+**Perf wall:** f32 + per-synapse eligibility → the size-32/3-seed study took ~95 min; size ≥ 64 needs the
+deferred fixed-point/perf pass. **BPTT stays out of scope.** Spec:
 `docs/superpowers/specs/2026-07-14-wave-resonate-brf-hypr-design.md`; plans: `.../wave-resonate-phase1-inference.md`,
 `.../wave-resonate-phase2a-hypr-training.md`, `.../wave-resonate-phase2b-trainable-omega-b.md`.
 

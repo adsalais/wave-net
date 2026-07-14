@@ -327,3 +327,95 @@ point. Equivalent directions to try (not yet built): **anneal `c_reg` → 0 as t
 liveness rescue early, remove the homogenizing pressure late), or **gate `rate_reg` off** for neurons/layers
 already at/above target rate. Left unimplemented per scope; recorded so the collapse is not mistaken for a
 substrate/credit limit.
+
+---
+
+# The `wave_resonate` engine — BRF (complex resonate-and-fire) + HYPR
+
+**What this is:** a second, independent engine (`src/wave_resonate/`, an island duplicated from
+`wave_driven`) whose neuron is the **Balanced Resonate-and-Fire (BRF)** complex-membrane oscillator —
+the flagship variant of Higuchi et al., *Balanced Resonate-and-Fire Neurons*, ICML 2024 — trained
+**online without BPTT** by a **HYPR**-style forward eligibility (Baronig et al. 2026). The **ternary
+±1/0 BitNet weight substrate is preserved**; only the neuron's internal integration (LIF/ALIF → a damped
+complex oscillator with per-neuron frequency `ω` and dampening `b′`) and the credit rule change. Design:
+`docs/superpowers/specs/2026-07-14-wave-resonate-*`. Harness: `src/bench/wave_resonate_bench.rs`.
+
+## The neuron & why it needed a different operating point
+
+Each neuron is `u = x + i·y` with `x' = x + δ(b·x − ω·y + I)`, `y' = y + δ(ω·x + b·y)`, spike on the real
+part `z = Θ(x − ϑ_c − q)`, refractory `q' = γ·q + z`, balanced dampening `b = p(ω) − |b′| − q`,
+`p(ω) = (−1+√(1−(δω)²))/δ`. The sub-threshold `(x,y)` is **linear**, so HYPR's forward eligibility is an
+**exact 2-state per-synapse trace** `(εˣ,εʸ)` recursed through the same Jacobian, `elig += ψ·εˣ`
+(ψ = the reference double-Gaussian surrogate) — generalizing the `wave_driven` e-prop rule to a resonator,
+validated by a **bit-exact online-vs-dense eligibility oracle**.
+
+**Load-bearing bring-up findings (both non-obvious):**
+
+- **A balanced resonator barely responds to DC drive.** Our cues are constant over the present window
+  (DC), and at the reference threshold `ϑ_c = 1` the entire compute stack is **silent** (damped
+  steady-state `x ≈ 0.03·I ≈ 0.2` ≪ 1). **`ϑ_c ≈ 0.1`** gives a live, depth-stable stack (~4–5%
+  spikes/neuron/wave). This is *the* gotcha for driving RF networks with rate/spatial (non-oscillatory)
+  input.
+- **HYPR's ε traces are δ-scaled** (injections are `δ·z ≈ 0.05`), so the hidden learning rate must be
+  **~100× the integer engines'** (`hidden_lr ≈ 2` vs `0.004`) or the ternary shadow never moves.
+- Membrane is **f32** (O(neurons)); weights stay **ternary** (O(synapses) — the memory constraint).
+  Dense oscillator update + sparse firer-gated delivery (resonators ring, so there is no membrane
+  frontier). Deterministic, single-threaded.
+
+## Headline — temporal-task battery, size 32, 3 seeds (worst/mean held-out ×1000)
+
+Config: 5 layers, forward fan-in `r3/c32`, side-car recurrent `rec 8`/`r4` (backward-fed:
+`L0→L1`, `L1→L3` skip, `L2` self + `L2→L3`, `L3→L2` back + `L3→L4`, read `L4`), `ϑ_c 0.1`, `δ 0.05`,
+`ω∼U(5,10)`, `b′∼U(0,0.2)`, `hidden_lr 2`, trained-`ω/b′` `omega_b_lr 1.0`, best-checkpointed
+(`train_and_eval_best`, ≤2400 trials). σ (mean consecutive-layer spike ratio) ≈ **1.14** across configs.
+
+| task           | FF frozen | FF +ω/b′ | side-car frozen | side-car +ω/b′ | ALIF ref (FF→side) |
+|----------------|-----------|----------|-----------------|----------------|--------------------|
+| temporal-XOR   | 1000/1000 | 1000/1000 | 1000/1000      | 1000/1000      | 990 → 1000         |
+| parity-4       |  565/600  |  620/631 |  650/746        |  670/733       | 587 → 837          |
+| distractor-XOR |  720/755  | **1000/1000** | **1000/1000** | 1000/1000  | 700 → 995          |
+| flip-flop      |  930/963  |  960/986 | **1000/1000**   | 1000/1000      | 985 → 1000         |
+
+(ALIF ref = the `wave_driven` ALIF+e-prop worst-seed numbers, size 32, for context — a *different* neuron
+model on the identical tasks/harness.)
+
+## Verdicts
+
+- **RQ1 — BRF+HYPR is a viable temporal learner.** It clears chance on all four tasks and reaches
+  **ceiling on three** (temporal-XOR, distractor-XOR, flip-flop); parity-4 is above chance but not solved
+  (the hardest task — ALIF only reaches 837 too). Competitive with the ALIF+e-prop reference on the same
+  battery, from a completely different neuron model — a second, independent confirmation that the
+  ternary-weight + online-eligibility recipe learns.
+- **RQ2 — trainable `ω/b′` matters, exactly where the frozen frequency bank falls short.** The clean case
+  is **distractor-XOR: FF frozen 720 → FF +ω/b′ 1000/1000** — learning the resonant frequencies solves a
+  task the random bank cannot. It also helps FF on parity-4 (565→620) and flip-flop (930→960). On tasks a
+  frozen bank already ceilings (temporal-XOR), it neither helps nor (at the chosen LR) hurts. **The LR is
+  task-dependent** (size-16 FF sweep): `omega_b_lr ≤ 1.0` helps the hard tasks with **no** regression on
+  the easy ones (distractor 515→705/852, XOR held at 1000); `omega_b_lr 2.0` maxes distractor (→1000) but
+  **destabilizes** temporal-XOR (1000→760, over-aggressive frequency updates on an already-good bank). We
+  use `1.0` as the safe default.
+- **RQ3 — topological recurrence remains the strongest single lever, but intrinsic resonance narrows the
+  gap.** The backward-fed **side-car frozen** solves distractor-XOR and flip-flop to **1000** with *no*
+  `ω/b′` training, and is best on parity-4 — reproducing the repo's "recurrence beats FF" headline with a
+  BRF neuron. **But** on distractor-XOR, **FF + trainable `ω/b′` also reaches 1000** — i.e. per-neuron
+  oscillatory memory can *substitute* for wiring recurrence there; on flip-flop it closes most of the gap
+  (FF 930 → FF+ω/b′ 960 vs side 1000). So: side-car ≥ FF, and trained resonance is a partial (sometimes
+  full) FF-side substitute for the recurrent scratchpad.
+- **RQ4 — timescale (`ω`-init × `δ`) is a first-class lever.** On distractor-XOR FF **frozen** (size 16,
+  2 seeds), the study's default `ω∼U(5,10)/δ0.05` (515) is **suboptimal**; lowering to **`ω∼U(3,6)` with
+  `δ0.10` reaches 770/795** — nearly doubling worst-seed. The winner has period `≈ 2π/(δω) ≈ 10–21 waves`,
+  matching the task's ~20-wave memory span; higher `ω∼U(8,16)` is worse (460–602). So a frozen frequency
+  bank is only as good as its range vs the task's memory horizon — which is exactly what trainable `ω/b′`
+  (RQ2) discovers automatically, and a caveat that the **frozen** numbers above are timescale-under-tuned,
+  not a BRF ceiling. (Full grid in `bench::wave_resonate_omega_delta_sweep`.)
+- **Width floor confirmed** (matches `wave_bitnet`/`wave_driven`): parity-4 is at chance at size 16 for
+  every config and only rises above chance at size 32; distractor FF frozen 515 (size 16) → 720 (size 32).
+
+## Cost & the perf wall
+
+BRF is f32 with a per-synapse 2-state eligibility, and resonators ring (a larger eligibility active set),
+so it is **markedly slower than the integer engines**: the size-32 / 3-seed / 4-task / 4-config study took
+**~95 min** (`--release`); size-16 / 2-seed took ~12.5 min. This is the anticipated scaling wall (cf. the
+standing perf-then-scaling note) arriving earlier for the f32 engine — size ≥ 64 multi-seed sweeps are not
+practical without the deferred fixed-point port / perf pass. All experiments are `#[ignore]`d
+(`bench::wave_resonate_bench`); no config was silently capped.
