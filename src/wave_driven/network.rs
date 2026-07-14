@@ -317,7 +317,12 @@ impl Network {
                         let r_tz = rho[tz];
                         let sbase = slot_bases[e_idx];
                         let wpn = occ_wpn[e_idx];
-                        let words = &occ[e_idx][i * wpn..i * wpn + wpn];
+                        // SAFETY: e_idx < topology.len() == occ.len() == offsets.len(); i < ls and
+                        // occ[e_idx].len() == ls*wpn, so [i*wpn, i*wpn+wpn) is in bounds; offsets[e_idx]
+                        // is this entry's neighborhood LUT (len == cell count). Mirrors the sanctioned
+                        // unsafe in wave_bitnet::process_layer (same word-scan invariants).
+                        let words = unsafe { occ.get_unchecked(e_idx).get_unchecked(i * wpn..i * wpn + wpn) };
+                        let lut = unsafe { offsets.get_unchecked(e_idx) };
                         let fb = &fired_bitset[tz];
                         let mut rank = 0usize;
                         for (wi, &w0) in words.iter().enumerate() {
@@ -326,19 +331,23 @@ impl Network {
                             while word != 0 {
                                 let bit = word.trailing_zeros() as usize;
                                 let cell = cbase + bit;
-                                let (dx, dy) = offsets[e_idx][cell];
+                                // SAFETY: `cell` is a SET occupancy bit => a sampled cell < lut.len()
+                                // (padding bits are never set). widx = i*ts + sbase + rank, rank < count,
+                                // sbase+count <= ts, i < ls => widx < ls*ts == eps_a.len() == elig.len().
+                                // j = local_of(wrap,..) < ls => j>>6 < fb.len() (ceil(ls/64) words).
+                                let (dx, dy) = unsafe { *lut.get_unchecked(cell) };
                                 let j = local_of(wrap(sx, dx as i32, size), wrap(sy, dy as i32, size), size);
                                 let widx = i * ts + sbase + rank;
-                                let ea = tr.eps_a[widx];
-                                let fired = fb[(j >> 6) as usize] & (1u64 << (j & 63)) != 0;
+                                let ea = unsafe { *tr.eps_a.get_unchecked(widx) };
+                                let fired = unsafe { *fb.get_unchecked((j >> 6) as usize) } & (1u64 << (j & 63)) != 0;
                                 let new_ea = if fired {
-                                    tr.elig[widx] += pr - beta * ea;
+                                    unsafe { *tr.elig.get_unchecked_mut(widx) += pr - beta * ea };
                                     dirty_rows[z].push(iu);
                                     pr + (r_tz - beta) * ea
                                 } else {
                                     r_tz * ea
                                 };
-                                tr.eps_a[widx] = if new_ea.abs() < eps_a_cut { 0.0 } else { new_ea };
+                                unsafe { *tr.eps_a.get_unchecked_mut(widx) = if new_ea.abs() < eps_a_cut { 0.0 } else { new_ea } };
                                 rank += 1;
                                 word &= word - 1;
                             }
