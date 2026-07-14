@@ -58,10 +58,18 @@ BPTT** by a **HYPR**-style forward eligibility (Baronig et al. 2026): the sub-th
 are linear, so RTRL is an exact, cheap 2-state per-synapse trace. It keeps the **ternary ±1/0 weight
 substrate** (the f32 membrane `x,y,q,ω,b′` is O(neurons)) but runs a **dense** oscillator update + a
 **sparse, firer-gated** ternary delivery — resonators ring continuously, so there is no membrane frontier.
-**Phase 1 (inference) is landed** (BRF dynamics validated by a bit-exact single-neuron oracle, divergence-
-free stability, resonance/frequency selectivity, deterministic forward); **Phase 2 (HYPR training) is
-next.** Spec: `docs/superpowers/specs/2026-07-14-wave-resonate-brf-hypr-design.md`; plan:
-`docs/superpowers/plans/2026-07-14-wave-resonate-phase1-inference.md`.
+**Phase 1 (inference) + Phase 2a (HYPR training, weights-only) are landed.** Phase 1: BRF dynamics
+validated by a bit-exact single-neuron oracle, divergence-free stability, resonance/frequency selectivity,
+deterministic forward. Phase 2a: per-synapse 2-state forward eligibility `(εˣ,εʸ)` through the BRF
+Jacobian × double-Gaussian surrogate ψ × multi-layer-DFA into the ternary shadow, gated by a **bit-exact
+online-vs-dense eligibility oracle**; **FF single-cue trains to ceiling** (depth-4 size-16 → 1000
+held-out). **Bring-up findings:** a balanced resonator barely responds to **DC** cue drive, so `θ_c≈0.1`
+(not the reference's 1) gives a live, depth-stable stack, and BRF's δ-scaled ε traces need `hidden_lr`
+~100× the integer engines' (see `bench::wave_resonate_bench`). **Next: Phase 2b — trainable ω/b′**
+(`EligParams.train_omega_b`, per-neuron eligibilities) then experiments. **BPTT stays out of scope.** Spec:
+`docs/superpowers/specs/2026-07-14-wave-resonate-brf-hypr-design.md`; plans:
+`docs/superpowers/plans/2026-07-14-wave-resonate-phase1-inference.md`,
+`docs/superpowers/plans/2026-07-14-wave-resonate-phase2a-hypr-training.md`.
 
 - **`wave_bitnet/` — the engine.** A memory-lean integer spiking engine: topology is materialized once
   into a per-neuron neighborhood **occupancy bitset** (no per-wave hashing), and weights are stored as
@@ -344,15 +352,18 @@ src/
     network.rs           # Network: sparse/dense orchestration, injection-into-frontier, deferred one-hop swap, online eligibility accrual + dfa_update
     training.rs          # online activity-scaled multi-layer-DFA: EligParams(β,εᵃ)/Edge, spike-ψ membrane + ALIF εᵃ eligibility + bit-exact dense_eligibility oracle
     equivalence_tests.rs # (test-only) sparse==dense oracle + adapt_bump==0 wave_bitnet cross-check
-  wave_resonate/         # 3rd engine (island): BRF (complex resonate-and-fire) neurons + HYPR training; f32 membrane + ternary weights. Phase 1: inference
+  wave_resonate/         # 3rd engine (island): BRF (complex resonate-and-fire) neurons + HYPR training; f32 membrane + ternary weights. Phase 1 (inference) + 2a (weights-only training)
     synapse.rs           # copied hash/topology helpers (verbatim from wave_driven)
     config.rs            # BRF Config (global dt/gamma/theta_c) + LayerConfig (omega_init/b_offset_init/tau_out); validate enforces δ·ω ≤ 1
-    neurons.rs           # BRF Layer SoA (f32 x,y,q + per-neuron ω,b') + pw() divergence boundary + occupancy bitset + 2-bit codes
-    wave.rs              # process_layer — dense complex-oscillator update + firer-gated ternary delivery (single-neuron reference oracle)
-    network.rs           # Network: orchestration, deferred one-hop swap, L0 transducer, leaky-integrator readout, listeners
+    neurons.rs           # BRF Layer SoA (f32 x,y,q + per-neuron ω,b') + pw() divergence boundary + occupancy bitset + 2-bit codes + optional TrainState (shadow/elig/eps_x/eps_y/b_eff/psi) + repack
+    wave.rs              # process_layer — dense complex-oscillator update + firer-gated ternary delivery + forward capture of b_eff/ψ (single-neuron reference oracle)
+    network.rs           # Network: orchestration, deferred one-hop swap, L0 transducer, leaky-integrator readout, online HYPR eligibility accrual + dfa_update + reset_eligibility
+    training.rs          # HYPR: double-Gaussian surrogate, EligParams(dt,eps_cut,train_omega_b)/Edge, bit-exact dense_eligibility oracle
+    equivalence_tests.rs # (test-only) online == dense HYPR eligibility (bit-exact)
   bench/                 # experiment harness (public-API only, test-only) — the learning rules + tasks
     wave_bitnet_bench.rs # FF + side-car training harness (run_trial, build_signal, train_and_eval_best, tasks) + smoke benchmark
     wave_driven_bench.rs # wave_driven FF training harness (online eligibility) — trains above chance; ignored depth-8 smoke + online-vs-offline throughput
+    wave_resonate_bench.rs # BRF+HYPR FF training harness — FF single-cue trains to ceiling; ignored liveness/depth diagnostics
 docs/
   experiments_results.md # SOURCE OF TRUTH for findings
   related-work.md        # literature framing (GeNN, e-prop, ALIF/LSNN, FPTT, …)
