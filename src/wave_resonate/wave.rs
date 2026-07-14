@@ -5,6 +5,7 @@
 
 use crate::wave_resonate::neurons::{pw, Layer, WCODE};
 use crate::wave_resonate::synapse::{local_of, wrap, xy_of};
+use crate::wave_resonate::training::surrogate;
 
 pub fn process_layer(
     layer: &mut Layer,
@@ -40,8 +41,9 @@ pub fn process_layer(
         return;
     }
 
-    // --- compute: dense BRF oscillator update + decide ---
+    // --- compute: dense BRF oscillator update + decide (+ training capture) ---
     let (dt, gamma, theta_c) = (layer.dt, layer.gamma, layer.theta_c);
+    let training = layer.train.is_some();
     for i in 0..ls {
         let cur = layer.pending[i] as f32;
         layer.pending[i] = 0;
@@ -55,6 +57,16 @@ pub fn process_layer(
         layer.q[i] = gamma * q + if spike { 1.0 } else { 0.0 };
         if spike {
             fired.push(i as u32);
+        }
+        if training {
+            // capture the target-neuron values the HYPR accrual needs this wave: b_j^t and ψ_j^t (at the
+            // pre-update q, matching the forward threshold), plus the running spike count.
+            let t = layer.train.as_mut().unwrap();
+            t.b_eff[i] = b;
+            t.psi[i] = surrogate(nx - theta_c - q);
+            if spike {
+                t.spike_count[i] += 1;
+            }
         }
     }
 
@@ -240,6 +252,23 @@ mod tests {
         l.pending[0] = 0;
         process_layer(&mut l, 0, 4, &[], &mut deliv, &mut fired);
         assert!(l.x[0] < x1 && l.x[0] > 0.0, "with no input the accumulator leaks toward 0: {} < {}", l.x[0], x1);
+    }
+
+    #[test]
+    fn training_capture_fills_b_eff_and_psi() {
+        use crate::wave_resonate::training::surrogate;
+        let dt = 0.05f32;
+        let mut l = compute_layer(1, 10.0, 0.3, dt, 0.9, 1.0);
+        l.enable_training();
+        let mut deliv: Vec<Vec<i32>> = vec![vec![0i32; 1]; 1];
+        let mut fired = Vec::new();
+        l.pending[0] = 40; // drive toward threshold
+        process_layer(&mut l, 0, 1, &[], &mut deliv, &mut fired);
+        let t = l.train.as_ref().unwrap();
+        // b_eff = pw(omega) - |b_off| - q_old (q_old was 0 on the first wave)
+        let expect_b = crate::wave_resonate::neurons::pw(l.omega[0], dt) - l.b_off[0].abs();
+        assert!((t.b_eff[0] - expect_b).abs() < 1e-6, "b_eff captured");
+        assert_eq!(t.psi[0], surrogate(l.x[0] - l.theta_c - 0.0), "psi captured at (x - θ_c - q_old)");
     }
 
     #[test]
