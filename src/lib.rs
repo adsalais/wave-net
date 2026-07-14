@@ -13,3 +13,4 @@
 pub mod bench; // experiments and benchmark harness for the wave_bitnet engine
 pub mod wave_bitnet; // the engine: bitset topology + 2-bit ternary weights
 pub mod wave_driven; // event-driven active-set inference engine (Phase 1)
+pub mod wave_resonate; // BRF resonate-and-fire engine (island); Phase 1: inference
