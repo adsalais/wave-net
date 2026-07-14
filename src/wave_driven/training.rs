@@ -150,7 +150,11 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     fn deep_cfg(size: u32) -> (Config, Vec<Vec<Edge>>) {
-        let mk = |topology: Vec<TopologyLevel>| LayerConfig { topology, leak: (3, 5), cooldown_base: 2, inhibitor_ratio: 6553, threshold_jitter: 32, baseline_init: 4, adapt_bump: 5, adapt_decay: 6 };
+        deep_cfg_ad(size, 6)
+    }
+
+    fn deep_cfg_ad(size: u32, adapt_decay: u8) -> (Config, Vec<Vec<Edge>>) {
+        let mk = |topology: Vec<TopologyLevel>| LayerConfig { topology, leak: (3, 5), cooldown_base: 2, inhibitor_ratio: 6553, threshold_jitter: 32, baseline_init: 4, adapt_bump: 5, adapt_decay };
         let layers = vec![
             mk(vec![TopologyLevel { level: 1, radius: 2, count: 8 }]),
             mk(vec![TopologyLevel { level: 1, radius: 2, count: 8 }, TopologyLevel { level: 0, radius: 1, count: 3 }]),
@@ -217,6 +221,65 @@ mod tests {
         net.clear_listeners();
         let fired = rec.lock().unwrap().clone();
         (net, fired)
+    }
+
+    // Drive an explicit sequence of L0 inputs (e.g. an active burst then a silent tail), recording
+    // fired per layer; return (net, fired-records).
+    fn drive_and_record_gen(cfg: Config, params: EligParams, drives: &[Vec<u32>]) -> (Network, Vec<Vec<Vec<u32>>>) {
+        let mut net = Network::new(cfg);
+        net.set_elig_params(params);
+        net.enable_training();
+        let l = net.layer_count();
+        let rec: Arc<Mutex<Vec<Vec<Vec<u32>>>>> = Arc::new(Mutex::new(vec![Vec::new(); l]));
+        for z in 0..l {
+            let r = rec.clone();
+            net.on_layer(z, Box::new(move |_w, f: &[u32]| r.lock().unwrap()[z].push(f.to_vec())));
+        }
+        net.reset_state();
+        for dv in drives {
+            net.wave(dv);
+        }
+        net.clear_listeners();
+        let fired = rec.lock().unwrap().clone();
+        (net, fired)
+    }
+
+    // A prune-triggering drive: an active burst, then a silent tail long enough for every εᵃ/pretr
+    // trace to decay below its cut. `adapt_decay=2` (ρ=0.75) makes εᵃ decay fast.
+    fn burst_then_silence(size: u32) -> Vec<Vec<u32>> {
+        let l0 = random_l0_input(0x0E11, size, 15000);
+        let mut drives: Vec<Vec<u32>> = (0..50usize).map(|w| l0(w)).collect();
+        drives.extend((0..150).map(|_| Vec::new()));
+        drives
+    }
+
+    #[test]
+    fn elig_active_prunes_dead_rows() {
+        use std::collections::HashSet;
+        let size = 16u32;
+        let (cfg, _entries) = deep_cfg_ad(size, 2);
+        let params = EligParams { rec_tau: 6.0, epsilon: 1.0 / 1024.0, elig_beta: 0.4, epsilon_a: 1.0 / 1024.0 };
+        let (net, fired) = drive_and_record_gen(cfg, params, &burst_then_silence(size));
+        let distinct: HashSet<u32> = fired[1].iter().flatten().copied().collect();
+        assert!(!distinct.is_empty(), "layer 1 must fire for the test to be meaningful");
+        // After the silent tail every trace has decayed, so the εᵃ scan set must have drained. The
+        // current push-only set stays at `distinct.len()` → RED until pruning lands.
+        assert_eq!(net.elig_active_len(1), 0, "{} sources fired but the εᵃ scan set never drained", distinct.len());
+    }
+
+    #[test]
+    fn online_equals_dense_with_eps_a_pruning() {
+        // Same prune-heavy drive: pruning must not change any accrued elig value (bit-exact vs dense).
+        let size = 16u32;
+        let (cfg, entries) = deep_cfg_ad(size, 2);
+        let params = EligParams { rec_tau: 6.0, epsilon: 1.0 / 1024.0, elig_beta: 0.4, epsilon_a: 1.0 / 1024.0 };
+        let (net, fired) = drive_and_record_gen(cfg, params, &burst_then_silence(size));
+        let dense = dense_eligibility(&net, &entries, &fired, &params);
+        for z in 0..net.layer_count() {
+            net.with_layer(z, |lz| {
+                assert_eq!(lz.train.as_ref().unwrap().elig, &dense[z][..], "layer {z} online==dense under εᵃ pruning");
+            });
+        }
     }
 
     #[test]

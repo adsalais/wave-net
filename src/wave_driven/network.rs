@@ -288,15 +288,23 @@ impl Network {
                 }
             }
         } else {
-            // εᵃ: over elig_active, with the adaptation-eligibility recursion (spike-ψ)
+            // εᵃ: over elig_active, with the adaptation-eligibility recursion (spike-ψ). Prune the scan
+            // set: a source with no live presynaptic trace AND an all-zero εᵃ row contributes exactly 0
+            // on every future wave until it fires again (which re-adds it) — so drop it here instead of
+            // letting elig_active grow monotonically per trial. Bit-exact vs the dense oracle.
             for z in 0..l {
                 if layers[z].train.is_none() {
                     continue;
                 }
                 let ts = layers[z].total_slots;
+                // Scan in place, compacting survivors toward the front (write pointer `keep`); the inner
+                // loop stays byte-identical to the un-pruned version — survival is decided per row after.
+                let mut scan = std::mem::take(&mut elig_active[z].list);
                 let Layer { topology, slot_bases, occ_wpn, occ, offsets, train, .. } = &mut layers[z];
                 let tr = train.as_mut().unwrap();
-                for &iu in &elig_active[z].list {
+                let mut keep = 0usize;
+                for r in 0..scan.len() {
+                    let iu = scan[r];
                     let i = iu as usize;
                     let pr = tr.pretr[i]; // 0 if the presynaptic trace already decayed (silent-source coupling)
                     let (sx, sy) = xy_of(iu, size);
@@ -336,7 +344,20 @@ impl Network {
                             }
                         }
                     }
+                    // Keep the source only while it can still contribute: a live presynaptic trace (can
+                    // inject on a future target-fire), or any still-live εᵃ slot. The row's εᵃ slots are
+                    // contiguous and out-of-range entries stay 0, so scanning the whole row is exact; the
+                    // `pr != 0` short-circuit means the hot path (live trace) pays nothing for the check.
+                    let survive = pr != 0.0 || tr.eps_a[i * ts..i * ts + ts].iter().any(|&e| e != 0.0);
+                    if survive {
+                        scan[keep] = iu;
+                        keep += 1;
+                    } else {
+                        elig_active[z].mark[(iu >> 6) as usize] &= !(1u64 << (iu & 63));
+                    }
                 }
+                scan.truncate(keep);
+                elig_active[z].list = scan;
             }
         }
 
@@ -469,6 +490,13 @@ impl Network {
     pub(crate) fn seed_worksets_test(&mut self, z: usize, i: u32) {
         self.dirty_rows[z].push(i);
         self.pretr_active[z].push(i);
+    }
+
+    /// Size of the εᵃ scan set (sources whose row is still accrued each wave). Exposed for the pruning
+    /// tests: a fully-decayed set should shrink to 0, not grow monotonically with cumulative activity.
+    #[cfg(test)]
+    pub(crate) fn elig_active_len(&self, z: usize) -> usize {
+        self.elig_active[z].len()
     }
 }
 
