@@ -433,6 +433,50 @@ mod tests {
         run_temporal_study(32, &[0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF], 2400);
     }
 
+    /// Build a FF BRF net with an explicit dt / ω-init (for the timescale sweep), else like `make_ff`.
+    fn make_ff_ts(seed: u64, size: u32, layers: usize, uc: u32, ur: u32, dt: f32, omega_init: (f32, f32)) -> (Network, Vec<Vec<Edge>>) {
+        let lc = LayerConfig { topology: vec![TopologyLevel { level: 1, radius: ur, count: uc }], inhibitor_ratio: 0, omega_init, b_offset_init: (0.0, 0.2), tau_out: 20.0 };
+        let mut net = Network::new(Config { seed, size, dt, gamma: 0.9, theta_c: 0.1, layers: vec![lc; layers] });
+        net.set_elig_params(EligParams { dt, eps_cut: 1e-6, train_omega_b: false });
+        net.enable_training();
+        let entries = (0..layers).map(|z| if z == layers - 1 { vec![] } else { vec![Edge { level: 1, count: uc as usize, radius: ur }] }).collect();
+        (net, entries)
+    }
+
+    #[test]
+    #[ignore] // RQ4: timescale (ω-init × δ) sensitivity on distractor-XOR FF, size 16 (--release --nocapture)
+    fn wave_resonate_omega_delta_sweep() {
+        let seeds = [0xE9_0B_0A17u64, 0x1234_5678];
+        let size = 16u32;
+        eprintln!("== ω-init × δ sweep (size {size}, FF frozen, distractor-XOR, 2 seeds); period≈2π/(δω) waves ==");
+        eprintln!("   {:<12} | δ 0.02 | δ 0.05 | δ 0.10", "ω-init");
+        for &oi in &[(3.0f32, 6.0f32), (5.0, 10.0), (8.0, 16.0)] {
+            let mut row = String::new();
+            for &dt in &[0.02f32, 0.05, 0.10] {
+                if dt * oi.1 > 1.0 {
+                    row.push_str("   skip |");
+                    continue;
+                }
+                let bests: Vec<u64> = seeds
+                    .iter()
+                    .map(|&s| {
+                        let (mut net, e) = make_ff_ts(s, size, 5, 32, 3, dt, oi);
+                        let mut c = ff_cfg();
+                        c.size = size;
+                        c.present = 6;
+                        c.delay = 20;
+                        c.read = 8;
+                        c.holdout = 200;
+                        train_and_eval_best(&mut net, &e, s, s, &c, |s2, t| task_distractor(s2, t), 300, 3, 1500).0
+                    })
+                    .collect();
+                let (w, m) = (*bests.iter().min().unwrap(), bests.iter().sum::<u64>() / bests.len() as u64);
+                row.push_str(&format!(" {w:>4}/{m:<4}|"));
+            }
+            eprintln!("   ω{oi:?} |{row}");
+        }
+    }
+
     #[test]
     #[ignore] // pick omega_b_lr: does a smaller LR keep the distractor gain without hurting XOR? (--release --nocapture)
     fn wave_resonate_omega_b_lr_sweep() {
