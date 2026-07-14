@@ -354,6 +354,83 @@ mod tests {
         assert!(best > 600, "BRF+HYPR FF should train above chance: {best}");
     }
 
+    struct Bench {
+        name: &'static str,
+        present: usize,
+        delay: usize,
+        read: usize,
+        task: Box<dyn Fn(u64, usize) -> (Vec<usize>, usize)>,
+    }
+
+    fn temporal_benches() -> Vec<Bench> {
+        vec![
+            Bench { name: "temporal-XOR", present: 6, delay: 8, read: 8, task: Box::new(|s, t| task_parity(s, t, 2)) },
+            Bench { name: "parity-4", present: 6, delay: 8, read: 8, task: Box::new(|s, t| task_parity(s, t, 4)) },
+            Bench { name: "distractor-XOR", present: 6, delay: 20, read: 8, task: Box::new(|s, t| task_distractor(s, t)) },
+            Bench { name: "flip-flop", present: 6, delay: 12, read: 8, task: Box::new(|s, t| task_flipflop(s, t, 4)) },
+        ]
+    }
+
+    /// Core comparison: for each task, FF vs side-car × frozen vs trained ω/b′, worst+mean over seeds.
+    /// `size`, `seeds`, `max_trials` parameterize the size-16 validation vs the size-32 study.
+    fn run_temporal_study(size: u32, seeds: &[u64], max_trials: usize) {
+        let (uc, ur, rec, rr) = (32u32, 3u32, 8u32, 4u32);
+        eprintln!("== wave_resonate temporal study — size {size}, {} seeds, θ_c 0.1, FF/side-car × frozen/trained ω/b′ ==", seeds.len());
+        eprintln!("   {:<15} | FF froz w/m | FF train w/m | side froz w/m | side train w/m | side σ", "task");
+        for b in temporal_benches() {
+            let mkcfg = |train_ob: bool| {
+                let mut c = ff_cfg();
+                c.size = size;
+                c.present = b.present;
+                c.delay = b.delay;
+                c.read = b.read;
+                c.holdout = 200;
+                c.train_omega_b = train_ob;
+                c.omega_b_lr = if train_ob { 2.0 } else { 0.0 };
+                c
+            };
+            // returns (worst, mean)
+            let run = |sidecar: bool, train_ob: bool| -> (u64, u64) {
+                let bests: Vec<u64> = seeds
+                    .iter()
+                    .map(|&s| {
+                        let (mut net, e) = if sidecar {
+                            make_sidecar(s, size, uc, ur, rec, rr, 0.1, (0.0, 0.2), train_ob)
+                        } else {
+                            make_ff(s, size, 5, uc, ur, 0.1, (0.0, 0.2), train_ob)
+                        };
+                        train_and_eval_best(&mut net, &e, s, s, &mkcfg(train_ob), b.task.as_ref(), 300, 3, max_trials).0
+                    })
+                    .collect();
+                (*bests.iter().min().unwrap(), bests.iter().sum::<u64>() / bests.len() as u64)
+            };
+            let ff_f = run(false, false);
+            let ff_t = run(false, true);
+            let sc_f = run(true, false);
+            let sc_t = run(true, true);
+            let sig = {
+                let (mut net, _e) = make_sidecar(seeds[0], size, uc, ur, rec, rr, 0.1, (0.0, 0.2), false);
+                rate_profile(&mut net, size, seeds[0], 0, 16, 64).1
+            };
+            eprintln!(
+                "   {:<15} | {:>4}/{:<4} | {:>4}/{:<4} | {:>4}/{:<4} | {:>4}/{:<4} | {sig:.2}",
+                b.name, ff_f.0, ff_f.1, ff_t.0, ff_t.1, sc_f.0, sc_f.1, sc_t.0, sc_t.1
+            );
+        }
+    }
+
+    #[test]
+    #[ignore] // validation (size 16, 2 seeds): fast preliminary readout of the full matrix (--release --nocapture)
+    fn wave_resonate_temporal_size16() {
+        run_temporal_study(16, &[0xE9_0B_0A17u64, 0x1234_5678], 1500);
+    }
+
+    #[test]
+    #[ignore] // the study (size 32, 3 seeds): the headline comparison — SLOW, run in background (--release --nocapture)
+    fn wave_resonate_temporal_size32() {
+        run_temporal_study(32, &[0xE9_0B_0A17u64, 0x1234_5678, 0xDEAD_BEEF], 2400);
+    }
+
     #[test]
     #[ignore] // smoke: FF trains with ω/b′ trainable; also prints frozen-vs-trained (--release --nocapture)
     fn wave_resonate_ff_trains_with_omega_b() {
