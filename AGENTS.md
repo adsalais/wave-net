@@ -273,13 +273,16 @@ removed allocation from the hot path.
 - Rust, edition 2024. **Standard library only by default** — the one optional dependency (`blake3`) is
   behind a test-only feature. This is a **library crate** (no binary); experiments are `#[ignore]`d tests.
 - **Standard library only** in `src/`; **warning-free build**.
-- **No `unsafe` — with ONE documented exception.** `wave_bitnet::wave::process_layer`'s forward hot loop
-  uses `get_unchecked`/`get_unchecked_mut` for four accesses: the per-neuron occupancy-word slice, the
-  offset LUT, the packed weight-code word, and the delivery-target accumulator. Each index is **provably
-  in-bounds** from the word-scan invariants and carries a `SAFETY:` comment. It removed ~7% of
-  bounds-check overhead on the throughput-critical path. This is the **only** `unsafe` in the tree and is
-  confined to that loop — **do not add `unsafe` anywhere else** without an equally airtight, commented
-  justification.
+- **No `unsafe` — with TWO documented sites, both hot occupancy-scan loops.** (1)
+  `wave_bitnet::wave::process_layer`'s forward hot loop uses `get_unchecked`/`get_unchecked_mut` for four
+  accesses: the per-neuron occupancy-word slice, the offset LUT, the packed weight-code word, and the
+  delivery-target accumulator (~7% off the throughput path). (2) `wave_driven::network`'s `εᵃ`
+  eligibility-accrual inner loop uses them for the same-shaped accesses: the occupancy-word slice, the
+  offset LUT, and the `eps_a`/`elig`/fired-bitset slots. In **both**, every index is **provably in-bounds**
+  from the identical word-scan invariants (`cell` is a set occupancy bit ⇒ `< lut.len()`;
+  `widx = i·ts + sbase + rank < ls·ts`; `j < ls`) and carries a `SAFETY:` comment. These are the **only**
+  `unsafe` in the tree, each confined to its scan loop — **do not add `unsafe` anywhere else** without an
+  equally airtight, commented justification.
 - **Determinism is a hard requirement** — results are a pure function of `(seed, config, input)`.
   Currently single-threaded; any future threading must stay deterministic.
 - Tests are **inline `#[cfg(test)]` per module**, test-first (TDD) where practical.
