@@ -44,6 +44,7 @@ pub fn process_layer(
     // --- compute: dense BRF oscillator update + decide (+ training capture) ---
     let (dt, gamma, theta_c) = (layer.dt, layer.gamma, layer.theta_c);
     let training = layer.train.is_some();
+    let train_omega_b = layer.train_omega_b;
     for i in 0..ls {
         let cur = layer.pending[i] as f32;
         layer.pending[i] = 0;
@@ -61,11 +62,32 @@ pub fn process_layer(
         if training {
             // capture the target-neuron values the HYPR accrual needs this wave: b_j^t and ψ_j^t (at the
             // pre-update q, matching the forward threshold), plus the running spike count.
+            let psi_val = surrogate(nx - theta_c - q);
             let t = layer.train.as_mut().unwrap();
             t.b_eff[i] = b;
-            t.psi[i] = surrogate(nx - theta_c - q);
+            t.psi[i] = psi_val;
             if spike {
                 t.spike_count[i] += 1;
+            }
+            if train_omega_b {
+                // per-neuron parameter eligibility: 2-state (gˣ,gʸ) forward traces through the same BRF
+                // Jacobian with each param's source terms (uses PRE-update x,y; forward b; ω). Accumulate
+                // grad += ψ·gˣ (same convention as the weight elig). p'(ω) = −δω/√(1−(δω)²).
+                let pwp = -dt * omega / (1.0 - (dt * omega) * (dt * omega)).sqrt();
+                // b′: ∂b/∂b′ = −1, ∂ω/∂b′ = 0
+                let (gbx, gby) = (t.g_bo_x[i], t.g_bo_y[i]);
+                let ngbx = gbx + dt * (-x + b * gbx - omega * gby);
+                let ngby = gby + dt * (omega * gbx - y + b * gby);
+                t.g_bo_x[i] = ngbx;
+                t.g_bo_y[i] = ngby;
+                // ω: ∂ω/∂ω = 1, ∂b/∂ω = p'(ω)
+                let (gwx, gwy) = (t.g_om_x[i], t.g_om_y[i]);
+                let ngwx = gwx + dt * (pwp * x + b * gwx - y - omega * gwy);
+                let ngwy = gwy + dt * (x + omega * gwx + pwp * y + b * gwy);
+                t.g_om_x[i] = ngwx;
+                t.g_om_y[i] = ngwy;
+                t.om_grad[i] += psi_val * ngwx;
+                t.bo_grad[i] += psi_val * ngbx;
             }
         }
     }
@@ -269,6 +291,27 @@ mod tests {
         let expect_b = crate::wave_resonate::neurons::pw(l.omega[0], dt) - l.b_off[0].abs();
         assert!((t.b_eff[0] - expect_b).abs() < 1e-6, "b_eff captured");
         assert_eq!(t.psi[0], surrogate(l.x[0] - l.theta_c - 0.0), "psi captured at (x - θ_c - q_old)");
+    }
+
+    #[test]
+    fn param_eligibility_accrues_only_when_enabled() {
+        let dt = 0.05f32;
+        let mut off = compute_layer(1, 10.0, 0.3, dt, 0.9, 1.0);
+        off.enable_training();
+        let mut on = compute_layer(1, 10.0, 0.3, dt, 0.9, 1.0);
+        on.enable_training();
+        on.train_omega_b = true;
+        let mut deliv = vec![vec![0i32; 1]; 1];
+        let mut fired = Vec::new();
+        for _ in 0..20 {
+            off.pending[0] = 30;
+            on.pending[0] = 30;
+            process_layer(&mut off, 0, 1, &[], &mut deliv, &mut fired);
+            process_layer(&mut on, 0, 1, &[], &mut deliv, &mut fired);
+        }
+        assert!(off.train.as_ref().unwrap().om_grad[0] == 0.0, "off: no param grad");
+        let t = on.train.as_ref().unwrap();
+        assert!(t.om_grad[0] != 0.0 || t.bo_grad[0] != 0.0, "on: param grad accrues");
     }
 
     #[test]
