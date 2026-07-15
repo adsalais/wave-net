@@ -18,6 +18,8 @@ mod tests {
     const MAX_PREFIX: usize = 3;
     /// Hash purpose tag for trial sampling (distinct stream from CUE_P / P_DFA).
     const P_SEQ: u64 = 0x5E9;
+    /// Hash purpose tag for the fixed random DFA feedback weights.
+    const P_DFA: u64 = 61;
     /// Hash purpose tag for token site codes. Distinct from `wave_driven_bench`'s `CUE_P` (0xC0E) —
     /// this is a different predicate over a different site set, and a different task.
     const CUE_P: u64 = 0xC0F;
@@ -280,6 +282,354 @@ mod tests {
         }
         let sigma = if ratios.is_empty() { 0.0 } else { ratios.iter().sum::<f64>() / ratios.len() as f64 };
         (pct, sigma)
+    }
+
+    /// Task/readout configuration. `rate_reg`/`rate_target` are bench-side: the engine only exposes
+    /// `layer_spike_count`, and the learning rule lives here per AGENTS.md.
+    struct SeqCfg {
+        size: u32,
+        density: u32,
+        present: usize,
+        delay: usize,
+        read: usize,
+        readout_lr: f32,
+        hidden_lr: f32,
+        rate_reg: f32,
+        rate_target: f32,
+    }
+
+    /// The spec's operating point. A 3-token prefix spans 26 waves, leaving ~66% of the first token's
+    /// adaptation trace alive at read time (ρ = 1 − 2⁻⁶ ≈ 0.984/wave at `adapt_decay 6`).
+    fn seq_cfg() -> SeqCfg {
+        SeqCfg { size: 16, density: OP_DENSITY, present: 6, delay: 4, read: 8, readout_lr: 0.02, hidden_lr: 0.004, rate_reg: 5.0, rate_target: 0.1 }
+    }
+
+    /// Present a prefix token by token, then read. Each token fires its site code for `present`
+    /// waves, with `delay` empty waves between tokens; `act` integrates the top layer's spikes over
+    /// the trailing `read` window only.
+    fn run_seq_trial(net: &mut Network, cfg: &SeqCfg, prefix: &[usize], task_seed: u64) -> (Vec<f32>, usize) {
+        let l = net.layer_count();
+        let ls = (cfg.size * cfg.size) as usize;
+        let top = l - 1;
+        let top_spikes: Arc<Mutex<Vec<Vec<u32>>>> = Arc::new(Mutex::new(Vec::new()));
+        let ts = top_spikes.clone();
+        net.on_layer(top, Box::new(move |_w, fired: &[u32]| ts.lock().unwrap().push(fired.to_vec())));
+        net.reset_state();
+        let mut ttot = 0usize;
+        for (pos, &token) in prefix.iter().enumerate() {
+            if pos > 0 {
+                for _ in 0..cfg.delay {
+                    net.wave(&[]);
+                    ttot += 1;
+                }
+            }
+            let sites = token_sites(task_seed, cfg.size, token, cfg.density);
+            for _ in 0..cfg.present {
+                net.wave(&sites);
+                ttot += 1;
+            }
+        }
+        let read_start = top_spikes.lock().unwrap().len();
+        for _ in 0..cfg.read {
+            net.wave(&[]);
+            ttot += 1;
+        }
+        net.clear_listeners();
+        let mut act = vec![0f32; ls];
+        for wv in top_spikes.lock().unwrap().iter().skip(read_start) {
+            for &loc in wv {
+                act[loc as usize] += 1.0;
+            }
+        }
+        (act, ttot)
+    }
+
+    /// Fixed random ±1 DFA feedback weight for (neuron, class).
+    fn dfa_weight(seed: u64, neuron_global: u32, class: usize) -> f32 {
+        if mix(key(seed, neuron_global, class as i32, 0, P_DFA)) & 1 == 1 { 1.0 } else { -1.0 }
+    }
+
+    /// Learning signal per computational layer/neuron: DFA task feedback plus the `rate_reg`
+    /// homeostatic term, generalized over V classes.
+    ///
+    /// `signal[tz][j] = Σ_{c<V} b·err[c] + rate_reg·(rate_j − rate_target)`, with `b = w[c][j]` at
+    /// the top layer (symmetric readout feedback) and a fixed random ±1 hash below.
+    ///
+    /// The rate term is a homeostatic controller: `dfa_update` applies
+    /// `shadow += -lr · signal[tz][j] · e` with `e ≥ 0`, so a neuron above `rate_target` gets a
+    /// positive signal and has its incoming weights pushed *down*, and one below gets them pushed
+    /// *up*. It rescues liveness in deep stacks (no firing ⇒ no eligibility ⇒ no credit) at the cost
+    /// of homogenizing rates and eroding the class signal — which is why `rate_reg` is a Phase B
+    /// axis here rather than an inherited constant. Note it acts **per neuron**: a layer whose mean
+    /// sits on `rate_target` is still pushed toward uniformity *across* its neurons, which is
+    /// exactly the prefix-specific structure this task needs. See the spec's Design analysis §4.
+    ///
+    /// `rate` is normalized by `ttot`, which varies with prefix length in this task.
+    fn build_signal_n(net: &Network, w: &[Vec<f32>], err: &[f32], seed: u64, ttot: usize, cfg: &SeqCfg) -> Vec<Vec<f32>> {
+        let l = net.layer_count();
+        let ls = (cfg.size * cfg.size) as usize;
+        let top = l - 1;
+        let denom = ttot.max(1) as f32;
+        let mut signal = vec![vec![0f32; ls]; l];
+        for tz in 1..l {
+            let sc = net.layer_spike_count(tz);
+            for j in 0..ls {
+                let task_sig: f32 = (0..V)
+                    .map(|c| {
+                        let b = if tz == top { w[c][j] } else { dfa_weight(seed, (tz * ls + j) as u32, c) };
+                        b * err[c]
+                    })
+                    .sum();
+                let rate = sc[j] as f32 / denom;
+                signal[tz][j] = task_sig + cfg.rate_reg * (rate - cfg.rate_target);
+            }
+        }
+        signal
+    }
+
+    /// Metrics at one evaluation point. All computed from an exact enumeration — no sampling.
+    struct SeqMetrics {
+        /// Checkpoint scalar: mean over all prefixes of `1 − TV(truth, softmax)`. For a
+        /// deterministic prefix this is exactly the softmax mass on the target; for a fork it is the
+        /// calibration score. One number scoring both kinds uniformly.
+        fidelity: f32,
+        /// Top-1 accuracy over the deterministic (single-continuation) prefixes.
+        det_acc: f32,
+        /// Top-1 accuracy over the `[·,2,3]` family — compare against `markov_k_accuracy(·, 2, ·)`.
+        family_acc: f32,
+        /// Per-fork total variation between the true conditional and the readout softmax.
+        fork_tv: Vec<(Vec<usize>, f32)>,
+    }
+
+    /// Enumerate every prefix once and score it. The engine is deterministic and resets per trial,
+    /// so each prefix yields exactly one score vector — the evaluation is exact, with no sampling
+    /// and no variance, at ~9 runs instead of a sampled holdout's 200.
+    ///
+    /// There is deliberately no holdout: the input universe *is* these 9/12/15 prefixes, and a
+    /// held-out prefix's answer is arbitrary rather than derivable. The Markov-2 control does a
+    /// holdout's actual job — ruling out the answer-from-recent-context shortcut. See the spec §6.
+    fn eval_all_prefixes(net: &mut Network, cfg: &SeqCfg, w: &[Vec<f32>], set_size: usize, task_seed: u64) -> SeqMetrics {
+        let fam = family(set_size);
+        let (mut fid_sum, mut n_all) = (0f32, 0f32);
+        let (mut det_hit, mut det_n) = (0f32, 0f32);
+        let (mut fam_hit, mut fam_n) = (0f32, 0f32);
+        let mut fork_tv = Vec::new();
+
+        for p in prefixes(set_size) {
+            let truth = conditional(set_size, &p);
+            let (act, _) = run_seq_trial(net, cfg, &p, task_seed);
+            let s = score_n(w, &act);
+            let q = softmax_n(&s);
+            let tv = total_variation(&truth, &q);
+
+            fid_sum += 1.0 - tv;
+            n_all += 1.0;
+
+            let live: Vec<usize> = (0..V).filter(|&t| truth[t] > 0.0).collect();
+            if live.len() == 1 {
+                let hit = if argmax_first(&s) == live[0] { 1.0 } else { 0.0 };
+                det_hit += hit;
+                det_n += 1.0;
+                if fam.contains(&p) {
+                    fam_hit += hit;
+                    fam_n += 1.0;
+                }
+            } else {
+                fork_tv.push((p.clone(), tv));
+            }
+        }
+
+        SeqMetrics {
+            fidelity: fid_sum / n_all,
+            det_acc: if det_n > 0.0 { det_hit / det_n } else { 0.0 },
+            family_acc: if fam_n > 0.0 { fam_hit / fam_n } else { 0.0 },
+            fork_tv,
+        }
+    }
+
+    /// Train online, evaluating exactly every `eval_every` trials and returning the **peak**
+    /// metrics plus the trial count they were reached at.
+    ///
+    /// Best-checkpointing is not optional: `rate_reg` over-trains into a non-monotonic accuracy
+    /// collapse (recorded as transient at ~4 layers, permanent by ~12 — we sit at 5). Compare at the
+    /// peak of the duration sweep, never at a fixed final trial count.
+    ///
+    /// The usual objection — that reporting the max over evals selects on the reported set — is much
+    /// weaker here than in the sampled-holdout battery: this evaluation has *no sampling noise*, so
+    /// the max reads the true peak of a deterministic curve rather than the top of the noise.
+    fn train_and_eval_best_seq(
+        net: &mut Network,
+        entries: &[Vec<Edge>],
+        seed: u64,
+        task_seed: u64,
+        cfg: &SeqCfg,
+        set_size: usize,
+        eval_every: usize,
+        patience: usize,
+        max_trials: usize,
+    ) -> (SeqMetrics, usize) {
+        let ls = (cfg.size * cfg.size) as usize;
+        let task = seq_task(set_size);
+        let mut w = vec![vec![0f32; ls]; V];
+        let mut best = eval_all_prefixes(net, cfg, &w, set_size, task_seed);
+        let (mut best_at, mut stale, mut t) = (0usize, 0usize, 0usize);
+
+        while t < max_trials {
+            let stop = (t + eval_every).min(max_trials);
+            while t < stop {
+                let (prefix, target) = task(task_seed, t);
+                let (act, ttot) = run_seq_trial(net, cfg, &prefix, task_seed);
+                let p = softmax_n(&score_n(&w, &act));
+                let err: Vec<f32> = (0..V).map(|c| p[c] - if c == target { 1.0 } else { 0.0 }).collect();
+                for c in 0..V {
+                    for j in 0..ls {
+                        w[c][j] -= cfg.readout_lr * err[c] * act[j];
+                    }
+                }
+                if cfg.hidden_lr != 0.0 {
+                    let signal = build_signal_n(net, &w, &err, seed, ttot, cfg);
+                    net.dfa_update(entries, &signal, cfg.hidden_lr);
+                }
+                t += 1;
+            }
+            let m = eval_all_prefixes(net, cfg, &w, set_size, task_seed);
+            if m.fidelity > best.fidelity {
+                best = m;
+                best_at = t;
+                stale = 0;
+            } else {
+                stale += 1;
+                if stale >= patience {
+                    break;
+                }
+            }
+        }
+        (best, best_at)
+    }
+
+    #[test]
+    fn eval_all_prefixes_scores_an_untrained_net() {
+        let cfg = seq_cfg();
+        let (mut net, _) = make_ff_seq(6, 16, 5, OP_UC, OP_UR, 3, 6);
+        let w = vec![vec![0f32; 256]; V];
+
+        // At init every weight is 0, so every score ties at 0.0 and softmax is uniform over V.
+        let m = eval_all_prefixes(&mut net, &cfg, &w, 4, 7);
+
+        // Fidelity of a uniform predictor: for a one-hot truth, 1 - TV = 1/V. The 7 deterministic
+        // prefixes each score 1/9; the 2 forks score higher (uniform is closer to a spread truth
+        // than to a one-hot). So fidelity sits just above 1/V.
+        assert!(m.fidelity > 1.0 / V as f32 - 0.01, "uniform predictor scores ~1/V, got {}", m.fidelity);
+        assert!(m.fidelity < 0.35, "an untrained net must not look good, got {}", m.fidelity);
+
+        // argmax_first breaks the init tie toward token 0, which no deterministic prefix targets.
+        assert_eq!(m.det_acc, 0.0, "untrained argmax ties to token 0; no prefix targets it");
+
+        // Exactly the two forks are reported, both badly calibrated at init.
+        assert_eq!(m.fork_tv.len(), 2);
+        assert!(m.fork_tv.iter().all(|(_, tv)| *tv > 0.3), "uniform is far from both forks");
+
+        // Determinism: the whole evaluation is a pure function.
+        let m2 = eval_all_prefixes(&mut net, &cfg, &w, 4, 7);
+        assert_eq!(m.fidelity, m2.fidelity);
+        assert_eq!(m.det_acc, m2.det_acc);
+    }
+
+    #[test]
+    fn seq_training_moves_off_chance() {
+        // A cheap smoke test: does the loop learn *anything*? Not a result — the real runs are the
+        // #[ignore]d experiments. Kept small enough for `cargo test`.
+        let cfg = seq_cfg();
+        let (mut net, entries) = make_ff_seq(9, 16, 5, OP_UC, OP_UR, 3, 6);
+        let (best, best_at) = train_and_eval_best_seq(&mut net, &entries, 9, 7, &cfg, 4, 100, 4, 1200);
+
+        // Chance fidelity for a uniform predictor is ~1/V ≈ 0.111.
+        assert!(best.fidelity > 0.15, "training must beat a uniform predictor, got {}", best.fidelity);
+        assert!(best_at > 0, "the peak must land somewhere");
+        assert_eq!(best.fork_tv.len(), 2, "both forks reported at the peak");
+
+        // Every reported metric is a well-formed fraction. Whether family_acc clears the Markov-2
+        // ceiling is Phase B's question, not this smoke test's — 1200 trials is far too few to ask.
+        assert!((0.0..=1.0).contains(&best.det_acc), "det_acc is a fraction, got {}", best.det_acc);
+        assert!((0.0..=1.0).contains(&best.family_acc), "family_acc is a fraction, got {}", best.family_acc);
+        assert!(best.fork_tv.iter().all(|(_, tv)| (0.0..=1.0).contains(tv)), "TV is bounded, got {:?}", best.fork_tv);
+    }
+
+    #[test]
+    fn run_seq_trial_is_deterministic_and_alive() {
+        let cfg = seq_cfg();
+        let (mut net, _) = make_ff_seq(3, 16, 5, OP_UC, OP_UR, 3, 6);
+
+        // A trial produces activity — otherwise `act` is all zeros and nothing can ever train.
+        let (act, ttot) = run_seq_trial(&mut net, &cfg, &[0, 1, 2], 7);
+        assert_eq!(act.len(), 256);
+        assert!(act.iter().any(|&x| x > 0.0), "top layer must spike in the read window");
+
+        // ttot is the full timeline: 3 tokens × present + 2 gaps × delay + read.
+        assert_eq!(ttot, 3 * cfg.present + 2 * cfg.delay + cfg.read);
+
+        // Prefix length changes the timeline — unlike the fixed-length battery, `ttot` varies here,
+        // which is why build_signal's rate normalisation is load-bearing for this task.
+        let (_, t1) = run_seq_trial(&mut net, &cfg, &[0], 7);
+        assert_eq!(t1, cfg.present + cfg.read);
+        assert!(t1 < ttot, "shorter prefix, shorter trial");
+
+        // Determinism: the engine resets per trial, so a prefix yields exactly one score vector.
+        // This is what makes the exact 9-prefix evaluation possible.
+        let (a1, _) = run_seq_trial(&mut net, &cfg, &[0, 1, 2], 7);
+        let (a2, _) = run_seq_trial(&mut net, &cfg, &[0, 1, 2], 7);
+        assert_eq!(a1, a2, "same prefix → same activity, every time");
+
+        // Different prefixes are distinguishable at the top layer, or the readout has nothing to use.
+        let (b, _) = run_seq_trial(&mut net, &cfg, &[1, 1, 2], 7);
+        assert_ne!(a1, b, "[1,2,3] and [2,2,3] must differ at the top layer");
+    }
+
+    #[test]
+    fn build_signal_n_shape_and_rate_term() {
+        let mut cfg = seq_cfg();
+        let (mut net, _) = make_ff_seq(4, 16, 5, OP_UC, OP_UR, 3, 6);
+        let ls = 256usize;
+        let w = vec![vec![0f32; ls]; V];
+        let err = vec![0f32; V];
+        let (_, ttot) = run_seq_trial(&mut net, &cfg, &[0, 1, 2], 7);
+
+        // Shape: one row per layer, L0's row left zeroed (DFA never targets the transducer).
+        let sig = build_signal_n(&net, &w, &err, 5, ttot, &cfg);
+        assert_eq!(sig.len(), 5);
+        assert!(sig.iter().all(|r| r.len() == ls));
+        assert!(sig[0].iter().all(|&x| x == 0.0), "L0 is never a DFA target");
+
+        // With zero task error the signal is exactly the rate term, for every neuron.
+        let sc = net.layer_spike_count(1);
+        for j in 0..ls {
+            let rate = sc[j] as f32 / ttot as f32;
+            let expect = cfg.rate_reg * (rate - cfg.rate_target);
+            assert!((sig[1][j] - expect).abs() < 1e-5, "signal is exactly the rate term at neuron {j}");
+        }
+
+        // The sign convention is the mechanism rate_reg works by: `dfa_update` applies
+        // `-lr · signal · e` with `e ≥ 0`, so a below-target neuron must get a *negative* signal
+        // (incoming weights pushed up, firing more) and an above-target one a *positive* signal.
+        //
+        // Note both sides must exist. At the c32 operating point no L1 neuron is ever silent — every
+        // one fires at least once across a 34-wave trial at ~17.5% mean rate — so this deliberately
+        // does not look for a zero-rate neuron; rate_reg still homogenizes *across* the spread.
+        let below = (0..ls).find(|&j| (sc[j] as f32 / ttot as f32) < cfg.rate_target);
+        let above = (0..ls).find(|&j| (sc[j] as f32 / ttot as f32) > cfg.rate_target);
+        assert!(below.is_some() && above.is_some(), "the operating point straddles rate_target (not degenerate)");
+        assert!(sig[1][below.unwrap()] < 0.0, "below-target neuron gets a negative (excitatory) signal");
+        assert!(sig[1][above.unwrap()] > 0.0, "above-target neuron gets a positive (suppressing) signal");
+
+        // At rate_reg 0 the term drops out entirely and rate_target becomes inert — the Phase B
+        // rate_reg{0} cells depend on this.
+        cfg.rate_reg = 0.0;
+        let sig0 = build_signal_n(&net, &w, &err, 5, ttot, &cfg);
+        assert!(sig0[1].iter().all(|&x| x == 0.0), "zero error + zero rate_reg → zero signal");
+
+        // dfa_weight is a deterministic ±1 hash.
+        assert_eq!(dfa_weight(5, 17, 3), dfa_weight(5, 17, 3));
+        assert!(dfa_weight(5, 17, 3).abs() == 1.0);
     }
 
     #[test]
