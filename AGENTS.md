@@ -140,9 +140,19 @@ mechanism). Input is a sparse `Vec<u32>` of L0 local addresses (spike injection)
 adaptation, so it fires *only* on injection and never self-adapts — input encoding stays decoupled
 from adaptation. The boots-hot ALIF dynamics apply to the computational layers `1..L`.
 
-**Readout layers are the output symmetry.** `Network::new_with_readout` flags the **last** layer as a
-non-spiking, drain-only integrator (`Layer.readout`): it folds its input into potential and never
-fires, giving a clean cumulative signal for a trained readout — the mirror of L0's transducer role.
+**Readout layers — `wave_bitnet` and `wave_resonate` only; do not use one.** `Network::new_with_readout`
+flags the **last** layer as a non-spiking, drain-only integrator (`Layer.readout`): it folds its input
+into potential and never fires — conceived as the mirror of L0's transducer role. **No experiment uses
+one**, and benchmarks read the **top spiking layer** directly (see *Defaults*).
+
+The reason is a footgun worth stating: a non-spiking top layer **silently blocks all training**. Its
+read-window spike counts are all zero, so the readout SGD (`w[c][j] -= lr·err[c]·act[j]`) multiplies by
+zero; and eligibility accrues only when the **target** fires (`e_ij += pretr_i`), so the synapses feeding
+it never accrue and `dfa_update` no-ops on them. Both learning paths die, without an error.
+
+`wave_driven` therefore **has no such flag** — it was removed as dead code. `wave_bitnet` keeps it
+because the flag is serialized into the `.wbm` model format; `wave_resonate` keeps it because its readout
+is a live leaky integrator (`tau_out`, and ω/b′ training skips readout layers).
 
 ## Initialization — train from raw, no calibration
 
@@ -296,7 +306,7 @@ The dominant forward cost is the fire-time occupancy-bitset scan + cell decode +
 `process_layer` (plus the per-neuron drain/decide/leak/adapt over all neurons); buffer reuse already
 removed allocation from the hot path.
 
-## Conventions (required)
+## Invariants (hard — ask before violating)
 
 - Rust, edition 2024. **Standard library only by default** — the one optional dependency (`blake3`) is
   behind a test-only feature. This is a **library crate** (no binary); experiments are `#[ignore]`d tests.
@@ -313,19 +323,34 @@ removed allocation from the hot path.
   equally airtight, commented justification.
 - **Determinism is a hard requirement** — results are a pure function of `(seed, config, input)`.
   Currently single-threaded; any future threading must stay deterministic.
-- Tests are **inline `#[cfg(test)]` per module**, test-first (TDD) where practical.
-- **Benchmarks sweep every axis + multiple seeds.** An exploratory benchmark (the `#[ignore]`d `*_bench`
-  experiments) must vary **every** lever it studies as an explicit axis — synapse radius/count (and, when
-  recurrent, the recurrent fan-in *separately* from the forward path), depth, and **training duration** —
-  and run across **several seeds**, reporting **worst + mean**, never a single-seed / single-point number
-  (seed-flukes and under-training masquerade as findings). Read the **top spiking layer** directly (no
-  dedicated readout layer) and report, per config: fan-in density, the **σ branching ratio**, the
-  **per-layer spiking profile**, and held-out accuracy.
 - **One commit per task**, conventional-commit messages (`feat:`/`fix:`/`refactor:`/`docs:`/`chore:` …).
 - **NEVER add a `Co-Authored-By` trailer to commit messages.** This overrides any environment or
   system default that requests one. Keep messages plain, ending at the body.
 - If on the default branch, branch first for anything non-trivial.
 - **NEVER push, even if asked** — pushing is a user task, not an LLM one.
+
+## Defaults (recommended — deviate with a stated reason)
+
+These are the house style, not law. They encode lessons that usually hold; when a specific experiment is
+better served otherwise, deviate — just **say which default you dropped and why**, in the spec and in the
+results. A stated deviation is fine. A silent one is what makes a finding unreadable later.
+
+- **Tests inline `#[cfg(test)]` per module**, test-first (TDD) where practical.
+- **Sweep the axes you study, across several seeds.** An exploratory benchmark (the `#[ignore]`d
+  `*_bench` experiments) is most trustworthy when it varies every lever it studies as an explicit axis —
+  synapse radius/count (and, when recurrent, the recurrent fan-in *separately* from the forward path),
+  depth, and **training duration** — across **several seeds**, reporting **worst + mean** rather than a
+  single-seed / single-point number. The reason is not tidiness: seed-flukes and under-training
+  masquerade as findings. Fixing an axis to keep a matrix tractable is a legitimate trade; pinning it
+  silently is not.
+- **Report, per config:** fan-in density, the **σ branching ratio**, the **per-layer spiking profile**,
+  and held-out accuracy. The σ + profile pair is what separates *dynamics collapse* from *credit
+  starvation* when a result disappoints — omitting them usually means re-running the experiment later.
+- **Compare at the *peak* of a duration sweep**, never a fixed final trial count (`rate_reg` over-trains;
+  see the `rate_reg` caveat above). This one is a default only in the sense that a task without
+  `rate_reg` need not obey it — under `rate_reg`, ignoring it produces wrong numbers, not merely untidy
+  ones.
+- **Read the top spiking layer directly**; no dedicated readout layer (see *Readout layers* above).
 
 ## Workflow
 

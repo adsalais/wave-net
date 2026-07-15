@@ -83,12 +83,46 @@ Membrane potential cannot carry the first token: the `.max(1)` floor drains any 
 ~16 waves, and a 3-token prefix spans 26. But the adaptation trace decays at ρ = 1 − 2⁻⁶ = **0.984/wave**
 (`adapt_decay: 6`), retaining **~66%** across those 26 waves.
 
+This is corroborated by a recorded finding rather than resting on the arithmetic above — AGENTS.md
+already states: *"ALIF adaptation is both a working memory **and** load-bearing for liveness. It is a
+strong **~64-wave held-category memory (store-recall)**; it does **not** help linear echo (MC) or
+nonlinear temporal computation (XOR) feed-forward."* The timescale matches exactly (`adapt_decay: 6` →
+τ ≈ 64 waves), and "store-recall" is precisely this task. It also explains the gap this benchmark fills:
+the existing battery is all XOR-shaped computation, which is the regime where adaptation is recorded as
+*not* helping — so adaptation-as-memory has never actually been probed. **This task is adaptation's home
+turf.**
+
 So the two topologies store the first token in different physics — FF in the **adaptation trace**, the
 side-car in its L2 scratchpad's ongoing **recurrent spiking**. Since `adapt_bump` sets the trace's
 amplitude, **lowering it should degrade FF while leaving the side-car flat.** That predicted crossing is
 the experiment's headline result, and it is why `adapt_bump` is the main axis rather than a setting.
 
 ## Components
+
+### 0. Remove `wave_driven`'s dead `readout` flag (engine, prerequisite)
+
+The flag makes a layer drain-only (`wave.rs:63-66` returns before decide/fire) and is a silent training
+killer: zero `act` ⇒ the readout SGD multiplies by zero; eligibility accrues only on **target** fire ⇒
+the synapses feeding it never accrue and `dfa_update` no-ops. It is also **dead** — in `wave_driven`,
+`new_with_readout` is called by nothing but its own unit test.
+
+Delete, from `wave_driven` only: the `Layer.readout` field (`neurons.rs:96`), `Network::new_with_readout`
+(`network.rs:41`), `build`'s `readout_last` parameter (`network.rs:49,62-63`), the `wave.rs:64-66`
+branch, and the `readout_integrates_without_firing` test (`network.rs:552`).
+
+**Zero behavioural change**, which is the point: every surviving constructor (`new`, `new_dense`) already
+passes `readout_last = false`, so the deleted branch was never taken and the recorded battery reproduces
+bit-exactly. The `equivalence_tests.rs` oracles (sparse==dense; `adapt_bump==0` bit-exact vs
+`wave_bitnet`) are unaffected — neither uses the flag.
+
+**Not touched:** `wave_bitnet` (the flag is serialized into the fingerprint-bound `.wbm` format —
+`persist.rs:82,108,117`, asserted at `:357`) and `wave_resonate` (its readout is a live leaky integrator:
+`tau_out`, and `dfa_update` skips ω/b′ training for readout layers at `network.rs:373`). AGENTS.md's
+*Readout layers* paragraph is updated to scope the feature to those two engines and record the footgun.
+
+This resolves a standing self-contradiction in AGENTS.md, which described readout layers as "the output
+symmetry" in the architecture section while the benchmarking conventions said "no dedicated readout
+layer" — plausibly why the flag existed, unused, in all three engines.
 
 ### 1. New module `src/bench/wave_driven_seq_bench.rs` (registered in `src/bench/mod.rs`)
 
@@ -159,23 +193,11 @@ axis and is expected to show up in the results, not a defect.
 ### 4. Topologies (5 layers each — matched)
 
 L0 is a forced injection transducer that does not compute, so 5 layers is 4 computing layers.
-Per AGENTS.md the **top spiking layer is read directly**; no dedicated readout layer.
-
-**Do not call `Network::new_with_readout` — it would silently block all training.** The engine's
-`readout: bool` flag makes a layer a drain-only integrator: `wave.rs:63-66` returns *before*
-decide/fire, so the layer never spikes. Two consequences, both silent:
-
-1. `act[j]` (top-layer read-window spike counts) is all zeros, so the readout SGD
-   `w[c][j] -= readout_lr * err[c] * act[j]` multiplies by zero and never learns.
-2. Eligibility accrues only when the **target** fires (`e_ij += pretr_i`), so the incoming L3→L4
-   synapses never accrue, and `dfa_update` is a no-op on them.
-
-Use plain `Network::new` (which passes `readout_last = false`, `network.rs:38-40`), as both `make_ff`
-and `make_sidecar` already do. The top layer is then an ordinary spiking layer whose only peculiarity is
-having no outgoing work — `make_sidecar`'s L4 has genuinely empty topology, while `make_ff`'s top layer
-carries an inert level-1 topology aimed at a nonexistent layer 5 (`entries[top] = vec![]` keeps DFA off
-it). It receives from L3, integrates, and fires normally, with `rate_reg` driving it toward
-`rate_target`.
+The **top spiking layer is read directly**; no dedicated readout layer (see Phase 0). The top layer is an
+ordinary spiking layer whose only peculiarity is having no outgoing work — `make_sidecar`'s L4 has
+genuinely empty topology, while `make_ff`'s top layer carries an inert level-1 topology aimed at a
+nonexistent layer 5 (`entries[top] = vec![]` keeps DFA off it). It receives from L3, integrates, and
+fires normally, with `rate_reg` driving it toward `rate_target`.
 
 - **FF:** `make_ff(seed, size 16, layers 5, up_count 16, up_radius 3, adapt_bump, adapt_decay 6)`,
   membrane-only (`elig_beta 0`).
@@ -224,16 +246,34 @@ Metrics per (topology, bump, set, seed):
 
 ## Run matrix
 
-**Phase A — liveness pilot (6 runs).** density {32, 64} × `adapt_bump` {1,3,5}, FF only, 4-set, 1 seed.
-Purpose is to pick density on σ and the spiking profile. The analysis says 32 is the floor (≈2 synapses
-per neuron: `sites × 16 / 256 ≥ 2`); this measures it rather than trusting the arithmetic. A 1-seed pilot
-for operating-point selection is not the reported result.
+The r/c sweep runs **first**, as a reported result rather than a hedge — it is the axis AGENTS.md most
+wants swept, and its outcome fixes the operating point everything after it uses.
+
+**Phase A1 — forward fan-in + density (24 runs).** density {32, 64} × forward `(r,c)` ∈ {(2,8), (3,16),
+(3,32), (4,16)} × 3 seeds. FF, 4-set, `adapt_bump 3` (the recorded good point; the interaction with bump
+is Phase B's business). Constraint: `c ≤ (2r+1)²`, so r2 caps at 25 and r3 at 49.
+
+Select on **dynamics** — σ near 1, a healthy per-layer profile, no dead or saturated layer — with
+accuracy secondary. Dynamics are the low-variance, seed-robust signal; picking an operating point on
+accuracy across 3 seeds invites a fluke.
+
+**These two axes are not independent, and that is itself a result.** Input drive is set by the product
+`sites × c` (§Design analysis 1: each neuron needs ≥2 incoming synapses, i.e. `sites × c / 256 ≥ 2`), so
+density and `c` trade off directly at L0 — 64 sites needs `c ≥ 8`, 32 sites needs `c ≥ 16`. But `c` also
+sets **hidden**-layer drive, where the source is ~25 firing neurons (`rate_target 0.1`), giving
+`25 × c / 256` ≈ 1.6 synapses per neuron at c16 — right at the coincidence floor. So `c` is doing two
+different jobs and the sweep should show them separating.
+
+**Phase A2 — recurrent fan-in, swept separately (9 runs).** Side-car `(n, r)` ∈ {(8,3), (8,4), (16,4)} ×
+3 seeds, at A1's forward winner, `adapt_bump 3`, 4-set. Separate from the forward sweep per AGENTS.md;
+the recorded sweet spot is n=8 (σ collapses by n≥24), so this is a confirmation at this task's operating
+point rather than an open search.
 
 **Phase B — main experiment (54 runs).** `adapt_bump` {1,3,5} × {FF, side-car} × set {4,5,6} × 3 seeds,
-at the density Phase A picks.
+at the Phase A operating point. This is the headline: the predicted FF/side-car crossing in `adapt_bump`.
 
-60 runs at size 16 / 5 layers ≈ 13 size-32-equivalents — below the existing confirmation suite's 24.
-Both phases are `#[ignore]`d inline tests, run manually in `--release`.
+≈87 runs at size 16 / 5 layers ≈ 22 size-32-equivalents — still under the existing confirmation suite's
+24. All phases are `#[ignore]`d inline tests, run manually in `--release`.
 
 ## Non-goals and deviations
 
@@ -244,12 +284,16 @@ Both phases are `#[ignore]`d inline tests, run manually in `--release`.
 - **Sparse / one-hot input drive** — rejected on the arithmetic in §Design analysis 1–2, not on taste.
   If revisited, it is a separate spike answering "can `wave_driven` compute under ~1-neuron-per-layer
   drive at all?", with its own σ sweep — never confounded with this question.
-- **Deviation from AGENTS.md:** r3/c16 is **fixed**, not swept, and depth is fixed at 5. AGENTS.md
-  requires sweeping radius/count and depth. Mitigation: an r/c sanity check at the winning `adapt_bump`
-  once the headline result is in. Flagged explicitly so the result is not over-read.
-- **`adapt_decay`** — fixed at 6 (τ ≈ 64 waves vs a 26-wave prefix), matching the battery. Sweeping it
-  alongside `adapt_bump` would map FF's memory horizon in two dimensions; deferred to a follow-up once
-  the crossing is confirmed.
+- **Defaults dropped, and why** (AGENTS.md *Defaults* asks that these be stated, not that they never
+  happen):
+  - **Depth is fixed at 5**, not swept. Depth is matched between FF and the side-car so the comparison
+    isolates topology; sweeping it would confound the headline axis. Depth-reach is also already
+    characterised for `wave_driven` (the skip-topology work reaching 24).
+  - **`adapt_decay` fixed at 6** (τ ≈ 64 waves vs a 26-wave prefix), matching the battery. It sets the
+    adaptation trace's *horizon* where `adapt_bump` sets its *amplitude*; sweeping both would map FF's
+    memory capacity in two dimensions and is the natural follow-up once the crossing is confirmed.
+  - **`adapt_bump 3` is pinned during Phase A**, so the r/c winner is selected under one bump. Accepted:
+    the alternative is a 3× larger pilot to tune a variable Phase B then sweeps anyway.
 
 ## Risks
 
