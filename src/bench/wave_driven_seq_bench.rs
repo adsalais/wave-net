@@ -6,7 +6,11 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::wave_driven::synapse::{key, mix};
+    use crate::wave_driven::config::{Config, LayerConfig};
+    use crate::wave_driven::network::Network;
+    use crate::wave_driven::synapse::{key, mix, TopologyLevel};
+    use crate::wave_driven::training::{Edge, EligParams};
+    use std::sync::{Arc, Mutex};
 
     /// Vocabulary size. Tokens {1,2,3,4,5,6,7,8,16} → ids 0..8.
     const V: usize = 9;
@@ -17,6 +21,25 @@ mod tests {
     /// Hash purpose tag for token site codes. Distinct from `wave_driven_bench`'s `CUE_P` (0xC0E) —
     /// this is a different predicate over a different site set, and a different task.
     const CUE_P: u64 = 0xC0F;
+
+    /// Operating point. `density 2` ≈ 64 of 256 sites per token; `r3/c32` ≈ 8 synapses per L1
+    /// neuron.
+    ///
+    /// **c32, not the c16 the spec first assumed.** Measured untrained at 5 layers, r3/c16 dies from
+    /// L3 up ([22.3, 8.1, 1.3, 0.0, 0.0], σ 0.069) — the read layer never spikes, so `act` is all
+    /// zeros and nothing can train. r3/c32 is intrinsically live ([22.3, 17.5, 13.8, 11.0, 10.2],
+    /// σ 0.83), settling near `rate_target` on its own. Count is the lever, not radius: r4/c16
+    /// measures σ 0.070, indistinguishable from r3/c16, while c48 goes supercritical (σ 1.03).
+    ///
+    /// The coincidence floor is ~8 synapses/neuron, not the ~2 the spec estimated: untrained ternary
+    /// weights are random ±1/0, so of 8 synapses only ~2.7 are +1 and ~2.7 are −1 and they largely
+    /// cancel — ~8 raw synapses are needed to reliably net ≥2.
+    ///
+    /// Phase A1 confirms this *under training* (weights reshape, so σ moves) and reports where the
+    /// accuracy peak lands so `OP_MAX_TRIALS` can be set from measurement.
+    const OP_DENSITY: u32 = 2;
+    const OP_UR: u32 = 3;
+    const OP_UC: u32 = 32;
 
     /// The six sequences as token ids. Sets are nested: set 4 = SEQS[..4], set 5 = SEQS[..5], etc.
     /// ids: 0→"1" 1→"2" 2→"3" 3→"4" 4→"5" 5→"6" 6→"7" 7→"8" 8→"16"
@@ -165,6 +188,139 @@ mod tests {
     /// collapsed onto one branch. For a one-hot `p`, `1 − TV` is exactly `q[target]`.
     fn total_variation(p: &[f32], q: &[f32]) -> f32 {
         0.5 * p.iter().zip(q).map(|(a, b)| (a - b).abs()).sum::<f32>()
+    }
+
+    /// Plain feed-forward stack, `layers` deep. L0 is forced to a transducer by the engine
+    /// (threshold i16::MAX, adapt_bump 0), so 5 layers is 4 computing layers. The top layer is read
+    /// directly; its level-1 topology points past the stack and is inert, and `entries[top]` is empty
+    /// so DFA never targets it. Membrane-only eligibility (`elig_beta 0`).
+    fn make_ff_seq(seed: u64, size: u32, layers: usize, uc: u32, ur: u32, adapt_bump: i16, adapt_decay: u8) -> (Network, Vec<Vec<Edge>>) {
+        let lc = LayerConfig {
+            topology: vec![TopologyLevel { level: 1, radius: ur, count: uc }],
+            leak: (3, 5),
+            cooldown_base: 2,
+            inhibitor_ratio: 0,
+            threshold_jitter: 32,
+            baseline_init: 6,
+            adapt_bump,
+            adapt_decay,
+        };
+        let mut net = Network::new(Config { seed, size, layers: vec![lc; layers] });
+        net.enable_training();
+        net.set_elig_params(EligParams { rec_tau: 6.0, epsilon: 1.0 / 1024.0, elig_beta: 0.0, epsilon_a: 1.0 / 1024.0 });
+        let entries = (0..layers)
+            .map(|z| if z == layers - 1 { vec![] } else { vec![Edge { level: 1, count: uc as usize, radius: ur }] })
+            .collect();
+        (net, entries)
+    }
+
+    /// Backward-fed side-car, 5 layers: L0→L1(+1); L1→L3(+2, skipping past the scratchpad);
+    /// L2 self(0)+→L3(+1); L3→L2(−1)+→L4(+1); L4 read. The recurrent layer is isolated from the
+    /// forward path. Spike-ψ εᵃ (`elig_beta 0.4`) is what makes the recurrence trainable, and it
+    /// requires a non-zero `adapt_bump` to couple to.
+    fn make_sidecar_seq(seed: u64, size: u32, uc: u32, ur: u32, n: u32, r: u32, adapt_bump: i16, adapt_decay: u8) -> (Network, Vec<Vec<Edge>>) {
+        let mk = |topology| LayerConfig {
+            topology,
+            leak: (3, 5),
+            cooldown_base: 2,
+            inhibitor_ratio: 0,
+            threshold_jitter: 32,
+            baseline_init: 6,
+            adapt_bump,
+            adapt_decay,
+        };
+        let layers = vec![
+            mk(vec![TopologyLevel { level: 1, radius: ur, count: uc }]),
+            mk(vec![TopologyLevel { level: 2, radius: ur, count: uc }]),
+            mk(vec![TopologyLevel { level: 0, radius: r, count: n }, TopologyLevel { level: 1, radius: r, count: n }]),
+            mk(vec![TopologyLevel { level: -1, radius: r, count: n }, TopologyLevel { level: 1, radius: ur, count: uc }]),
+            mk(vec![]),
+        ];
+        let mut net = Network::new(Config { seed, size, layers });
+        net.set_elig_params(EligParams { rec_tau: 20.0, epsilon: 1.0 / 1024.0, elig_beta: 0.4, epsilon_a: 1.0 / 1024.0 });
+        net.enable_training();
+        let entries = vec![
+            vec![Edge { level: 1, count: uc as usize, radius: ur }],
+            vec![Edge { level: 2, count: uc as usize, radius: ur }],
+            vec![Edge { level: 0, count: n as usize, radius: r }, Edge { level: 1, count: n as usize, radius: r }],
+            vec![Edge { level: -1, count: n as usize, radius: r }, Edge { level: 1, count: uc as usize, radius: ur }],
+            vec![],
+        ];
+        (net, entries)
+    }
+
+    /// Per-layer firing rate (%/neuron/wave) over a window, plus σ (mean consecutive-layer spike
+    /// ratio). The dynamics diagnostic AGENTS.md requires: σ + profile is what separates *dynamics
+    /// collapse* from *credit starvation* when a result disappoints.
+    fn rate_profile_seq(net: &mut Network, size: u32, task_seed: u64, token: usize, density: u32, warmup: usize, waves: usize) -> (Vec<f64>, f64) {
+        let l = net.layer_count();
+        let counts = Arc::new(Mutex::new(vec![0u64; l]));
+        for z in 0..l {
+            let c = counts.clone();
+            net.on_layer(z, Box::new(move |_w, f: &[u32]| c.lock().unwrap()[z] += f.len() as u64));
+        }
+        net.reset_state();
+        let sites = token_sites(task_seed, size, token, density);
+        for _ in 0..warmup {
+            net.wave(&sites);
+        }
+        counts.lock().unwrap().iter_mut().for_each(|x| *x = 0);
+        for _ in 0..waves {
+            net.wave(&sites);
+        }
+        net.clear_listeners();
+        let counts = std::mem::take(&mut *counts.lock().unwrap());
+        let denom = ((size as u64) * (size as u64) * waves as u64) as f64;
+        let pct: Vec<f64> = counts.iter().map(|&s| (s as f64 / denom * 1000.0).round() / 10.0).collect();
+        let mut ratios = Vec::new();
+        for z in 1..l - 1 {
+            if counts[z] > 0 {
+                ratios.push(counts[z + 1] as f64 / counts[z] as f64);
+            }
+        }
+        let sigma = if ratios.is_empty() { 0.0 } else { ratios.iter().sum::<f64>() / ratios.len() as f64 };
+        (pct, sigma)
+    }
+
+    #[test]
+    fn builders_produce_live_five_layer_nets() {
+        // FF: 5 layers (L0 transducer + 4 computing) at the operating point, r3/c32 density 2.
+        let (mut net, entries) = make_ff_seq(1, 16, 5, OP_UC, OP_UR, 3, 6);
+        assert_eq!(net.layer_count(), 5);
+        assert_eq!(entries.len(), 5);
+        assert!(entries[4].is_empty(), "top layer has no outgoing DFA edges");
+
+        // EVERY computational layer must fire, untrained. A dead layer accrues no eligibility, so it
+        // never trains — and a dead *top* layer means `act` is all zeros and the readout SGD
+        // multiplies by zero, so nothing trains at all.
+        //
+        // This is not a formality: measured untrained, r3/c16 gives [22.3, 8.1, 1.3, 0.0, 0.0]
+        // (σ 0.069) — dead from L3 up, unable to train. r3/c32 gives [22.3, 17.5, 13.8, 11.0, 10.2]
+        // (σ 0.83). `c` is the lever, not radius (r4/c16 measures 0.070, indistinguishable from
+        // r3/c16); c48 goes supercritical (σ 1.03, activity growing with depth).
+        let (pct, sigma) = rate_profile_seq(&mut net, 16, 7, 0, OP_DENSITY, 8, 24);
+        assert_eq!(pct.len(), 5);
+        for z in 1..5 {
+            assert!(pct[z] > 0.0, "L{z} must fire untrained, profile {pct:?} σ {sigma:.3}");
+        }
+        assert!(sigma > 0.4 && sigma < 1.2, "σ must be near-critical, got {sigma:.3}, profile {pct:?}");
+
+        // Side-car: 5 layers, L2 the isolated recurrent scratchpad, L4 the read layer.
+        let (mut net2, entries2) = make_sidecar_seq(1, 16, OP_UC, OP_UR, 8, 4, 3, 6);
+        assert_eq!(net2.layer_count(), 5);
+        assert_eq!(entries2.len(), 5);
+        assert!(entries2[4].is_empty(), "side-car read layer has no outgoing DFA edges");
+        assert_eq!(entries2[2].len(), 2, "L2 carries a self-loop and a forward edge");
+
+        // The side-car must also reach its read layer, or the comparison is vacuous. Its forward
+        // path is L0→L1→L3→L4 (L2 is the isolated scratchpad), so L2 may legitimately differ.
+        let (pct2, _) = rate_profile_seq(&mut net2, 16, 7, 0, OP_DENSITY, 8, 24);
+        assert!(pct2[4] > 0.0, "side-car read layer must fire untrained, profile {pct2:?}");
+
+        // Determinism: same seed and config → identical dynamics.
+        let (mut a, _) = make_ff_seq(2, 16, 5, OP_UC, OP_UR, 3, 6);
+        let (mut b, _) = make_ff_seq(2, 16, 5, OP_UC, OP_UR, 3, 6);
+        assert_eq!(rate_profile_seq(&mut a, 16, 7, 0, OP_DENSITY, 8, 24), rate_profile_seq(&mut b, 16, 7, 0, OP_DENSITY, 8, 24));
     }
 
     #[test]
