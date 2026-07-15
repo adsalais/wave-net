@@ -463,3 +463,29 @@ clear the ~5×-at-size-≥64 bar and unblock the size-64/128 multi-seed scaling 
 full-engine spec (non-goals here): forward/delivery/`dfa_update`/ω-b′ on GPU, keeping the whole per-wave
 loop device-resident (no transfer), bench-harness integration, sizes > 128, and (for browser portability)
 packing the index arrays into the 8-storage-buffer WebGPU baseline.
+
+---
+
+# Sequence-recall memory (`wave_driven`, 2026-07-15) — see `experiments_results_seq_memory.md`
+
+Can `wave_driven` **memorize** a branching sequence set and resolve a prefix family that only a 3-token
+memory can answer? **Yes — and the side-car does it reliably while feed-forward does not.** The side-car
+reaches family accuracy **1.000 on the worst seed of all 27 cells** against Markov-2 ceilings of
+0.500/0.333/0.250, and beats FF in **27/27**; FF fails the memory test in 8/27. Unlike the existing
+battery, **this task is discriminative** (nothing ceilings).
+
+Two results that bear on the engine generally, and one that corrects this file:
+
+- **`rate_reg` cannot rescue a *fully* dead layer.** Eligibility accrues only on *target* fire, so a
+  silent layer has `e = 0` and `dfa_update` is identically zero. The "conclusive liveness rescue" recorded
+  above has an unstated precondition: **weakly firing, not silent**. r3/c16 at 5 layers stays at chance
+  even after training with `rate_reg 5`.
+- **Adaptation quenches.** Higher `adapt_bump` raises the effective threshold and kills deep layers
+  (`[10.9, 4.1, 2.1, 0.5, 0.0]` at bump 5 vs `[10.9, 8.0, 6.6, 5.2, 6.0]` at bump 1). The spec's
+  prediction that adaptation-as-memory would make FF *degrade at low bump* is **refuted and inverted** —
+  both topologies degrade as bump *rises*. `adapt_decay` is the untested axis that would settle it.
+- **Count is the lever, radius is noise** (r2/r3/r4 at c24: σ 0.127/0.097/0.129), and the coincidence
+  floor is **~6-8 synapses/neuron**, not ~2 — untrained ternary weights cancel by sign.
+
+Full results, the 162-cell grid, and the caveats (notably a **token-drive confound** that affects the
+fidelity comparison but *not* the memory finding) are in `docs/experiments_results_seq_memory.md`.

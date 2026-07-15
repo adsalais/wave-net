@@ -60,11 +60,6 @@ pub fn process_layer(
         layer.cooldown[a as usize] = 0;
     }
 
-    // --- readout: drain-only integrator; no decide/leak/generate/carry ---
-    if layer.readout {
-        return;
-    }
-
     // --- 3. decide / fire / leak / carry (single arithmetic path; iteration set differs by mode) ---
     let (la, lb) = layer.leak;
     let cb = layer.cooldown_base;
