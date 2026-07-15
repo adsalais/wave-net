@@ -183,6 +183,41 @@ mod tests {
         TaskCfg { size: 16, present: 6, delay: 4, read: 6, holdout: 200, readout_lr: 0.02, hidden_lr: 0.004, rate_reg: 5.0, rate_target: 0.1 }
     }
 
+    // FF stack with a half-count +2 residual SKIP on every layer (forward r`ur`/c`uc` + skip r`sr`/c`sc`).
+    // Reproduces wave_bitnet's depth-reach topology: the skip routes signal around layers so credit reaches
+    // deeper than a plain level-1 stack (~12-16). Top layer read directly; out-of-range edges are inert.
+    fn make_ff_skip(seed: u64, size: u32, layers: usize, uc: u32, ur: u32, sc: u32, sr: u32, adapt_bump: i16, adapt_decay: u8) -> (Network, Vec<Vec<Edge>>) {
+        let lc = LayerConfig {
+            topology: vec![
+                TopologyLevel { level: 1, radius: ur, count: uc },
+                TopologyLevel { level: 2, radius: sr, count: sc },
+            ],
+            leak: (3, 5),
+            cooldown_base: 2,
+            inhibitor_ratio: 0,
+            threshold_jitter: 32,
+            baseline_init: 6,
+            adapt_bump,
+            adapt_decay,
+        };
+        let mut net = Network::new(Config { seed, size, layers: vec![lc; layers] });
+        net.enable_training();
+        net.set_elig_params(EligParams { rec_tau: 6.0, epsilon: 1.0 / 1024.0, elig_beta: 0.0, epsilon_a: 1.0 / 1024.0 });
+        let entries = (0..layers)
+            .map(|z| {
+                if z == layers - 1 {
+                    vec![]
+                } else {
+                    vec![
+                        Edge { level: 1, count: uc as usize, radius: ur },
+                        Edge { level: 2, count: sc as usize, radius: sr },
+                    ]
+                }
+            })
+            .collect();
+        (net, entries)
+    }
+
     // Backward-fed side-car (ported from benches/throughput_bitnet.rs make_sidecar):
     // L0→L1(+1); L1→L3(+2 skip); L2 self(0)+→L3(+1); L3→L2(−1)+→L4(+1); L4 read.
     fn make_sidecar(seed: u64, size: u32, uc: u32, ur: u32, n: u32, r: u32, adapt_bump: i16, adapt_decay: u8) -> (Network, Vec<Vec<Edge>>) {
@@ -313,6 +348,38 @@ mod tests {
         let worst = *bests.iter().min().unwrap();
         eprintln!("worst {worst} (target ~1000)");
         assert!(worst >= 900, "pure ternary FF depth-8 should hold ~1000 (worst {worst})");
+    }
+
+    #[test]
+    #[ignore] // check: does wave_driven reproduce wave_bitnet's depth-24 SKIP ceiling? (--release; env knobs
+              // D24_DEPTH / D24_TRIALS / D24_SEEDS, e.g. `D24_SEEDS=1 D24_TRIALS=400 cargo test ... --nocapture`)
+    fn wave_driven_ff_skip_depth24() {
+        let depths: Vec<usize> = std::env::var("D24_DEPTH")
+            .ok()
+            .map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+            .unwrap_or_else(|| vec![24]);
+        let max_trials: usize = std::env::var("D24_TRIALS").ok().and_then(|v| v.parse().ok()).unwrap_or(2500);
+        let seeds: Vec<u64> = std::env::var("D24_SEEDS")
+            .ok()
+            .map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+            .unwrap_or_else(|| vec![1, 2, 3]);
+        let size = 32u32;
+        eprintln!("== wave_driven FF+skip depth sweep {depths:?} (size {size}, fwd r3/c32 + skip r3/c16, adapt 5) — {} seed(s), max {max_trials} trials ==", seeds.len());
+        for &depth in &depths {
+            let mut best_all = Vec::new();
+            for &s in &seeds {
+                let t0 = std::time::Instant::now();
+                let (mut net, entries) = make_ff_skip(s, size, depth, 32, 3, 16, 3, 5, 6);
+                // trial length scaled to depth: a single cue must climb ~depth hops before the read window.
+                let cfg = TaskCfg { size, present: depth, delay: 4, read: depth, holdout: 200, readout_lr: 0.02, hidden_lr: 0.004, rate_reg: 5.0, rate_target: 0.1 };
+                let (best, at) = train_and_eval_best(&mut net, &entries, s, s, &cfg, single_task, 250, 5, max_trials);
+                eprintln!("  depth {depth} seed {s}: best {best}/1000 @ trial {at}  ({:.1}s)", t0.elapsed().as_secs_f64());
+                best_all.push(best);
+            }
+            let worst = *best_all.iter().min().unwrap();
+            let mean = best_all.iter().sum::<u64>() / best_all.len().max(1) as u64;
+            eprintln!("  => depth-{depth}: worst {worst}, mean {mean} (per-seed {best_all:?})");
+        }
     }
 
     #[test]

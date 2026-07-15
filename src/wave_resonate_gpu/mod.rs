@@ -321,7 +321,6 @@ mod tests {
     fn cpu_accrue_matches_dense_eligibility_oracle() {
         use crate::wave_resonate::training::{dense_eligibility, EligParams};
         let size = 8u32;
-        let ls = (size * size) as usize;
         let cfg = ff_cfg(size, 3);
         // a representative drive sequence (some cue waves, some silent)
         let inputs: Vec<Vec<u32>> =
