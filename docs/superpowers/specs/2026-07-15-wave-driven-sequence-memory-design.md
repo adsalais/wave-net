@@ -159,8 +159,23 @@ axis and is expected to show up in the results, not a defect.
 ### 4. Topologies (5 layers each — matched)
 
 L0 is a forced injection transducer that does not compute, so 5 layers is 4 computing layers.
-Per AGENTS.md the **top spiking layer is read directly**; no dedicated readout layer (the engine's
-`readout: bool` drain-only integrator at `wave.rs:63` stays unused, as in every other experiment).
+Per AGENTS.md the **top spiking layer is read directly**; no dedicated readout layer.
+
+**Do not call `Network::new_with_readout` — it would silently block all training.** The engine's
+`readout: bool` flag makes a layer a drain-only integrator: `wave.rs:63-66` returns *before*
+decide/fire, so the layer never spikes. Two consequences, both silent:
+
+1. `act[j]` (top-layer read-window spike counts) is all zeros, so the readout SGD
+   `w[c][j] -= readout_lr * err[c] * act[j]` multiplies by zero and never learns.
+2. Eligibility accrues only when the **target** fires (`e_ij += pretr_i`), so the incoming L3→L4
+   synapses never accrue, and `dfa_update` is a no-op on them.
+
+Use plain `Network::new` (which passes `readout_last = false`, `network.rs:38-40`), as both `make_ff`
+and `make_sidecar` already do. The top layer is then an ordinary spiking layer whose only peculiarity is
+having no outgoing work — `make_sidecar`'s L4 has genuinely empty topology, while `make_ff`'s top layer
+carries an inert level-1 topology aimed at a nonexistent layer 5 (`entries[top] = vec![]` keeps DFA off
+it). It receives from L3, integrates, and fires normally, with `rate_reg` driving it toward
+`rate_target`.
 
 - **FF:** `make_ff(seed, size 16, layers 5, up_count 16, up_radius 3, adapt_bump, adapt_decay 6)`,
   membrane-only (`elig_beta 0`).
