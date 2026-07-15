@@ -214,22 +214,57 @@ and `rate_reg` requires ALIF.
   spike counts; `softmax_n` (max-subtract) → cross-entropy `err[c] = p[c] − onehot[c]`; readout SGD
   `w[c][j] -= readout_lr * err[c] * act[j]`.
 - `build_signal` generalized over V: `signal[tz][j] = Σ_{c<V} b·err[c] + rate_reg·(spike_count[j]/ttot −
-  rate_target)`, with `b = w[c][j]` at the top layer and `dfa_weight(seed, tz*ls+j, c)` below.
+  rate_target)`, with `b = w[c][j]` at the top layer and `dfa_weight(seed, tz*ls+j, c)` below. `rate_reg`
+  is **bench-side**, as in the existing harness: the engine only exposes `layer_spike_count(z)`
+  (`network.rs:183`, "for rate_reg"), and the rule lives here per AGENTS.md.
 - `TaskCfg`-equivalent: `size 16, present 6, delay 4, read 8, readout_lr 0.02, hidden_lr 0.004,
   rate_reg 5.0, rate_target 0.1`.
-- **Duration:** `train_and_eval_best`-equivalent, `eval_every 200, patience 10, max_trials 12000`.
-  Per AGENTS.md, compare at the **peak** of the duration sweep, never at a fixed trial count —
-  `rate_reg` over-trains and collapses accuracy non-monotonically after convergence.
+- **`ttot` varies per trial here, unlike the battery.** `build_signal` normalizes rate by
+  `denom = ttot.max(1)`, and our prefixes differ in length (`[1]` spans 14 waves, `[1,2,3]` spans 34).
+  `rate_target` targets a firing *frequency*, not a count, so this is already correct — but it is
+  load-bearing in a way it is not for the fixed-length battery, and worth watching in Phase A.
+- **Duration:** `train_and_eval_best`-equivalent, **`eval_every 100`**, `patience 10`,
+  `max_trials 12000`. Compare at the **peak**, never at a fixed trial count — `rate_reg` over-trains into
+  a non-monotonic collapse (recorded: transient at ~4 layers, permanent by ~12; we are at 5).
+  `eval_every 100` rather than the battery's 300 because the exact 9-prefix eval costs ~9% overhead
+  against `max_trials` where a sampled `holdout: 200` would cost ~200% — cheap exactness buys finer peak
+  resolution, which is the whole point of best-checkpointing under `rate_reg`.
 
 ### 6. Evaluation — exact, not sampled
 
-**This task has no holdout, by design.** The 4-set has only 9 distinct prefixes (12 / 15 for the 5- and
-6-sets); train and test are the same items, which is correct because remembering *is* the task. It is a
-memorization and capacity measurement and must not be reported as generalization.
+**This task has no holdout, and cannot have one.** Not a compromise — a consequence of what is being
+measured.
 
-The engine is deterministic and resets per trial (`reset_state()`), so **each prefix yields exactly one
-score vector**. Evaluation enumerates all 9/12/15 prefixes, one run each — exact, no sampling, no
-variance, ~20× cheaper than the battery's `holdout: 200`. This is what affords `eval_every 200`.
+A holdout answers *"does it work on inputs it has never seen?"*. The battery can ask that because XOR and
+parity are **functions** over a huge input space: `task(seed, t)` trains and `task(seed, EVAL_OFFSET+i)`
+evaluates on genuinely fresh cue bits, and only a network that learned the *rule* can answer them.
+
+Here the entire universe of inputs is **9 prefixes** (12 / 15 for the 5- and 6-sets). There is no 10th.
+Holding out `[1,2,3]` would present a prefix whose answer (`4`) is **arbitrary** — a memorized fact, not
+a rule instance, derivable from nothing the network could have seen. It would guarantee failure and
+measure nothing. Train and test being the same items is what memorization *means*; the question is "can
+it store and reproduce 9 arbitrary associations?", and there is deliberately no rule to infer.
+
+**The Markov-2 control does the job a holdout normally does.** The degenerate solution here is not
+memorizing (that is the task) but answering from recent context alone — and a bigram/trigram lookup
+provably scores 1/k on the `[·,2,3]` family while genuine 3-token memory scores 100%. That is the
+validity guard, and it is why the family exists.
+
+**Consequence:** this is a memorization/capacity measurement and must never be reported as
+generalization. The 4/5/6 set axis is the capacity probe.
+
+**Exactness.** The engine is deterministic and resets per trial (`reset_state()`), so **each prefix
+yields exactly one score vector**. Evaluation enumerates all 9/12/15 prefixes, one run each — exact, no
+sampling, no variance, ~20× cheaper than the battery's `holdout: 200`.
+
+This inverts the usual objection to best-checkpointing. Reporting the max over evals normally selects on
+the reported set, an optimistic bias — and the battery has it, since its sampled `holdout: 200` carries
+variance the max cherry-picks upward. **Our eval has no sampling noise**, so the max over evals reads the
+true peak of a deterministic curve rather than the top of the noise. Having no holdout makes
+best-checkpointing *cleaner* here, not dirtier. Residual caveat, stated plainly: the peak is still an
+upward-biased estimate of "accuracy at a fixed sensible stopping point", since a jagged trajectory is
+read at its top — but the jaggedness is real learning dynamics, and both topologies are measured
+identically, so the FF/side-car delta is unaffected.
 
 Metrics per (topology, bump, set, seed):
 
