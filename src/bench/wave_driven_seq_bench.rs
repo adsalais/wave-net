@@ -61,6 +61,32 @@ mod tests {
     /// `patience` stops converged runs early regardless, so a generous ceiling is nearly free.
     const OP_MAX_TRIALS: usize = 10000;
 
+    /// **Default `adapt_bump` for future side-car tests** — paired with `seq_cfg`'s `rate_reg 5.0`.
+    /// See `docs/sidecar_default.md`.
+    ///
+    /// Best cell of the Phase B `adapt_bump {1,3,5} × rate_reg {0,2,5}` grid: worst-seed fidelity
+    /// 0.936 / mean 0.956, `det` 1.000 on every seed of every set, family 1.000. The only cell that
+    /// never drops below 0.93 anywhere.
+    ///
+    /// `rate_reg` is needed **in proportion to** `adapt_bump` — adaptation adds to the effective
+    /// threshold and quenches the stack, and `rate_reg` undoes exactly that. Side-car mean fidelity:
+    ///
+    /// | bump | rr0 | rr2 | rr5 |
+    /// |---|---|---|---|
+    /// | 1 | 0.938 | 0.884 | 0.936 |
+    /// | **3** | 0.869 | 0.861 | **0.956** |
+    /// | 5 | 0.727 | 0.833 | 0.931 |
+    ///
+    /// Viable cheaper alternative: `adapt_bump 1` with `rate_reg 0` (0.882 worst / 0.938 mean, `det`
+    /// 1.000) — at bump 1 the regulariser buys nothing, so it can be switched off entirely.
+    ///
+    /// Must stay **> 0**: `elig_beta 0.4` (spike-ψ εᵃ) needs an adaptation trace to couple to.
+    const OP_ADAPT_BUMP: i16 = 3;
+    /// Default recurrent fan-in. `n16/r4` is statistically tied (0.949/0.956 vs 0.947/0.961) at 2× the
+    /// synapses, so n8 wins on cost, not performance — see `docs/sidecar_default.md`.
+    const OP_REC_N: u32 = 8;
+    const OP_REC_R: u32 = 4;
+
     /// The six sequences as token ids. Sets are nested: set 4 = SEQS[..4], set 5 = SEQS[..5], etc.
     /// ids: 0→"1" 1→"2" 2→"3" 3→"4" 4→"5" 5→"6" 6→"7" 7→"8" 8→"16"
     ///
@@ -681,7 +707,7 @@ mod tests {
         assert!(sigma > 0.4 && sigma < 1.2, "σ must be near-critical, got {sigma:.3}, profile {pct:?}");
 
         // Side-car: 5 layers, L2 the isolated recurrent scratchpad, L4 the read layer.
-        let (mut net2, entries2) = make_sidecar_seq(1, 16, OP_UC, OP_UR, 8, 4, 3, 6);
+        let (mut net2, entries2) = make_sidecar_seq(1, 16, OP_UC, OP_UR, OP_REC_N, OP_REC_R, OP_ADAPT_BUMP, 6);
         assert_eq!(net2.layer_count(), 5);
         assert_eq!(entries2.len(), 5);
         assert!(entries2[4].is_empty(), "side-car read layer has no outgoing DFA edges");
@@ -860,7 +886,7 @@ mod tests {
             let mut prof0 = Vec::new();
             for seed in SEEDS {
                 let cfg = seq_cfg();
-                let (mut net, entries) = make_sidecar_seq(seed, 16, OP_UC, OP_UR, n, r, 3, 6);
+                let (mut net, entries) = make_sidecar_seq(seed, 16, OP_UC, OP_UR, n, r, OP_ADAPT_BUMP, 6);
                 let (best, best_at) = train_and_eval_best_seq(&mut net, &entries, seed, 7, &cfg, 4, 100, 10, OP_MAX_TRIALS);
                 let (pct, sigma) = rate_profile_seq(&mut net, 16, 7, 0, OP_DENSITY, 8, 24);
                 fid.push(best.fidelity);
@@ -951,7 +977,7 @@ mod tests {
                             let (mut net, entries) = if topo == "ff" {
                                 make_ff_seq(seed, 16, 5, OP_UC, OP_UR, bump, 6)
                             } else {
-                                make_sidecar_seq(seed, 16, OP_UC, OP_UR, 8, 4, bump, 6)
+                                make_sidecar_seq(seed, 16, OP_UC, OP_UR, OP_REC_N, OP_REC_R, bump, 6)
                             };
                             let (best, best_at) = train_and_eval_best_seq(&mut net, &entries, seed, 7, &cfg, set_size, 100, 10, OP_MAX_TRIALS);
                             let (pct, _) = rate_profile_seq(&mut net, 16, 7, 0, OP_DENSITY, 8, 24);
