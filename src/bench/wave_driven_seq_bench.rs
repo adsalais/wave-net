@@ -55,9 +55,11 @@ mod tests {
     const OP_DENSITY: u32 = 1;
     const OP_UR: u32 = 3;
     const OP_UC: u32 = 48;
-    /// Trial ceiling. Set from Phase A1: the largest measured `peak_at` across every live cell was
-    /// 2600 (most peak 300-1400), so ~2× that. The plan's 12000 was ~5× over-provisioned.
-    const OP_MAX_TRIALS: usize = 6000;
+    /// Trial ceiling. Phase A1's FF cells peak by 2600 (most 300-1400) — the plan's 12000 was ~5×
+    /// over. But A2 found a side-car seed still improving at 5400 against a 6000 cap, and truncating
+    /// one topology more than the other would corrupt the matched comparison Phase B rests on.
+    /// `patience` stops converged runs early regardless, so a generous ceiling is nearly free.
+    const OP_MAX_TRIALS: usize = 10000;
 
     /// The six sequences as token ids. Sets are nested: set 4 = SEQS[..4], set 5 = SEQS[..5], etc.
     /// ids: 0→"1" 1→"2" 2→"3" 3→"4" 4→"5" 5→"6" 6→"7" 7→"8" 8→"16"
@@ -270,6 +272,13 @@ mod tests {
     /// Per-layer firing rate (%/neuron/wave) over a window, plus σ (mean consecutive-layer spike
     /// ratio). The dynamics diagnostic AGENTS.md requires: σ + profile is what separates *dynamics
     /// collapse* from *credit starvation* when a result disappoints.
+    ///
+    /// **σ is only interpretable for a feed-forward chain.** It averages ratios over *consecutive*
+    /// layers, which assumes every layer is on the forward path. The side-car's is L0→L1→L3→L4 with
+    /// **L2 an isolated scratchpad**, so a quiet L2 makes the L3/L2 ratio explode: measured
+    /// [10.9, 9.4, 0.4, 10.9, 12.9] reports σ 8.657 purely because L2 sits at 0.4%. That is an
+    /// artifact of this metric, not supercriticality — the stack is healthy. Do not compare FF and
+    /// side-car σ; read the **per-layer profile** instead, which stays honest for both.
     fn rate_profile_seq(net: &mut Network, size: u32, task_seed: u64, token: usize, density: u32, warmup: usize, waves: usize) -> (Vec<f64>, f64) {
         let l = net.layer_count();
         let counts = Arc::new(Mutex::new(vec![0u64; l]));
@@ -876,6 +885,102 @@ mod tests {
             );
         }
         println!("=== end Phase A2 ===\n");
+    }
+
+    /// Phase B — the main experiment. `adapt_bump {1,3,5}` × `rate_reg {0,2,5}` × {FF, side-car} ×
+    /// set {4,5,6} × 3 seeds = 162 runs. Run manually in --release:
+    ///   cargo test --release --lib seq_phase_b_main -- --ignored --nocapture
+    ///
+    /// Two headlines.
+    ///
+    /// **`adapt_bump`** — FF and the side-car store the first token in different physics. Membrane
+    /// potential cannot carry it (the `d.max(1)` leak floor drains any potential within ~16 waves; a
+    /// 3-token prefix spans 26), so FF's *only* memory is the adaptation trace, which decays at
+    /// ρ = 1 − 2⁻⁶ ≈ 0.984/wave and retains ~66% across the prefix. AGENTS.md records ALIF
+    /// adaptation as "a strong ~64-wave held-category memory (store-recall)" that does *not* help
+    /// XOR-shaped computation — which is why the existing battery never probed it. The side-car
+    /// instead holds memory in its L2 scratchpad's ongoing recurrent spiking. Since `adapt_bump`
+    /// sets the trace's amplitude, **lowering it should degrade FF while leaving the side-car flat**.
+    ///
+    /// **`rate_reg`** — a homogenizing pressure whose recorded cost is eroding the class signal, and
+    /// it acts *per neuron*, so it pushes a layer toward uniformity even when the layer mean sits on
+    /// target. The battery needs one discriminative direction (2 classes); this task needs 9-15
+    /// distinguishable patterns, so it has strictly more to lose. Phase A1 established `rate_reg`
+    /// **cannot rescue a fully dead layer** (eligibility accrues only on target fire), so at the
+    /// live d1/c48 operating point the `rate_reg 0` cells are a genuine test of whether fan-in alone
+    /// sustains the stack *through* training, where weights reshape and σ moves.
+    ///
+    /// The 3×3 grid maps a three-way tension nothing on record covers: `rate_reg` **requires**
+    /// adaptation to function, adaptation **is** the FF memory, and `rate_reg` **erodes** what that
+    /// memory stores.
+    ///
+    /// Reads the **per-layer profile**, not σ, as the dynamics diagnostic — σ is FF-only (see
+    /// `rate_profile_seq`).
+    #[test]
+    #[ignore]
+    fn seq_phase_b_main() {
+        const SEEDS: [u64; 3] = [1, 2, 3];
+        const BUMPS: [i16; 3] = [1, 3, 5];
+        const RATE_REGS: [f32; 3] = [0.0, 2.0, 5.0];
+        const SETS: [usize; 3] = [4, 5, 6];
+
+        println!("\n=== Phase B: adapt_bump × rate_reg × topology × set (3 seeds) ===");
+        println!("operating point: density {OP_DENSITY}/8, r{OP_UR}/c{OP_UC}, rec n8/r4, max_trials {OP_MAX_TRIALS}");
+        println!("chance fidelity ~{:.3}", 1.0 / V as f32);
+        for set_size in SETS {
+            println!(
+                "set {set_size}: {} prefixes, family {}-way, markov-1 {:.3}, markov-2 ceiling {:.3}",
+                prefixes(set_size).len(),
+                family(set_size).len(),
+                markov_k_accuracy(set_size, 1, &family(set_size)),
+                markov_k_accuracy(set_size, 2, &family(set_size))
+            );
+        }
+        println!();
+
+        for set_size in SETS {
+            let ceiling = markov_k_accuracy(set_size, 2, &family(set_size));
+            for bump in BUMPS {
+                for rate_reg in RATE_REGS {
+                    for topo in ["ff", "sidecar"] {
+                        let (mut fid, mut fam, mut det, mut peaks) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+                        let (mut prof0, mut forks0) = (Vec::new(), Vec::new());
+                        for seed in SEEDS {
+                            let mut cfg = seq_cfg();
+                            cfg.rate_reg = rate_reg;
+                            let (mut net, entries) = if topo == "ff" {
+                                make_ff_seq(seed, 16, 5, OP_UC, OP_UR, bump, 6)
+                            } else {
+                                make_sidecar_seq(seed, 16, OP_UC, OP_UR, 8, 4, bump, 6)
+                            };
+                            let (best, best_at) = train_and_eval_best_seq(&mut net, &entries, seed, 7, &cfg, set_size, 100, 10, OP_MAX_TRIALS);
+                            let (pct, _) = rate_profile_seq(&mut net, 16, 7, 0, OP_DENSITY, 8, 24);
+                            fid.push(best.fidelity);
+                            fam.push(best.family_acc);
+                            det.push(best.det_acc);
+                            peaks.push(best_at);
+                            if prof0.is_empty() {
+                                prof0 = pct;
+                                forks0 = best.fork_tv.iter().map(|(_, tv)| (tv * 1000.0).round() / 1000.0).collect();
+                            }
+                        }
+                        let n = SEEDS.len() as f32;
+                        let wf = fid.iter().copied().fold(f32::INFINITY, f32::min);
+                        let wd = det.iter().copied().fold(f32::INFINITY, f32::min);
+                        let wfam = fam.iter().copied().fold(f32::INFINITY, f32::min);
+                        let beats = if wfam > ceiling + 1e-6 { "MEM" } else { "---" };
+                        println!(
+                            "set{set_size} bump{bump} rr{rate_reg:.0} {topo:>7} | fid w {wf:.3} m {:.3} | det w {wd:.3} m {:.3} | fam w {wfam:.3} m {:.3} vs {ceiling:.3} {beats} | forkTV {forks0:?} | {prof0:?} | peak {peaks:?}",
+                            fid.iter().sum::<f32>() / n,
+                            det.iter().sum::<f32>() / n,
+                            fam.iter().sum::<f32>() / n,
+                        );
+                    }
+                }
+            }
+            println!();
+        }
+        println!("=== end Phase B (MEM = worst-seed family accuracy beats the Markov-2 ceiling) ===\n");
     }
 
     #[test]
