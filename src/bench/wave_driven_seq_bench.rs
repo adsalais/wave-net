@@ -14,6 +14,9 @@ mod tests {
     const MAX_PREFIX: usize = 3;
     /// Hash purpose tag for trial sampling (distinct stream from CUE_P / P_DFA).
     const P_SEQ: u64 = 0x5E9;
+    /// Hash purpose tag for token site codes. Distinct from `wave_driven_bench`'s `CUE_P` (0xC0E) —
+    /// this is a different predicate over a different site set, and a different task.
+    const CUE_P: u64 = 0xC0F;
 
     /// The six sequences as token ids. Sets are nested: set 4 = SEQS[..4], set 5 = SEQS[..5], etc.
     /// ids: 0→"1" 1→"2" 2→"3" 3→"4" 4→"5" 5→"6" 6→"7" 7→"8" 8→"16"
@@ -116,6 +119,120 @@ mod tests {
             acc += (0..V).map(|t| truth[t] * qdist[t]).sum::<f32>();
         }
         acc / targets.len() as f32
+    }
+
+    /// A token's L0 site code: a fixed random subset of the grid, `density`/8 of all sites
+    /// (density 1 ≈ 32 sites, density 2 ≈ 64 of 256).
+    ///
+    /// Population-coded, not place-coded, for two reasons. (1) Arithmetic: the engine's leak floor
+    /// (`wave.rs`, `d.max(1)`) drains ≥1 per wave, so a single +1 synapse nets zero and a lone site
+    /// can never fire anything — ≥2 coincident synapses is a precondition for any activity, and
+    /// `sample_distinct_cells` caps a source at one synapse per target. (2) Science: random codes
+    /// share no exploitable structure, so the net cannot interpolate geometrically instead of
+    /// remembering. See the spec's Design analysis §1-2.
+    fn token_sites(task_seed: u64, size: u32, token: usize, density: u32) -> Vec<u32> {
+        let ls = size * size;
+        (0..ls).filter(|&loc| (mix(key(task_seed, loc, token as i32, 0, CUE_P)) & 7) < density as u64).collect()
+    }
+
+    /// Max-subtract softmax over V logits.
+    fn softmax_n(z: &[f32]) -> Vec<f32> {
+        let m = z.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let e: Vec<f32> = z.iter().map(|x| (x - m).exp()).collect();
+        let s = e.iter().sum::<f32>().max(1e-30);
+        e.iter().map(|x| x / s).collect()
+    }
+
+    /// Per-class score: the dot product of each class's readout weights with the spike counts.
+    fn score_n(w: &[Vec<f32>], a: &[f32]) -> Vec<f32> {
+        w.iter().map(|wc| wc.iter().zip(a).map(|(x, y)| x * y).sum()).collect()
+    }
+
+    /// Argmax breaking ties toward the lower index — matching the 2-class harness's `(s1 > s0)`
+    /// rule, which predicts class 0 on a tie. At init every weight is 0 and every score ties at 0.0,
+    /// so the tie-break is reachable, not theoretical.
+    fn argmax_first(z: &[f32]) -> usize {
+        let mut best = 0usize;
+        for (i, &x) in z.iter().enumerate() {
+            if x > z[best] {
+                best = i;
+            }
+        }
+        best
+    }
+
+    /// Total variation distance, ½·Σ|p−q|. Bounded and legible: 0 is perfect, 0.5 means a 50/50 fork
+    /// collapsed onto one branch. For a one-hot `p`, `1 − TV` is exactly `q[target]`.
+    fn total_variation(p: &[f32], q: &[f32]) -> f32 {
+        0.5 * p.iter().zip(q).map(|(a, b)| (a - b).abs()).sum::<f32>()
+    }
+
+    #[test]
+    fn token_sites_density_and_determinism() {
+        // Density 1/8 ≈ 32 sites, 2/8 ≈ 64 sites of 256 (binomial, so a generous band).
+        for token in 0..V {
+            let n32 = token_sites(11, 16, token, 1).len();
+            let n64 = token_sites(11, 16, token, 2).len();
+            assert!((18..=50).contains(&n32), "density 1 ≈ 32 sites, got {n32} for token {token}");
+            assert!((44..=86).contains(&n64), "density 2 ≈ 64 sites, got {n64} for token {token}");
+        }
+
+        // Determinism: a pure function of its arguments.
+        assert_eq!(token_sites(11, 16, 3, 2), token_sites(11, 16, 3, 2));
+
+        // Distinct tokens get distinct codes (random population codes overlap, but not wholly).
+        let a = token_sites(11, 16, 0, 2);
+        let b = token_sites(11, 16, 1, 2);
+        assert_ne!(a, b, "distinct tokens must not share a code");
+        let shared = a.iter().filter(|s| b.contains(s)).count();
+        assert!(shared < a.len() * 3 / 4, "token codes must stay separable, shared {shared} of {}", a.len());
+
+        // Sites are in range and strictly ascending (the filter preserves order).
+        let s = token_sites(11, 16, 5, 2);
+        assert!(s.windows(2).all(|w| w[0] < w[1]), "sites ascend");
+        assert!(s.iter().all(|&loc| loc < 256), "sites are in range");
+    }
+
+    #[test]
+    fn readout_primitives_correct() {
+        // softmax_n is a distribution, and max-subtraction keeps it finite on large inputs.
+        let p = softmax_n(&[1.0, 2.0, 3.0]);
+        assert!((p.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+        assert!(p[2] > p[1] && p[1] > p[0], "monotone in the logit");
+        let big = softmax_n(&[1000.0, 1000.0]);
+        assert!((big[0] - 0.5).abs() < 1e-6, "no overflow: {big:?}");
+
+        // Uniform logits → uniform distribution.
+        let u = softmax_n(&vec![0.0; V]);
+        assert!(u.iter().all(|&x| (x - 1.0 / V as f32).abs() < 1e-6));
+
+        // score_n is a per-class dot product.
+        let w = vec![vec![1.0, 0.0], vec![0.0, 2.0]];
+        assert_eq!(score_n(&w, &[3.0, 5.0]), vec![3.0, 10.0]);
+
+        // argmax_first breaks ties toward the lower index (matching the 2-class `s1 > s0` rule).
+        assert_eq!(argmax_first(&[0.0, 0.0, 0.0]), 0);
+        assert_eq!(argmax_first(&[1.0, 5.0, 5.0]), 1);
+
+        // total_variation: 0 when identical; 1/2 when a 50/50 fork collapses onto one branch;
+        // 1/3 when [1]'s 67/33 collapses. Both figures are quoted in the spec's metrics.
+        let fork = vec![0.0, 0.0, 0.5, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0];
+        assert!(total_variation(&fork, &fork).abs() < 1e-6);
+        let collapsed = vec![0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        assert!((total_variation(&fork, &collapsed) - 0.5).abs() < 1e-6);
+        let skew = conditional(4, &[0]); // {2: 2/3, 4: 1/3}
+        let onto2 = {
+            let mut v = vec![0.0; V];
+            v[1] = 1.0;
+            v
+        };
+        assert!((total_variation(&skew, &onto2) - 1.0 / 3.0).abs() < 1e-5);
+
+        // For a deterministic (one-hot) truth, 1 - TV is exactly the mass on the target. This is the
+        // identity the checkpoint scalar rests on.
+        let truth = conditional(4, &[0, 1, 2]); // one-hot on token 3
+        let q = softmax_n(&[0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        assert!((1.0 - total_variation(&truth, &q) - q[3]).abs() < 1e-5);
     }
 
     #[test]
