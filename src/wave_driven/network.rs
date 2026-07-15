@@ -36,17 +36,14 @@ pub struct Network {
 
 impl Network {
     pub fn new(config: Config) -> Network {
-        Network::build(config, false, Mode::Sparse)
+        Network::build(config, Mode::Sparse)
     }
-    pub fn new_with_readout(config: Config) -> Network {
-        Network::build(config, true, Mode::Sparse)
-    }
-    /// Dense oracle build (processes all neurons every wave; no readout). For equivalence testing.
+    /// Dense oracle build (processes all neurons every wave). For equivalence testing.
     pub fn new_dense(config: Config) -> Network {
-        Network::build(config, false, Mode::Dense)
+        Network::build(config, Mode::Dense)
     }
 
-    fn build(config: Config, readout_last: bool, mode: Mode) -> Network {
+    fn build(config: Config, mode: Mode) -> Network {
         config.validate().expect("invalid config");
         let size = config.size;
         let l = config.layers.len();
@@ -58,9 +55,6 @@ impl Network {
                 // L0 transducer: fires only on injection (baseline i16::MAX), never adapts.
                 layer.threshold.iter_mut().for_each(|t| *t = i16::MAX);
                 layer.adapt_bump = 0;
-            }
-            if readout_last && z == l - 1 {
-                layer.readout = true;
             }
             layers.push(layer);
         }
@@ -546,23 +540,6 @@ mod tests {
                 assert_eq!(la.fire_wave, lb.fire_wave);
             })
         });
-    }
-
-    #[test]
-    fn readout_integrates_without_firing() {
-        // Last layer is a drain-only readout: it accumulates potential and never fires.
-        let up = LayerConfig { topology: vec![TopologyLevel { level: 1, radius: 2, count: 8 }], leak: (3, 5), cooldown_base: 2, inhibitor_ratio: 0, threshold_jitter: 0, baseline_init: 6, adapt_bump: 0, adapt_decay: 6 };
-        let cfg = Config { seed: 4, size: 8, layers: vec![up.clone(), LayerConfig { topology: vec![], ..up }] };
-        let mut net = Network::new_with_readout(cfg);
-        let fired_top = std::sync::Arc::new(std::sync::Mutex::new(0usize));
-        let ft = fired_top.clone();
-        net.on_layer(1, Box::new(move |_w, fired| *ft.lock().unwrap() += fired.len()));
-        for _ in 0..12 {
-            net.wave(&[0, 1, 2, 8, 9, 10]);
-        }
-        assert_eq!(*fired_top.lock().unwrap(), 0, "readout never fires");
-        let any_pot = net.with_layer(1, |l| l.potential.iter().any(|&p| p != 0));
-        assert!(any_pot, "readout integrated some potential");
     }
 
     #[test]

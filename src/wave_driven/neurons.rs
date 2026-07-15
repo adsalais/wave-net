@@ -93,7 +93,6 @@ pub struct Layer {
     pub topology: Vec<TopologyLevel>,
     pub adapt_bump: i16,
     pub adapt_decay: u8,
-    pub readout: bool,
     pub ternary_threshold: f32,
     // derived layout
     pub total_slots: usize,
@@ -218,7 +217,6 @@ impl Layer {
             topology: cfg.topology.clone(),
             adapt_bump: cfg.adapt_bump,
             adapt_decay: cfg.adapt_decay,
-            readout: false,
             ternary_threshold: 0.5,
             total_slots,
             slot_bases,
