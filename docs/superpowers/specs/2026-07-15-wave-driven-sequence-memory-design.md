@@ -97,6 +97,35 @@ side-car in its L2 scratchpad's ongoing **recurrent spiking**. Since `adapt_bump
 amplitude, **lowering it should degrade FF while leaving the side-car flat.** That predicted crossing is
 the experiment's headline result, and it is why `adapt_bump` is the main axis rather than a setting.
 
+### 4. `rate_reg` homogenizes, and this task has the most to lose
+
+`rate_reg` is a **homeostatic rate controller**, active during **training only** (`build_signal` is called
+at `wave_driven_bench.rs:128`, inside the train loop; the eval path at `:135` never touches it). The
+chain: `signal[tz][j] = task_sig + rate_reg·(rate_j − rate_target)`, then `dfa_update` applies
+`shadow[widx] += -lr · signal[tz][j] · e` (`network.rs:422`), where `e` is the eligibility of a synapse
+*into* `j` and is non-negative. So a neuron firing above `rate_target` gets its incoming weights pushed
+down, one firing below gets them pushed up — negative feedback, per neuron, per trial, toward 10%.
+
+Its purpose is liveness: deep FF stacks starve (activity decays layer by layer; eligibility accrues only
+on target fire, so no firing ⇒ no credit ⇒ no learning). AGENTS.md records it as a *"conclusive liveness
+rescue… chance → ~980 on temporal XOR, 5-seed robust"*, requiring ALIF.
+
+**But it is a homogenizing pressure, and its recorded cost is exactly what this task is made of.** The
+caveat states it *"homogenizes firing rates and erodes the class signal"*. The battery needs **one**
+discriminative direction in the 256-dim spike-count space — two classes. This task needs **9–15
+distinguishable patterns**, one per prefix. There is far more structure here for a homogenizing term to
+erode, so **this task is more exposed to the `rate_reg` pathology than anything in the existing
+battery**, and `rate_reg: 5.0` must not be inherited as a constant.
+
+The opening: AGENTS.md names **two** fixes for liveness starvation — `rate_reg`, and *"the fix is more
+fan-in"*. Phase A1 sweeps fan-in. If an `(r,c)` is intrinsically live, `rate_reg` may be unnecessary,
+which would remove the over-training collapse, make best-checkpointing belt-and-braces rather than
+load-bearing, and lift the pressure eroding the prefix patterns. Hence `rate_reg` is a **Phase B axis**.
+
+Three-way tension worth naming, since the 3×3 `adapt_bump × rate_reg` grid maps it: `rate_reg` **requires**
+adaptation to function; adaptation **is** the FF memory (§3); and `rate_reg` **erodes** what that memory
+stores. Nothing in the recorded findings maps this interaction.
+
 ## Components
 
 ### 0. Remove `wave_driven`'s dead `readout` flag (engine, prerequisite)
@@ -304,11 +333,28 @@ different jobs and the sweep should show them separating.
 the recorded sweet spot is n=8 (σ collapses by n≥24), so this is a confirmation at this task's operating
 point rather than an open search.
 
-**Phase B — main experiment (54 runs).** `adapt_bump` {1,3,5} × {FF, side-car} × set {4,5,6} × 3 seeds,
-at the Phase A operating point. This is the headline: the predicted FF/side-car crossing in `adapt_bump`.
+**Phase B — main experiment (162 runs).** `adapt_bump` {1,3,5} × **`rate_reg` {0,2,5}** × {FF, side-car}
+× set {4,5,6} × 3 seeds, at the Phase A operating point. Two headlines: the predicted FF/side-car
+crossing in `adapt_bump`, and the liveness-vs-erosion trade in `rate_reg` (§Design analysis 4). At
+`rate_reg 0`, `rate_target` is inert — the term drops out of `build_signal` entirely.
 
-≈87 runs at size 16 / 5 layers ≈ 22 size-32-equivalents — still under the existing confirmation suite's
-24. All phases are `#[ignore]`d inline tests, run manually in `--release`.
+**A1's `(r,c)` is selected under `rate_reg 5`, which masks liveness starvation.** A config may look
+healthy only because the regulariser props it up. Accepted rather than fixed: running A1 at
+`rate_reg 0` risks 24 null runs if nothing in the `(r,c)` range is intrinsically live at 5 layers.
+Phase B's `rate_reg 0` cells resolve it directly — and "no fan-in in this range survives without
+`rate_reg`" is itself a legitimate finding, not a failed experiment.
+
+**Cost, stated honestly:** ≈195 runs at size 16 / 5 layers. Per-run cost is ~0.6× a battery run (5× the
+trials, ¼ the neurons at size 16, ½ the fan-in at c16), so this is **≈5× the existing confirmation
+suite** — not the "under 24 equivalents" an earlier draft of this spec claimed by ignoring `max_trials`.
+Mitigation: `max_trials: 12000` is a **ceiling**, not the expected cost — `patience 10` exits ~1000
+trials past the peak, and a 9-prefix task may converge well short of the cap. **Phase A must report where
+the peak lands**, and Phase B's `max_trials` should be set from that measurement rather than from this
+estimate. If wall-clock proves painful, the fallback is to stage rather than trim seeds: run the full 3×3
+`bump × rate_reg` grid at set 4 only (54 runs), then extend the set {4,5,6} axis at the winning cell
+(+12), reaching ~66 runs at the cost of the `set × bump` interaction.
+
+All phases are `#[ignore]`d inline tests, run manually in `--release`.
 
 ## Non-goals and deviations
 
@@ -342,3 +388,13 @@ at the Phase A operating point. This is the headline: the predicted FF/side-car 
   will show if token codes have smeared together.
 - **Nine prefixes may be too few** to prevent an unanticipated shortcut. The Markov-2 control is the
   guard: a shortcut that beats Markov-2 on the family is, by construction, memory.
+- **`rate_reg 0` may be dead everywhere**, collapsing a third of the Phase B grid to chance. That is a
+  finding (fan-in alone cannot sustain 5 layers; `rate_reg` is mandatory), not a wasted third — but it
+  would make `rate_reg 2` the only informative non-default cell.
+- **`rate_reg 5` + `adapt_bump 1` may be an empty corner.** `rate_reg` requires ALIF, and bump 1 is the
+  weakest non-zero adaptation; the regulariser may be unable to rescue anything there. Expected
+  structure in the 3×3 grid rather than a defect, but worth predicting before seeing it.
+- **`readout_lr`/`hidden_lr` are inherited from a 2-class harness.** At V=9 the task term
+  `Σ_{c<9} b·err[c]` sums nine terms rather than two, so its magnitude relative to the fixed `rate_reg`
+  term shifts — the effective task/liveness balance is not the battery's, even at identical `rate_reg`.
+  Phase A should sanity-check that training moves at all before Phase B commits 162 runs.
