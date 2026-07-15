@@ -741,6 +741,79 @@ mod tests {
         assert!((1.0 - total_variation(&truth, &q) - q[3]).abs() < 1e-5);
     }
 
+    /// Phase A1 — forward fan-in × density, 3 seeds, under training. Run manually in --release:
+    ///   cargo test --release --lib seq_phase_a1_forward_sweep -- --ignored --nocapture
+    ///
+    /// The untrained probe (recorded on `OP_UC`) already established the σ landscape: count is the
+    /// lever, c16 is dead from L3 up, c32 is near-critical, c48 is supercritical. This sweep asks
+    /// the question that probe *cannot*: what survives **training**, where weights reshape and σ
+    /// moves. c16 is kept in as the documented dead control.
+    ///
+    /// Selects on dynamics (σ near 1, no dead layer) with fidelity secondary — dynamics are the
+    /// low-variance, seed-robust signal.
+    ///
+    /// **Also reports `peak_at`** — Phase B's `max_trials` must be set from that measurement, not
+    /// from the 12000 ceiling guessed here.
+    ///
+    /// Density and `c` are not interchangeable: at equal input drive (4 synapses/neuron), d1/c32
+    /// measured σ 0.473 while d2/c16 measured 0.069, because `c` alone sets *hidden*-layer drive and
+    /// that job dominates. This sweep should show the two separating under training too.
+    #[test]
+    #[ignore]
+    fn seq_phase_a1_forward_sweep() {
+        const SEEDS: [u64; 3] = [1, 2, 3];
+
+        println!("\n=== Phase A1: forward fan-in × density (FF, 4-set, adapt_bump 3, rate_reg 5) ===");
+        println!("chance fidelity ~{:.3}; markov-2 family ceiling {:.3}", 1.0 / V as f32, markov_k_accuracy(4, 2, &family(4)));
+        println!("\n-- count sweep at r3 (c ≤ (2r+1)² = 49) --");
+        for density in [1u32, 2u32] {
+            for uc in [16u32, 24, 32, 40, 48] {
+                run_a1_cell(density, 3, uc, &SEEDS);
+            }
+        }
+        // Radius at fixed count. c24 is the largest count r2 can carry: c ≤ (2·2+1)² = 25.
+        println!("\n-- radius sweep at c24, density 2 --");
+        for ur in [2u32, 3, 4] {
+            run_a1_cell(2, ur, 24, &SEEDS);
+        }
+        println!("\n=== select on σ + profile; set OP_MAX_TRIALS from peak_at ===\n");
+    }
+
+    /// One Phase A1 cell: train 3 seeds at (density, ur, uc) and report worst+mean with dynamics.
+    fn run_a1_cell(density: u32, ur: u32, uc: u32, seeds: &[u64]) {
+        let (mut fid, mut fam, mut det, mut sig, mut peaks) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut prof0 = Vec::new();
+        for &seed in seeds {
+            let mut cfg = seq_cfg();
+            cfg.density = density;
+            let (mut net, entries) = make_ff_seq(seed, 16, 5, uc, ur, 3, 6);
+            let (best, best_at) = train_and_eval_best_seq(&mut net, &entries, seed, 7, &cfg, 4, 100, 10, 12000);
+            let (pct, sigma) = rate_profile_seq(&mut net, 16, 7, 0, density, 8, 24);
+            fid.push(best.fidelity);
+            fam.push(best.family_acc);
+            det.push(best.det_acc);
+            sig.push(sigma);
+            peaks.push(best_at);
+            if prof0.is_empty() {
+                prof0 = pct;
+            }
+        }
+        let n = seeds.len() as f32;
+        let wf = fid.iter().copied().fold(f32::INFINITY, f32::min);
+        let wd = det.iter().copied().fold(f32::INFINITY, f32::min);
+        let wfam = fam.iter().copied().fold(f32::INFINITY, f32::min);
+        let ms = sig.iter().sum::<f64>() / seeds.len() as f64;
+        let dead = prof0[1..].iter().filter(|&&x| x == 0.0).count();
+        println!(
+            "d{density}(~{:2} sites) r{ur}/c{uc:2} fan-in {:5.2} | fid w {wf:.3} m {:.3} | det w {wd:.3} m {:.3} | fam w {wfam:.3} m {:.3} | σ {ms:.3} dead {dead} | {prof0:?} | peak {peaks:?}",
+            256 * density / 8,
+            (256 * density / 8) as f32 * uc as f32 / 256.0,
+            fid.iter().sum::<f32>() / n,
+            det.iter().sum::<f32>() / n,
+            fam.iter().sum::<f32>() / n,
+        );
+    }
+
     #[test]
     fn seq_conditionals_correct() {
         // Prefix enumeration: 9 / 12 / 15 distinct prefixes.
