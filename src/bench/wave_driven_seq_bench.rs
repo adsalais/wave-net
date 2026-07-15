@@ -24,24 +24,40 @@ mod tests {
     /// this is a different predicate over a different site set, and a different task.
     const CUE_P: u64 = 0xC0F;
 
-    /// Operating point. `density 2` ≈ 64 of 256 sites per token; `r3/c32` ≈ 8 synapses per L1
-    /// neuron.
+    /// Operating point — **selected from the Phase A1 measurement**, not assumed. `density 1` ≈ 32
+    /// of 256 sites per token; `r3/c48` ≈ 6 synapses per L1 neuron.
     ///
-    /// **c32, not the c16 the spec first assumed.** Measured untrained at 5 layers, r3/c16 dies from
-    /// L3 up ([22.3, 8.1, 1.3, 0.0, 0.0], σ 0.069) — the read layer never spikes, so `act` is all
-    /// zeros and nothing can train. r3/c32 is intrinsically live ([22.3, 17.5, 13.8, 11.0, 10.2],
-    /// σ 0.83), settling near `rate_target` on its own. Count is the lever, not radius: r4/c16
-    /// measures σ 0.070, indistinguishable from r3/c16, while c48 goes supercritical (σ 1.03).
+    /// A1 (FF, 4-set, adapt_bump 3, rate_reg 5, 3 seeds, trained to peak):
     ///
-    /// The coincidence floor is ~8 synapses/neuron, not the ~2 the spec estimated: untrained ternary
-    /// weights are random ±1/0, so of 8 synapses only ~2.7 are +1 and ~2.7 are −1 and they largely
-    /// cancel — ~8 raw synapses are needed to reliably net ≥2.
+    /// | cell | fan-in | fidelity w/m | family worst | σ | dead |
+    /// |---|---|---|---|---|---|
+    /// | **d1/c48** | 6.0 | **0.818 / 0.880** | **1.000** | 1.094 | 0 |
+    /// | d2/c40 | 10.0 | 0.844 / 0.878 | 0.500 | 0.825 | 0 |
+    /// | d2/c48 | 12.0 | 0.798 / 0.800 | 0.500 | 0.938 | 0 |
+    /// | d2/c32 | 8.0 | 0.591 / 0.706 | 1.000 | 0.464 | 0 |
+    /// | d2/c16 | 4.0 | 0.136 (chance) | 0.000 | 0.006 | 3 |
     ///
-    /// Phase A1 confirms this *under training* (weights reshape, so σ moves) and reports where the
-    /// accuracy peak lands so `OP_MAX_TRIALS` can be set from measurement.
-    const OP_DENSITY: u32 = 2;
+    /// d1/c48 wins on fidelity *and* is the only high-fidelity cell with family accuracy 1.000 on
+    /// every seed — d2/c40 and d2/c48 each have a seed that drops to the 0.500 Markov-2 ceiling,
+    /// i.e. fails the memory test. It also uses half the input drive (32 sites).
+    ///
+    /// **Count is the lever, not radius**: r2/r3/r4 at c24 give σ 0.127/0.097/0.129, all with 2 dead
+    /// layers — radius is noise, as AGENTS.md says. c16 is dead from L3 up at both densities.
+    ///
+    /// **`rate_reg` cannot rescue a *fully* dead layer.** c16 stays at chance (0.136) with 3 dead
+    /// layers even after training: eligibility accrues only on *target* fire, so a silent layer has
+    /// `e = 0` and `shadow += -lr·signal·0` is identically zero. AGENTS.md's "conclusive liveness
+    /// rescue" has an unstated precondition — the layer must be weakly firing, not silent.
+    ///
+    /// The coincidence floor is ~6-8 synapses/neuron, not the ~2 the spec estimated: untrained
+    /// ternary weights are random ±1/0, so of 8 synapses only ~2.7 are +1 and ~2.7 are −1 and they
+    /// largely cancel.
+    const OP_DENSITY: u32 = 1;
     const OP_UR: u32 = 3;
-    const OP_UC: u32 = 32;
+    const OP_UC: u32 = 48;
+    /// Trial ceiling. Set from Phase A1: the largest measured `peak_at` across every live cell was
+    /// 2600 (most peak 300-1400), so ~2× that. The plan's 12000 was ~5× over-provisioned.
+    const OP_MAX_TRIALS: usize = 6000;
 
     /// The six sequences as token ids. Sets are nested: set 4 = SEQS[..4], set 5 = SEQS[..5], etc.
     /// ids: 0→"1" 1→"2" 2→"3" 3→"4" 4→"5" 5→"6" 6→"7" 7→"8" 8→"16"
