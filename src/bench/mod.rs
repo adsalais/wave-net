@@ -4,4 +4,5 @@
 
 pub mod wave_bitnet_bench;
 pub mod wave_driven_bench;
+pub mod wave_driven_seq_bench;
 pub mod wave_resonate_bench;
