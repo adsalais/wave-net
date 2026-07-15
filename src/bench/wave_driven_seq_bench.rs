@@ -830,6 +830,54 @@ mod tests {
         );
     }
 
+    /// Phase A2 — recurrent fan-in, swept **separately** from the forward path (AGENTS.md), at the
+    /// Phase A1 operating point. Run manually in --release:
+    ///   cargo test --release --lib seq_phase_a2_recurrent_sweep -- --ignored --nocapture
+    ///
+    /// The recorded sweet spot is n=8 (σ collapses by n≥24), so this confirms it at *this* task's
+    /// operating point rather than searching openly.
+    #[test]
+    #[ignore]
+    fn seq_phase_a2_recurrent_sweep() {
+        const SEEDS: [u64; 3] = [1, 2, 3];
+        const NR: [(u32, u32); 3] = [(8, 3), (8, 4), (16, 4)];
+
+        println!("\n=== Phase A2: recurrent fan-in (side-car, 4-set, adapt_bump 3, rate_reg 5) ===");
+        println!("operating point: density {OP_DENSITY}/8, r{OP_UR}/c{OP_UC}, max_trials {OP_MAX_TRIALS}");
+        println!("markov-2 family ceiling {:.3}", markov_k_accuracy(4, 2, &family(4)));
+
+        for (n, r) in NR {
+            let (mut fid, mut fam, mut det, mut sig, mut peaks) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            let mut prof0 = Vec::new();
+            for seed in SEEDS {
+                let cfg = seq_cfg();
+                let (mut net, entries) = make_sidecar_seq(seed, 16, OP_UC, OP_UR, n, r, 3, 6);
+                let (best, best_at) = train_and_eval_best_seq(&mut net, &entries, seed, 7, &cfg, 4, 100, 10, OP_MAX_TRIALS);
+                let (pct, sigma) = rate_profile_seq(&mut net, 16, 7, 0, OP_DENSITY, 8, 24);
+                fid.push(best.fidelity);
+                fam.push(best.family_acc);
+                det.push(best.det_acc);
+                sig.push(sigma);
+                peaks.push(best_at);
+                if prof0.is_empty() {
+                    prof0 = pct;
+                }
+            }
+            let n_seeds = SEEDS.len() as f32;
+            let wf = fid.iter().copied().fold(f32::INFINITY, f32::min);
+            let wd = det.iter().copied().fold(f32::INFINITY, f32::min);
+            let wfam = fam.iter().copied().fold(f32::INFINITY, f32::min);
+            let ms = sig.iter().sum::<f64>() / SEEDS.len() as f64;
+            println!(
+                "rec n{n:2}/r{r} | fid w {wf:.3} m {:.3} | det w {wd:.3} m {:.3} | fam w {wfam:.3} m {:.3} | σ {ms:.3} | {prof0:?} | peak {peaks:?}",
+                fid.iter().sum::<f32>() / n_seeds,
+                det.iter().sum::<f32>() / n_seeds,
+                fam.iter().sum::<f32>() / n_seeds,
+            );
+        }
+        println!("=== end Phase A2 ===\n");
+    }
+
     #[test]
     fn seq_conditionals_correct() {
         // Prefix enumeration: 9 / 12 / 15 distinct prefixes.
